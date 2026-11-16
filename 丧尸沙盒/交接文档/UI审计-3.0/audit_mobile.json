@@ -1,0 +1,3166 @@
+{
+ "m_01_patch": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "patchCard",
+  "interactive": {
+   "total": 2,
+   "under44": 1,
+   "samples": [
+    {
+     "t": "patchX",
+     "w": 32,
+     "h": 44
+    }
+   ]
+  },
+  "text": {
+   "nodes": 35,
+   "minFontSize": 12,
+   "minSample": "3.0 正式版：实验分支全量合并",
+   "histogram": {
+    "12": 3,
+    "13": 28,
+    "18": 1,
+    "21": 1,
+    "12.5": 1,
+    "13.5": 1
+   },
+   "distinctColors": 7,
+   "topColors": [
+    "rgb(200, 212, 234)",
+    "rgb(217, 164, 65)",
+    "rgb(159, 176, 188)",
+    "rgb(201, 214, 223)",
+    "rgb(241, 226, 194)",
+    "rgb(143, 164, 204)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 743,
+   "scrollH": 743,
+   "clientH": 743,
+   "needsScroll": false,
+   "pct": 88
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_02_home": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 10,
+   "under44": 0,
+   "samples": []
+  },
+  "text": {
+   "nodes": 29,
+   "minFontSize": 10.5,
+   "minSample": "THE LAST LINE / ",
+   "histogram": {
+    "11": 5,
+    "12": 5,
+    "15": 2,
+    "18": 3,
+    "24": 2,
+    "10.5": 2,
+    "12.5": 6,
+    "14.5": 3,
+    "11.5": 1
+   },
+   "distinctColors": 11,
+   "topColors": [
+    "rgb(217, 164, 65)",
+    "rgb(185, 200, 211)",
+    "rgb(238, 243, 247)",
+    "rgb(147, 166, 179)",
+    "rgb(143, 162, 176)",
+    "rgb(231, 238, 244)",
+    "rgb(243, 231, 207)",
+    "rgb(169, 185, 197)",
+    "rgb(240, 217, 174)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 743,
+   "scrollH": 743,
+   "clientH": 743,
+   "needsScroll": false,
+   "pct": 88
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_03_start": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 13,
+   "under44": 3,
+   "samples": [
+    {
+     "t": "goHome",
+     "w": 91,
+     "h": 33
+    },
+    {
+     "t": "startReset",
+     "w": 140,
+     "h": 33
+    },
+    {
+     "t": "mapSel",
+     "w": 186,
+     "h": 32
+    }
+   ]
+  },
+  "text": {
+   "nodes": 31,
+   "minFontSize": 11,
+   "minSample": "01 模式",
+   "histogram": {
+    "11": 6,
+    "13": 7,
+    "17": 1,
+    "12.5": 10,
+    "11.5": 2,
+    "13.5": 5
+   },
+   "distinctColors": 11,
+   "topColors": [
+    "rgb(231, 238, 244)",
+    "rgb(143, 164, 204)",
+    "rgb(255, 230, 176)",
+    "rgb(127, 147, 161)",
+    "rgb(111, 132, 146)",
+    "rgb(217, 164, 65)",
+    "rgb(216, 230, 239)",
+    "rgb(255, 176, 176)",
+    "rgb(241, 226, 194)",
+    "rgb(216, 195, 154)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 904,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_04_custom": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 41,
+   "under44": 31,
+   "samples": [
+    {
+     "t": "goHome",
+     "w": 91,
+     "h": 33
+    },
+    {
+     "t": "startReset",
+     "w": 140,
+     "h": 33
+    },
+    {
+     "t": "mapSel",
+     "w": 186,
+     "h": 32
+    },
+    {
+     "t": "sizeSel",
+     "w": 318,
+     "h": 32
+    },
+    {
+     "t": "LABEL:英雄模式",
+     "w": 86,
+     "h": 18
+    },
+    {
+     "t": "optHero",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "SUMMARY:支援部队 · 三轮免",
+     "w": 296,
+     "h": 41
+    },
+    {
+     "t": "LABEL:开启支援部队",
+     "w": 105,
+     "h": 18
+    },
+    {
+     "t": "optReinforce",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:帝皇之力",
+     "w": 78,
+     "h": 18
+    },
+    {
+     "t": "optEmperor",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "SUMMARY:波次来袭 · 让丧尸",
+     "w": 296,
+     "h": 41
+    },
+    {
+     "t": "LABEL:开启波次模式",
+     "w": 105,
+     "h": 18
+    },
+    {
+     "t": "optWave",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "wCount",
+     "w": 150,
+     "h": 4
+    },
+    {
+     "t": "wFirst",
+     "w": 150,
+     "h": 4
+    },
+    {
+     "t": "wGap",
+     "w": 150,
+     "h": 4
+    },
+    {
+     "t": "wSize",
+     "w": 150,
+     "h": 4
+    },
+    {
+     "t": "LABEL:递增强度",
+     "w": 78,
+     "h": 18
+    },
+    {
+     "t": "optWaveScale",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:首领波次",
+     "w": 78,
+     "h": 18
+    },
+    {
+     "t": "optBossWave",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "wBossEvery",
+     "w": 130,
+     "h": 4
+    },
+    {
+     "t": "LABEL:双首领",
+     "w": 64,
+     "h": 18
+    },
+    {
+     "t": "optDoubleBoss",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "SUMMARY:士兵自动值守防线岗位",
+     "w": 296,
+     "h": 41
+    },
+    {
+     "t": "LABEL:让士兵自动值守防线岗",
+     "w": 172,
+     "h": 18
+    },
+    {
+     "t": "optPost",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "SUMMARY:画面选项",
+     "w": 296,
+     "h": 41
+    },
+    {
+     "t": "LABEL:战争迷雾（实验性功能",
+     "w": 155,
+     "h": 16
+    }
+   ]
+  },
+  "text": {
+   "nodes": 74,
+   "minFontSize": 11,
+   "minSample": "01 模式",
+   "histogram": {
+    "11": 6,
+    "12": 3,
+    "13": 7,
+    "15": 2,
+    "17": 1,
+    "12.5": 28,
+    "11.5": 3,
+    "13.5": 23,
+    "14.5": 1
+   },
+   "distinctColors": 13,
+   "topColors": [
+    "rgb(231, 238, 244)",
+    "rgb(159, 180, 221)",
+    "rgb(217, 164, 65)",
+    "rgb(255, 230, 176)",
+    "rgb(127, 147, 161)",
+    "rgb(143, 164, 204)",
+    "rgb(111, 132, 146)",
+    "rgb(216, 230, 239)",
+    "rgb(255, 176, 176)",
+    "rgb(255, 212, 121)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 1353,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_05_escort": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 30,
+   "under44": 25,
+   "samples": [
+    {
+     "t": "goHome",
+     "w": 91,
+     "h": 33
+    },
+    {
+     "t": "startReset",
+     "w": 140,
+     "h": 33
+    },
+    {
+     "t": "civRange",
+     "w": 150,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:−",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "BUTTON:＋",
+     "w": 39,
+     "h": 44
+    },
+    {
+     "t": "LABEL:开启支援部队",
+     "w": 105,
+     "h": 18
+    },
+    {
+     "t": "optReinforce",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:帝皇之力",
+     "w": 78,
+     "h": 18
+    },
+    {
+     "t": "optEmperor",
+     "w": 13,
+     "h": 13
+    }
+   ]
+  },
+  "text": {
+   "nodes": 78,
+   "minFontSize": 11,
+   "minSample": "01 模式",
+   "histogram": {
+    "11": 6,
+    "12": 9,
+    "13": 20,
+    "17": 1,
+    "12.5": 7,
+    "11.5": 4,
+    "13.5": 31
+   },
+   "distinctColors": 20,
+   "topColors": [
+    "rgb(231, 238, 244)",
+    "rgb(159, 180, 221)",
+    "rgb(217, 164, 65)",
+    "rgb(127, 147, 161)",
+    "rgb(255, 176, 176)",
+    "rgb(255, 212, 121)",
+    "rgb(255, 230, 176)",
+    "rgb(111, 132, 146)",
+    "rgb(216, 230, 239)",
+    "rgb(241, 226, 194)"
+   ]
+  },
+  "contrast": {
+   "under45": 3,
+   "worst": [
+    {
+     "t": "盾兵",
+     "r": 2.46,
+     "fs": 13.5,
+     "c": "rgb(30, 79, 168)",
+     "bg": "rgb(12,18,23)",
+     "grad": false
+    },
+    {
+     "t": "磁爆兵",
+     "r": 2.56,
+     "fs": 13.5,
+     "c": "rgb(168, 28, 28)",
+     "bg": "rgb(12,18,23)",
+     "grad": false
+    },
+    {
+     "t": "步枪兵",
+     "r": 3.51,
+     "fs": 13.5,
+     "c": "rgb(31, 122, 61)",
+     "bg": "rgb(12,18,23)",
+     "grad": false
+    }
+   ]
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 1497,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_06_help": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 8,
+   "under44": 1,
+   "samples": [
+    {
+     "t": "SUMMARY:完整机制 · 全部按",
+     "w": 322,
+     "h": 41
+    }
+   ]
+  },
+  "text": {
+   "nodes": 165,
+   "minFontSize": 11.5,
+   "minSample": "三条最要紧的",
+   "histogram": {
+    "12": 5,
+    "13": 9,
+    "17": 1,
+    "12.5": 3,
+    "11.5": 10,
+    "13.5": 137
+   },
+   "distinctColors": 7,
+   "topColors": [
+    "rgb(231, 238, 244)",
+    "rgb(217, 164, 65)",
+    "rgb(26, 18, 6)",
+    "rgb(241, 226, 194)",
+    "rgb(200, 214, 223)",
+    "rgb(169, 185, 197)",
+    "rgb(240, 217, 174)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 736,
+   "scrollH": 734,
+   "clientH": 734,
+   "needsScroll": false,
+   "pct": 87
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_07_settings": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 37,
+   "under44": 20,
+   "samples": [
+    {
+     "t": "volSlot",
+     "w": 266,
+     "h": 4
+    },
+    {
+     "t": "brightRange",
+     "w": 258,
+     "h": 4
+    },
+    {
+     "t": "LABEL:根据帧率调整渲染比例",
+     "w": 159,
+     "h": 24
+    },
+    {
+     "t": "qualityAdapt",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:枪口、爆炸与首领局部",
+     "w": 186,
+     "h": 24
+    },
+    {
+     "t": "glowLayerOn",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "glowStrength",
+     "w": 239,
+     "h": 4
+    },
+    {
+     "t": "LABEL:子弹曳光、墙缘高光、",
+     "w": 226,
+     "h": 24
+    },
+    {
+     "t": "fxOn",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:只显示人类与丧尸总占",
+     "w": 172,
+     "h": 24
+    },
+    {
+     "t": "minimalStats",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:启用屏幕震动",
+     "w": 105,
+     "h": 18
+    },
+    {
+     "t": "shakeOn",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "shakeScale",
+     "w": 204,
+     "h": 4
+    },
+    {
+     "t": "LABEL:按镜头距离衰减普通震",
+     "w": 172,
+     "h": 18
+    },
+    {
+     "t": "shakeDistance",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "SUMMARY:四、调试与版本",
+     "w": 322,
+     "h": 41
+    },
+    {
+     "t": "SUMMARY:创作者工具 · 录像",
+     "w": 322,
+     "h": 41
+    },
+    {
+     "t": "LABEL:记录单位快照",
+     "w": 105,
+     "h": 24
+    },
+    {
+     "t": "replayOn",
+     "w": 13,
+     "h": 13
+    }
+   ]
+  },
+  "text": {
+   "nodes": 55,
+   "minFontSize": 11.5,
+   "minSample": "一、音效",
+   "histogram": {
+    "13": 17,
+    "17": 1,
+    "11.5": 4,
+    "13.5": 27,
+    "12.5": 6
+   },
+   "distinctColors": 5,
+   "topColors": [
+    "rgb(231, 238, 244)",
+    "rgb(217, 164, 65)",
+    "rgb(143, 164, 204)",
+    "rgb(255, 230, 176)",
+    "rgb(241, 226, 194)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 1164,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_08_tune": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 71,
+   "under44": 65,
+   "samples": [
+    {
+     "t": "BUTTON:步枪兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:民兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:机枪兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:狙击手",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:盾兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:医疗兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:液氮兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:喷火兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:磁爆兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:激光兵",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:平民",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:丧尸",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:奔跑者",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:舔舐者",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:母体",
+     "w": 64,
+     "h": 40
+    },
+    {
+     "t": "utName",
+     "w": 150,
+     "h": 25
+    },
+    {
+     "t": "utColor",
+     "w": 38,
+     "h": 26
+    },
+    {
+     "t": "INPUT:34",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:8",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:216",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:360",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:0",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:1",
+     "w": 170,
+     "h": 4
+    },
+    {
+     "t": "BUTTON:↺",
+     "w": 34,
+     "h": 40
+    },
+    {
+     "t": "INPUT:2",
+     "w": 170,
+     "h": 4
+    }
+   ]
+  },
+  "text": {
+   "nodes": 106,
+   "minFontSize": 11.5,
+   "minSample": "选兵种",
+   "histogram": {
+    "12": 41,
+    "13": 6,
+    "17": 1,
+    "12.5": 6,
+    "11.5": 4,
+    "13.5": 48
+   },
+   "distinctColors": 9,
+   "topColors": [
+    "rgb(159, 180, 221)",
+    "rgb(255, 212, 121)",
+    "rgb(185, 200, 211)",
+    "rgb(231, 238, 244)",
+    "rgb(217, 164, 65)",
+    "rgb(241, 226, 194)",
+    "rgb(216, 195, 154)",
+    "rgb(255, 176, 176)",
+    "rgb(255, 230, 176)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 2917,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_09_touch": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 48,
+   "under44": 36,
+   "samples": [
+    {
+     "t": "LABEL:大小",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:52",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:透明",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:25",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:隐藏",
+     "w": 46,
+     "h": 20
+    },
+    {
+     "t": "INPUT:on",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:大小",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:52",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:透明",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:25",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:隐藏",
+     "w": 46,
+     "h": 20
+    },
+    {
+     "t": "INPUT:on",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:大小",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:42",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:透明",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:25",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:隐藏",
+     "w": 46,
+     "h": 20
+    },
+    {
+     "t": "INPUT:on",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:大小",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:44",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:透明",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:25",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:隐藏",
+     "w": 46,
+     "h": 20
+    },
+    {
+     "t": "INPUT:on",
+     "w": 13,
+     "h": 13
+    },
+    {
+     "t": "LABEL:大小",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:64",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:透明",
+     "w": 122,
+     "h": 20
+    },
+    {
+     "t": "INPUT:30",
+     "w": 92,
+     "h": 4
+    },
+    {
+     "t": "LABEL:隐藏",
+     "w": 46,
+     "h": 20
+    },
+    {
+     "t": "INPUT:on",
+     "w": 13,
+     "h": 13
+    }
+   ]
+  },
+  "text": {
+   "nodes": 40,
+   "minFontSize": 11,
+   "minSample": "换弹",
+   "histogram": {
+    "11": 24,
+    "12": 6,
+    "13": 6,
+    "17": 1,
+    "12.5": 1,
+    "13.5": 2
+   },
+   "distinctColors": 5,
+   "topColors": [
+    "rgb(159, 178, 191)",
+    "rgb(255, 230, 176)",
+    "rgb(231, 238, 244)",
+    "rgb(241, 226, 194)",
+    "rgb(143, 164, 204)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 983,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_10_battle": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "bPause",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bSpeed",
+      "w": 41,
+      "h": 44,
+      "mn": 41
+     },
+     {
+      "t": "bFull",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bMenu",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "placeSel",
+      "w": 168,
+      "h": 34,
+      "mn": 34
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "bControl",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "batchMinus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "batchVal",
+      "w": 30,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "batchPlus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "waveRange",
+      "w": 120,
+      "h": 4,
+      "mn": 4
+     },
+     {
+      "t": "waveVal",
+      "w": 34,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "bWave",
+      "w": 75,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bPromote",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#econHud",
+    "y": 52,
+    "h": 62,
+    "w": 104,
+    "sw": 100,
+    "cw": 100,
+    "ox": "visible",
+    "children": [
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 17,
+      "mn": 17
+     },
+     {
+      "t": "econRate",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     },
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     }
+    ]
+   }
+  ],
+  "root": "BODY",
+  "interactive": {
+   "total": 14,
+   "under44": 5,
+   "samples": [
+    {
+     "t": "bSpeed",
+     "w": 41,
+     "h": 44
+    },
+    {
+     "t": "placeSel",
+     "w": 168,
+     "h": 34
+    },
+    {
+     "t": "batchMinus",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "batchPlus",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "waveRange",
+     "w": 120,
+     "h": 4
+    }
+   ]
+  },
+  "text": {
+   "nodes": 25,
+   "minFontSize": 10,
+   "minSample": "资源",
+   "histogram": {
+    "10": 1,
+    "11": 1,
+    "12": 12,
+    "13": 2,
+    "16": 3,
+    "10.5": 5,
+    "13.5": 1
+   },
+   "distinctColors": 10,
+   "topColors": [
+    "rgb(185, 200, 211)",
+    "rgb(231, 238, 244)",
+    "rgb(223, 230, 245)",
+    "rgb(255, 230, 176)",
+    "rgb(143, 162, 176)",
+    "rgb(230, 210, 168)",
+    "rgb(127, 147, 161)",
+    "rgb(143, 224, 160)",
+    "rgb(217, 164, 65)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": [
+   {
+    "id": "mCtrl",
+    "x": 31,
+    "y": 658,
+    "w": 52,
+    "h": 52,
+    "op": "0.25"
+   }
+  ]
+ },
+ "m_11_control": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "bPause",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bSpeed",
+      "w": 41,
+      "h": 44,
+      "mn": 41
+     },
+     {
+      "t": "bFull",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bMenu",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "placeSel",
+      "w": 168,
+      "h": 34,
+      "mn": 34
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "bControl",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "batchMinus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "batchVal",
+      "w": 30,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "batchPlus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "waveRange",
+      "w": 120,
+      "h": 4,
+      "mn": 4
+     },
+     {
+      "t": "waveVal",
+      "w": 34,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "bWave",
+      "w": 75,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bPromote",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#econHud",
+    "y": 52,
+    "h": 62,
+    "w": 104,
+    "sw": 100,
+    "cw": 100,
+    "ox": "visible",
+    "children": [
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 17,
+      "mn": 17
+     },
+     {
+      "t": "econRate",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     },
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     }
+    ]
+   }
+  ],
+  "root": "BODY",
+  "interactive": {
+   "total": 18,
+   "under44": 6,
+   "samples": [
+    {
+     "t": "bSpeed",
+     "w": 41,
+     "h": 44
+    },
+    {
+     "t": "placeSel",
+     "w": 168,
+     "h": 34
+    },
+    {
+     "t": "batchMinus",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "batchPlus",
+     "w": 35,
+     "h": 44
+    },
+    {
+     "t": "waveRange",
+     "w": 120,
+     "h": 4
+    },
+    {
+     "t": "mFull",
+     "w": 42,
+     "h": 44
+    }
+   ]
+  },
+  "text": {
+   "nodes": 29,
+   "minFontSize": 10,
+   "minSample": "资源",
+   "histogram": {
+    "10": 1,
+    "11": 1,
+    "12": 15,
+    "13": 2,
+    "16": 3,
+    "19": 1,
+    "10.5": 5,
+    "13.5": 1
+   },
+   "distinctColors": 11,
+   "topColors": [
+    "rgb(185, 200, 211)",
+    "rgb(255, 230, 176)",
+    "rgb(231, 238, 244)",
+    "rgb(223, 230, 245)",
+    "rgb(143, 162, 176)",
+    "rgb(230, 210, 168)",
+    "rgb(127, 147, 161)",
+    "rgb(143, 224, 160)",
+    "rgb(217, 164, 65)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": [
+   {
+    "id": "mReload",
+    "x": 335,
+    "y": 658,
+    "w": 52,
+    "h": 52,
+    "op": "0.25"
+   },
+   {
+    "id": "mCtrl",
+    "x": 31,
+    "y": 658,
+    "w": 52,
+    "h": 52,
+    "op": "0.25"
+   },
+   {
+    "id": "mFull",
+    "x": 343,
+    "y": 68,
+    "w": 42,
+    "h": 44,
+    "op": "0.25"
+   },
+   {
+    "id": "mMenu",
+    "x": 343,
+    "y": 186,
+    "w": 44,
+    "h": 44,
+    "op": "0.25"
+   },
+   {
+    "id": "mPounce",
+    "x": 281,
+    "y": 464,
+    "w": 56,
+    "h": 56,
+    "op": "0.3"
+   }
+  ]
+ },
+ "m_12_pause": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "bPause",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bSpeed",
+      "w": 41,
+      "h": 44,
+      "mn": 41
+     },
+     {
+      "t": "bFull",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bMenu",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "placeSel",
+      "w": 168,
+      "h": 34,
+      "mn": 34
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "bControl",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "batchMinus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "batchVal",
+      "w": 30,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "batchPlus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "waveRange",
+      "w": 120,
+      "h": 4,
+      "mn": 4
+     },
+     {
+      "t": "waveVal",
+      "w": 34,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "bWave",
+      "w": 75,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bPromote",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#econHud",
+    "y": 52,
+    "h": 62,
+    "w": 104,
+    "sw": 100,
+    "cw": 100,
+    "ox": "visible",
+    "children": [
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 17,
+      "mn": 17
+     },
+     {
+      "t": "econRate",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     },
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     }
+    ]
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 4,
+   "under44": 0,
+   "samples": []
+  },
+  "text": {
+   "nodes": 44,
+   "minFontSize": 8.5,
+   "minSample": "机枪兵",
+   "histogram": {
+    "9": 10,
+    "10": 2,
+    "11": 2,
+    "13": 4,
+    "16": 6,
+    "17": 1,
+    "12.5": 1,
+    "10.5": 6,
+    "11.5": 2,
+    "8.5": 10
+   },
+   "distinctColors": 10,
+   "topColors": [
+    "rgb(200, 216, 255)",
+    "rgb(255, 255, 255)",
+    "rgb(143, 162, 176)",
+    "rgb(240, 217, 174)",
+    "rgb(217, 164, 65)",
+    "rgb(127, 147, 160)",
+    "rgb(231, 238, 244)",
+    "rgb(241, 226, 194)",
+    "rgb(159, 180, 221)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 6,
+   "worst": [
+    {
+     "t": "3",
+     "r": 1.12,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(242,242,242)",
+     "grad": false
+    },
+    {
+     "t": "640",
+     "r": 1.12,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(242,242,242)",
+     "grad": false
+    },
+    {
+     "t": "268",
+     "r": 1.62,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(245,197,66)",
+     "grad": false
+    },
+    {
+     "t": "1.8W",
+     "r": 1.62,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(245,197,66)",
+     "grad": false
+    },
+    {
+     "t": "54",
+     "r": 2.19,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(127,182,216)",
+     "grad": false
+    },
+    {
+     "t": "9.6K",
+     "r": 2.19,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(127,182,216)",
+     "grad": false
+    }
+   ]
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 738,
+   "scrollH": 736,
+   "clientH": 736,
+   "needsScroll": false,
+   "pct": 87
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_13_market": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "bPause",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bSpeed",
+      "w": 41,
+      "h": 44,
+      "mn": 41
+     },
+     {
+      "t": "bFull",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bMenu",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "placeSel",
+      "w": 168,
+      "h": 34,
+      "mn": 34
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "bControl",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "batchMinus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "batchVal",
+      "w": 30,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "batchPlus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "waveRange",
+      "w": 120,
+      "h": 4,
+      "mn": 4
+     },
+     {
+      "t": "waveVal",
+      "w": 34,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "bWave",
+      "w": 75,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bPromote",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#econHud",
+    "y": 52,
+    "h": 62,
+    "w": 104,
+    "sw": 100,
+    "cw": 100,
+    "ox": "visible",
+    "children": [
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 17,
+      "mn": 17
+     },
+     {
+      "t": "econRate",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     },
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     }
+    ]
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 19,
+   "under44": 8,
+   "samples": [
+    {
+     "t": "BUTTON:枪口：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:弹匣：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:瞄具：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:靴子：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:防护服：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:赐福：—",
+     "w": 120,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:改装枪械",
+     "w": 75,
+     "h": 40
+    },
+    {
+     "t": "BUTTON:角色升级",
+     "w": 75,
+     "h": 40
+    }
+   ]
+  },
+  "text": {
+   "nodes": 59,
+   "minFontSize": 12,
+   "minSample": "枪口：—",
+   "histogram": {
+    "12": 44,
+    "13": 11,
+    "17": 1,
+    "12.5": 3
+   },
+   "distinctColors": 8,
+   "topColors": [
+    "rgb(159, 180, 221)",
+    "rgb(231, 238, 244)",
+    "rgb(185, 200, 211)",
+    "rgb(223, 230, 245)",
+    "rgb(241, 226, 194)",
+    "rgb(255, 212, 121)",
+    "rgb(143, 224, 160)",
+    "rgb(255, 230, 176)"
+   ]
+  },
+  "contrast": {
+   "under45": 0,
+   "worst": []
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 374,
+   "h": 826,
+   "scrollH": 1377,
+   "clientH": 824,
+   "needsScroll": true,
+   "pct": 98
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ },
+ "m_14_result": {
+  "viewport": {
+   "w": 390,
+   "h": 844,
+   "dpr": 2,
+   "coarse": true,
+   "fine": false,
+   "touchUi": true
+  },
+  "bars": [
+   {
+    "sel": "#top",
+    "y": 0,
+    "h": 53,
+    "w": 390,
+    "sw": 390,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "bPause",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bSpeed",
+      "w": 41,
+      "h": 44,
+      "mn": 41
+     },
+     {
+      "t": "bFull",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bMenu",
+      "w": 65,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#bottom",
+    "y": 791,
+    "h": 53,
+    "w": 390,
+    "sw": 744,
+    "cw": 390,
+    "ox": "auto",
+    "children": [
+     {
+      "t": "placeSel",
+      "w": 168,
+      "h": 34,
+      "mn": 34
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "bControl",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "batchMinus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "batchVal",
+      "w": 30,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "batchPlus",
+      "w": 35,
+      "h": 44,
+      "mn": 35
+     },
+     {
+      "t": "SPAN",
+      "w": 1,
+      "h": 20,
+      "mn": 1
+     },
+     {
+      "t": "SPAN",
+      "w": 32,
+      "h": 21,
+      "mn": 21
+     },
+     {
+      "t": "waveRange",
+      "w": 120,
+      "h": 4,
+      "mn": 4
+     },
+     {
+      "t": "waveVal",
+      "w": 34,
+      "h": 16,
+      "mn": 16
+     },
+     {
+      "t": "bWave",
+      "w": 75,
+      "h": 44,
+      "mn": 44
+     },
+     {
+      "t": "bPromote",
+      "w": 51,
+      "h": 44,
+      "mn": 44
+     }
+    ]
+   },
+   {
+    "sel": "#editTabs",
+    "y": 0,
+    "h": 0,
+    "w": 0,
+    "sw": 0,
+    "cw": 0,
+    "ox": "auto",
+    "children": []
+   },
+   {
+    "sel": "#econHud",
+    "y": 52,
+    "h": 62,
+    "w": 104,
+    "sw": 100,
+    "cw": 100,
+    "ox": "visible",
+    "children": [
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 17,
+      "mn": 17
+     },
+     {
+      "t": "econRate",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     },
+     {
+      "t": "DIV",
+      "w": 84,
+      "h": 14,
+      "mn": 14
+     }
+    ]
+   }
+  ],
+  "root": "panel",
+  "interactive": {
+   "total": 4,
+   "under44": 0,
+   "samples": []
+  },
+  "text": {
+   "nodes": 36,
+   "minFontSize": 8.5,
+   "minSample": "机枪兵",
+   "histogram": {
+    "9": 10,
+    "10": 2,
+    "11": 2,
+    "13": 4,
+    "16": 3,
+    "17": 1,
+    "10.5": 3,
+    "11.5": 1,
+    "8.5": 10
+   },
+   "distinctColors": 9,
+   "topColors": [
+    "rgb(200, 216, 255)",
+    "rgb(255, 255, 255)",
+    "rgb(143, 162, 176)",
+    "rgb(240, 217, 174)",
+    "rgb(217, 164, 65)",
+    "rgb(231, 238, 244)",
+    "rgb(127, 147, 160)",
+    "rgb(185, 224, 168)",
+    "rgb(26, 18, 6)"
+   ]
+  },
+  "contrast": {
+   "under45": 6,
+   "worst": [
+    {
+     "t": "3",
+     "r": 1.12,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(242,242,242)",
+     "grad": false
+    },
+    {
+     "t": "640",
+     "r": 1.12,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(242,242,242)",
+     "grad": false
+    },
+    {
+     "t": "268",
+     "r": 1.62,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(245,197,66)",
+     "grad": false
+    },
+    {
+     "t": "1.8W",
+     "r": 1.62,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(245,197,66)",
+     "grad": false
+    },
+    {
+     "t": "54",
+     "r": 2.19,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(127,182,216)",
+     "grad": false
+    },
+    {
+     "t": "9.6K",
+     "r": 2.19,
+     "fs": 9,
+     "c": "rgb(255, 255, 255)",
+     "bg": "rgb(127,182,216)",
+     "grad": false
+    }
+   ]
+  },
+  "truncated": {
+   "count": 0,
+   "samples": []
+  },
+  "panel": {
+   "w": 220,
+   "h": 581,
+   "scrollH": 579,
+   "clientH": 579,
+   "needsScroll": false,
+   "pct": 69
+  },
+  "hud": {
+   "VW": 390,
+   "VH": 844,
+   "BOTBAR_H": 53,
+   "ratioBar": {
+    "x": 109,
+    "y": 769,
+    "w": 172,
+    "h": 12
+   },
+   "minimal": true
+  },
+  "hudOverlap": {
+   "barTop": 791,
+   "barBottomPx": 781,
+   "gapPx": 10
+  },
+  "mobileFloat": []
+ }
+}

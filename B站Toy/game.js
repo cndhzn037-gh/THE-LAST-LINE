@@ -1,0 +1,24599 @@
+
+"use strict";
+/* ============================================================================
+   归墟防线 · 人类最后的沙盘     单文件 / 无依赖 / 离线可玩（原代号：丧尸沙盘）
+   分节：1 CONFIG  2 工具  3 空间网格  4 导航与A*  5 物理  6 实体
+        7 AI  8 战斗与感染  9 模拟  10 存档  11 渲染  12 输入与UI  13 Boot
+   ============================================================================ */
+
+/* ------------------------- 1. CONFIG 全部可调数值 ------------------------- */
+var CFG = {
+  world: { w: 4096, h: 2304, tile: 32, cell: 96 },
+  /* 地图预设：改的是尺寸和地形布局，不碰任何兵种数值。
+     尺寸必须在 buildScenario 里先落到 CFG.world 上，NAV 和相机都按它自适应 */
+  mapPreset: "town",
+  portWave: { gapMul: 0.72, sizeMul: 1.12, firstMax: 22, scoutEvery: 3, scoutRunners: 8, scoutLickers: 1 },
+  portEvent: { bomberEvery: 2, bombers: 2 },
+  waveEvent: { every: 2, runners: 8, lickers: 2, bombers: 2,
+    profiles: {
+      runner: { share: 0.85, countMul: 1.55 },
+      bomber: { share: 0.30, countMul: 1.00 },
+      licker: { share: 0.12, countMul: 0.80, max: 3 }
+    } },
+  step: 1 / 60,
+  maxSteps: 4,
+  /* 第二轮：全单位最大速度 ×3、加速度小幅下调，人类更敏捷，丧尸加速更久且会冲过头 */
+  /* 模式级的全局倍率，由各场景生成时设定（默认都是 1） */
+  game: { zombieHpMul: 1, knockMul: 1, recoverT: 0, recoverAcc: 1 },
+  /* 丧尸拆可破坏墙：靠近且墙体挡在目标前方时才会动手 */
+  zombieWall: { dmg: 7, interval: 0.45, range: 46 },
+  tyrant: { searchMul: 9, searchRate: 0.5, chargeTime: 1.5, dashLenMul: 6, dashDur: 0.55, shockMul: 3, slowMul: 2, spawnEvery: 0.5, spawnCount: 3, spawnInitialMul: 1.35, orbSpeed: 620, orbMax: 80, shieldDur: 20, shieldMul: 100, eliteCount: 10, stageEliteCount: 30, eliteR: 10, eliteHp: 15 },
+  bossPool: ["plagueNest", "tyrant"],
+  plagueNest: { segPct: [0.28, 0.24, 0.20, 0.16, 0.12], eggEvery: 5, eggCount: 3, eggSpawnR: 300, eggHatch: 3, eggRelease: 1, eggMax: 1, eggHp: 24,
+                hpShockR: 900, hpShockLife: 1.0, tempHpDur: 8, deathMothers: 30, deathRadius: 260, reward: 10000 },
+  /* 额外速度余量随时间收窄，速度才能平滑滑下来，而不是到点被上限硬切 */
+  boostDecay: 4.0,
+  /* 武装单位多少秒没开枪就自动把弹匣补满 */
+  noFireReload: 10.0,
+  /* 2.0 AI 装填节奏：开关与思考间隔，出问题可整体关掉 */
+  proactiveReload: true, reloadThink: 0.35,
+  /* 速度整体下调、加速度上调；人类额外拥有高制动加速度，能迅速停下 */
+  unit: {
+    zombie:   { r: 8,  vmax: 148, acc: 200, hp: 5,    name: "丧尸",   color: "#8b3fe8" },
+    mother:   { r: 13, vmax: 96,  acc: 120, hp: 120,  name: "母体",   color: "#c9a7eb" },
+    plagueNest: { r: 240, vmax: 28.8, acc: 30, hp: 2000, name: "瘟疫巢主", color: "#7d4f9e", boss: true },
+    tyrant: { r: 120, vmax: 86.4, acc: 80, hp: 1200, name: "毁灭暴君", color: "#d65a5a", boss: true },
+    nestEgg:  { r: 14, vmax: 0,   acc: 0,   hp: 24,   name: "疫卵",   color: "#a6d98c" },
+    /* 奔跑者：跑得是普通丧尸的两倍，但只有 3 点血，一梭子就能放倒 */
+    runner:   { r: 8,  vmax: 296, acc: 260, hp: 3,    name: "奔跑者", color: "#a03030" },
+    /* 舔舐者：站在远处读条，读满就伸舌头把人类拽过来。自己不能动，舌头能被打断 */
+    licker:   { r: 9,  vmax: 148, acc: 200, hp: 20,   name: "舔舐者", color: "#e86d6d" },
+    /* 自爆丧尸：体型和速度都夹在母体与普通丧尸中间，死了先蓄一秒再炸 */
+    bomber:   { r: 10, vmax: 122, acc: 160, hp: 30,   name: "自爆丧尸", color: "#939b1c" },
+    /* 人类最高速度整体上调：平时按 cruiseMul 巡航，只有受惊或掉队时才真的跑满 */
+    civilian: { r: 8,  vmax: 170, acc: 350, hp: 24,   name: "平民",   color: "#b7f0a8" },
+    rifle:    { r: 8,  vmax: 215, acc: 360, hp: 34,   name: "步枪兵", color: "#1f7a3d" },
+    /* 民兵：自定义枪械走通用 gunOf 路径，不复制一套新的枪械系统 */
+    militia:  { r: 8,  vmax: 205, acc: 340, hp: 30,   name: "民兵", color: "#d9a441",
+                gun: { r: 130, interval: 0.5, spreadDeg: 8, dmg: 10, mag: 24, reload: 2.0 } },
+    mg:       { r: 9,  vmax: 203, acc: 340, hp: 44,   name: "机枪兵", color: "#f5c542" },
+    /* 狙击手压深一点：液氮兵用的是亮冰蓝，两者都是蓝系，必须拉开一档 */
+    sniper:   { r: 8,  vmax: 195, acc: 350, hp: 30,   name: "狙击手", color: "#7fb6d8" },
+    shield:   { r: 10, vmax: 190, acc: 340, hp: 60,   name: "盾兵",   color: "#1e4fa8" },
+    /* 医疗兵：体型、速度、寻路都跟平民一致，只是手里拿的是治疗枪 */
+    medic:    { r: 8,  vmax: 170, acc: 350, hp: 24,   name: "医疗兵", color: "#f2f2f2" },
+    /* ---- 1.3.3 四个新兵种 ----
+       gun 字段让它们自动进入"武装单位"与兵种库；
+       真正的开火逻辑在这四个兵种各自的专用分支里，不走通用子弹路径 */
+    cryo:     { r: 9,  vmax: 203, acc: 340, hp: 40,   name: "液氮兵", color: "#7fd8ff",
+                line: true, gun: { name: "液氮罐", r: 840, interval: 0.5, spreadDeg: 0, dmg: 0, mag: 1, reload: 3.0, widthMul: 2 } },
+    flame:    { r: 9,  vmax: 203, acc: 340, hp: 44,   name: "喷火兵", color: "#ff8a3d",
+                /* 射程砍掉 1/3：840 → 560，手太长压不住 */
+                line: true, gun: { name: "喷火器", r: 560, interval: 0.1, spreadDeg: 0, dmg: 2, mag: 100, reload: 5.0, widthMul: 3 } },
+    tesla:    { r: 8,  vmax: 200, acc: 345, hp: 32,   name: "磁爆兵", color: "#a81c1c",
+                line: true, gun: { name: "磁暴线圈", r: 560, interval: 0.1, spreadDeg: 0, dmg: 1, mag: 25, reload: 6.0, widthMul: 2 } },
+    laser:    { r: 8,  vmax: 198, acc: 350, hp: 34,   name: "激光兵", color: "#3fe0c0",
+                line: true, gun: { name: "镭射核心", r: 840, interval: 2.0, spreadDeg: 0, dmg: 1.5, mag: 1, reload: 0.5, widthMul: 2 } }
+  },
+  /* 恐惧半径：让人类能在丧尸扑到身上之前先拉开距离（武装 130 / 平民 260） */
+  fearR: 130,
+  fearRCivilian: 260,
+  /* 按兵种覆盖恐惧半径 / 后坐力（兵种数据面板会往这里写）。空对象 = 全部走预设 */
+  fearRBy: {},
+  recoilBy: {},
+  humanBrake: 1500,
+  bossHunt: { range: 2800 },  /* 武装单位在附近无威胁时主动向首领推进的最大距离 */         /* 人类制动加速度：想停就能立刻停住，不会被惯性推着滑一段 */
+  /* 巡航速度：平时只走到最高速的这个比例。受惊（进入恐惧圈）或掉队太远时才放开到满速，
+     所以"最高速度"是应急储备而不是日常步速 */
+  /* 全局速度比例：乘在"兵种最高速"之上，一个旋钮统一调全场快慢 */
+  speedScale: 1.0,
+  cruiseMul: 0.78,
+  strayDist: 460,           /* 判定"掉队"的距离：离护卫/同伴超过它就跑满速去追 */
+  retakeFearMul: 0.5,       /* 夺回坚守点位途中，恐惧半径缩小到一半 */
+  defendLeave: 36,          /* 离坚守点位多远算“已不在位” */
+  fireSlowMul: 0.7,         /* 开火时移速降到 70%（射击惩罚） */
+  fireSlowHold: 0.35,       /* 停火后仍维持减速的时间 */
+  fireDistMin: 190,         /* 步枪兵希望维持的最小交战距离 */
+  far:  { r: 840, interval: 1.0,  spreadDeg: 0, dmg: 2, mag: 30,  reload: 1.5 },
+  /* 狙击枪：射程无限、弹匣 1、换弹 5 秒、伤害 4、可穿一堵墙、对丧尸无限穿透、子弹更快更粗且带光效 */
+  sniper: { r: 100000, interval: 3.0, spreadDeg: 0, dmg: 4, mag: 5, reload: 5.0,
+            widthMul: 5, wallPierce: 9999, speedMul: 3, fearMul: 2, guards: 2,
+            len: 340, flashLen: 150, flashWid: 84,
+            hitRMul: 3, trailLife: 1.0, trailMul: 3,
+            /* 脱战多久就主动出发找目标；打出一枪立刻回到原来的游走找射位机制 */
+            huntAfter: 4.0 },
+  /* 盾兵手枪：射程同速射、攻速同远射、伤害 1。照常消耗弹药、照常换弹 */
+  pistol: { r: 130, interval: 1.0, spreadDeg: 8, dmg: 5 },
+  /* 盾兵护盾：可承受丧尸接触累计 6 秒，破裂时放出一圈冲击波推开来敌，8 秒后恢复。
+     盾兵被感染不会尸变，而是在 2 秒后自爆（伤害 4，半径等于恐惧范围） */
+  militiaEvent: { chance: 0.01 },
+  shield: { hp: 6.0, regen: 8.0,
+            /* 冲击波位移拆成小步推进（每步 blastStep 像素，必须小于最薄的墙）：
+               一次推一百多像素会直接跨过二十像素厚的墙，落点已经在墙的另一侧，
+               collideObstacles 的 AABB 快速排除就再也发现不了那堵墙了 */
+            /* 护盾每掉这么多百分比就放一次很弱的推力 */
+            pulseStep: 0.2, pulseDmg: 1, pulsePush: 34,
+            /* 英雄防护罩：半径取平民恐惧半径，只挡丧尸；扛 15 秒接触，
+               脱离接触 10 秒后按比例慢慢回满 */
+            domeHp: 15.0, domeRegen: 10.0, domeDmg: 4, domeRestore: 10.0,
+            /* 护盾碎裂的那一瞬间给本体一小段无敌：
+               否则"护盾耐久归零"和"接触判定落到本体上"会挤在同一帧，
+               看起来就是盾一碎立刻被感染 */
+            graceT: 0.5,
+            blastStep: 6,
+            blastPush: 115,      /* 护盾碎裂时把丧尸推开的距离（px） */
+            blastPushDet: 85,    /* 自爆时的推开距离（px） */
+            /* 冲击波之后的一小段惯性：被炸飞的东西不会当场钉在原地。
+               初速度、失控时长、以及失控期间自身加速度的倍率，
+               三者合起来保证"滑一段"但绝不会甩得满地图乱飞 */
+            blastVel: 190, stunT: 0.45, stunAccMul: 0.12,
+            detonateDelay: 2.0, detonateDmg: 4, shockLife: 0.45 },
+  /* 舔舐者 */
+  licker: {
+    tongueHp: 30,          /* 舌头的血量（原 15，太容易被顺手打掉了，翻倍） */
+    windup: 2.0,           /* 读条 2 秒 */
+    reachMul: 5.0,         /* 起手距离 = 平民恐惧半径 × 5（原来是 ×2，射程太短，加了 150%） */
+    loseMul: 1.5,          /* 目标跑出"射程 × 1.5"就断线 */
+    track: 0.30,           /* 舌头的弱追踪强度：每帧朝目标方向转这么多，不是瞬间锁死 */
+    retract: 2600,         /* 断线后缩回去的速度（px/s） */
+    speedDiv: 2,           /* 舌头末端速度 = 步枪弹速 ÷ 2 */
+    dragDiv: 5,            /* 把目标往回拽的速度 = 丧尸移速 ÷ 5 */
+    dragBoost: 2.0,        /* 命中后的拖拽倍率：拉人的速度比过来时快一倍 */
+    holdT: 4.5,            /* 粘住之后最多拖这么久，到点自动松手，
+                              不然一条舌头能把人拖二十秒，另一只舔舐者永远轮不上 */
+    tongueW: 3.4,          /* 舌头粗细（人类半径的一半左右） */
+    fleeMul: 0.333,        /* 被打断后逃跑速度 = 自身移速的三分之一 */
+    cd: 4.0,               /* 舌头被打断后的冷却：4 秒内不能再读条（原 5 秒，缩短后压得更紧） */
+    color: "#c94b4b"       /* 比本体深一点的红色 */
+  },
+  /* 自爆丧尸：死掉不会立刻消失，原地把光闪成一片白再炸开 */
+  bomber: {
+    armT: 1.0,             /* 蓄爆时长：这一秒里越闪越快、越胀越大 */
+    bloat: 2.0,            /* 爆前的最大体型倍率（指数曲线，末尾才到 2 倍） */
+    kbMul: 0.18,           /* 中弹后只后退几个像素，不走正常的踉跄 */
+    stopT: 0.15,           /* 中弹后原地顿一下 */
+    blastRMul: 2.0,        /* 冲击波半径 = 平民恐惧范围直径（260 × 2） */
+    slowT: 1.0, slowMul: 0.2,   /* 被波及的人类：减速 80%，持续 1 秒 */
+    popT: 0.5, popCount: 5,     /* 0.5 秒内随机落 5 块血，大小随机 */
+    ringT: 0.6, ringStep: 0.1,  /* 每 0.1 秒一圈纯特效环 */
+    shockLife: 0.9         /* 黄色冲击波扩散得比护盾爆碎慢 */
+  },
+  /* 医疗兵：读条一秒锁定身边最多四个"被感染过"的己方，读满就打一组追踪治疗弹 */
+  medic: {
+    r: 630,                /* 锁定范围：步枪远射射程（840）的一半再上调 50% */
+    windup: 1.0,           /* 脚下读条一秒，满了立刻出手：凑不齐数量就把额度摊到现有目标上 */
+    maxLock: 4,            /* 一次最多锁四个 */
+    scopeLock: 5,          /* 买了瞄准镜之后能锁五个 */
+    cd: 2.0,               /* 每次治疗之后的冷却 */
+    mag: 12, reload: 8.0,
+    dmgZombie: 3,          /* 打丧尸每发三点 */
+    speedDiv: 2,           /* 弹速 = 步枪弹速 ÷ 2 */
+    lenDiv: 2,             /* 弹体长度 = 步枪弹长 ÷ 2 */
+    widthMul: 3,           /* 宽度等同机枪弹 */
+    popCount: 3,           /* 治愈成功时头顶飘出的绿色十字符号数量 */
+    popLife: 1.1, popRise: 40,   /* 每个符号飘多久、飘多高 */
+    turn: 0.20,            /* 追踪转向强度：每帧朝目标拧这么多 */
+    life: 4.0,
+    color: "#35ff6e"
+  },
+  /* 母体产卵：每掉总血量 20% 产 10 只 */
+  brood: { step: 0.2, count: 10 },
+  /* 速射只在恐惧半径内触发；射速减半、散布收窄。半径与恐惧半径保持一致 */
+  near: { r: 130, interval: 0.06, spreadDeg: 5, dmg: 2 },
+  /* 机枪兵：射程同远射，0.07s/发，14° 散射（已从 28° 收窄一半，弹着点更像一束），
+     弹匣 100，换弹 6s，伤害 3，最多穿透 1 个目标 */
+  /* 机枪弹：不要求致死即可穿透（默认穿 2 个目标）；穿掉的单位里只要出现击杀就再追加一次穿透 */
+  mg:   { r: 840, interval: 0.07, spreadDeg: 7, dmg: 3, mag: 100, reload: 6.0, widthMul: 3,
+          hits: 2, maxHits: 6 },
+  bullet: { speed: 4200, len: 75, life: 1.6, hue: 52, width: 0.7, pierce: 1 },
+  /* 开火瞬间的一帧光晕特效 */
+  flash: { len: 30, wideLen: 54, life: 0.04 },
+  /* 后坐力：每次开火沿射击反方向给射手一个瞬时速度增量。
+     倍率：步枪 1、机枪 1.5、狙击 3、破盾手枪 0.6；unit 是"1 倍"对应的 px/s。
+     boostTime 是允许短暂超速的时长（这样边退边打才真的能退得更快），
+     undoTime 是恐惧半径内没有丧尸时朝射击方向顶回去的时长 */
+  recoil: { unit: 42, rifle: 1, mg: 1.5, sniper: 3, shield: 0.6, civilian: 0,
+            boostTime: 0.28, undoTime: 0.16, undoMul: 1.0,
+            /* 后坐力抵消：抵消加速度 = 这把枪的平均推力率 × counterMul。
+               必须小于 1，射手只是"勉强站得住"，还会被一点点推着走；
+               等于或大于 1 就等于把后坐力整个抹掉，机枪兵会顶着满额后坐力高速前压。
+               逃跑时不抵消，那时候本来就该顺着推力走 */
+            counterMul: 0.85 },
+  /* 目标够不着时暂时放弃：寻路走到头也到不了（典型情况是目标躲在密闭空间里、
+     或者隔着一道永远打不通的墙），就冷却一段时间不再理它，
+     免得单位对着它反反复复重算路径白烧 CPU */
+  giveUp: { dist: 42, time: 6.0, maxMul: 8, recheck: 100, maxHold: 120 },
+  /* 手头一个可达目标都没有时，丧尸改为慢速游荡而不是满速直冲 */
+  zombieWanderMul: 0.34,
+  /* 英雄单位：战场上某一类人只剩最后一个时，他会升格 */
+  hero: {
+    sizeMul: 1.35,        /* 体积放大倍数 */
+    shockPush: 150,       /* 金光冲击波的击退距离（px） */
+    shockDmg: 2,          /* 金光冲击波的伤害 */
+    suitTime: 3.0,        /* 防护服能扛住的累计接触时间（秒），扛完就破 */
+    textLife: 8.0,        /* 头顶那行金字停留多久 */
+    /* 金光冲击波半径 = 该单位恐惧半径 × 这个系数 */
+    shockR: 2.0,
+    /* 平民英雄的光环：半径是恐惧半径的 1.5 倍，圈内所有单位无限弹药 */
+    auraR: 1.5,
+    /* 平民升格后跑得更快 */
+    civSpeedMul: 1.25,
+    /* 英雄的枪械后坐力只剩一成，否则他会一直把自己的火力推着满地跑 */
+    recoilMul: 0.1,
+    /* 两名英雄（武装 + 平民）同时在场时，彼此靠到这么近就算抱团成功 */
+    pairDist: 90,
+    /* 手动指名升格的花费（与经济同比例，原 1500 ×10） */
+    cost: 15000,
+    /* 武装英雄射速翻倍；站在平民英雄光环里的人再快两成 */
+    rateMul: 2.0, auraRate: 1.2,
+    /* 武装英雄的附加武器：与该单位的原武器同型（同样的伤害、射程、弹匣、穿透），
+       只是攻速上略有浮动，一把稍快、一把稍慢。数值是攻速倍率 */
+    guns: [0.90, 1.12],
+    /* 医疗兵英雄不挂额外的枪，改把弹匣容量和一次锁定的额度各扩到三倍 */
+    medicMagMul: 3, medicLockMul: 3,
+    gold: "255,215,90",
+    lines: ["赞美帝皇！", "帝皇在上！", "神皇在上...", "帝皇在注着视我...！",
+            "帝皇的战士愿为帝皇欣然赴死！", "休伤吾主！"]
+  },
+  /* 连续攻击兵种（喷火 / 激光）的形态判定：
+     敌人少而散 → 直射锁定；敌人多而密 → 横扫 */
+  fireMode: { directMax: 4, scatterDist: 170, recheck: 0.45 },
+  /* ============================================================================
+     1.3.3 四个新兵种的专用参数。
+     全部集中在这里：液氮的弹道与冻结、火焰的扇形与火墙、磁爆的连锁、激光的蓄力节奏。
+     数值调平衡只改这一块，不许在逻辑里写魔数（见《创作准则》§3）。
+     ============================================================================ */
+  cryo: {
+    /* throwEvery 是弹匣里还有瓶时的峰值间隔（每秒两罐）；
+       初始只有 1 瓶，所以这个峰值要等扩容之后才看得出来；
+       打空之后按 reload 换弹，换完立刻恢复发射，不额外等 throwEvery */
+    price: 120, mag: 1, reload: 3.0, throwEvery: 0.5,
+    potSpeed: 1500, arcG: 1400, potR: 7,
+    radius: 130, fieldLife: 3.0,
+    fieldGrow: 0.12,      /* 寒冷圈铺开只用 0.12 秒：落地就是一片，不是慢慢长大 */
+    slowStart: 0.30, freezeAt: 6.0, slowFloor: 0.05, afterT: 3.0,
+    warmSec: 3.0,         /* 离圈之后，从满冻回暖到正常速度固定 3 秒 */
+    dmg: 1, dmgEvery: 1.5,
+    heroRMul: 5,
+    color: "#9fe8ff"
+  },
+  flame: {
+    price: 150, mag: 100, ammoPerTick: 2, tick: 0.1, reload: 5.0,
+    range: 560, coneDeg: 16,
+    partSpeedMin: 1500, partSpeedMax: 2300,  /* 视觉流速：要赶在淡化前撞到火坑位置 */
+    partLifeMin: 0.55, partLifeMax: 0.95,
+    wallLife: 4.0, wallDmg: 2, wallTick: 0.4, wallHalfLen: 52, wallHalfWid: 26,   /* 火坑伤害翻倍，可叠加 */
+    igniteT: 4.0, igniteDmg: 1, igniteEvery: 1.0,
+    /* 直流喷射：DPS 与火坑相同（5/s），但伤害减半、频率翻倍 → 1 点 / 0.2 秒 */
+    directDmg: 1, directEvery: 0.2,
+    sweepRate: 1.9, sweepWobble: 0.55,
+    recoil: 16,
+    color: "#ff8a3d"
+  },
+  tesla: {
+    price: 210, mag: 25, burst: 5, burstGap: 0.1, cooldown: 1.5, reload: 4.5,
+    /* 单发 0.45：两轮（10 次）刚好把 5 血普通丧尸打到残血，靠麻痹控场 */
+    dmg: 0.45, chainMax: 10, chainR: 174, packedR: 20, packedCost: 0.5,   /* 连锁半径 +1/3 */
+    arcLife: 0.18,
+    color: "#a81c1c", core: "#3a3d42"
+  },
+  laser: {
+    price: 250, charge: 2.0, beamT: 2.8, rest: 0.5, cdAfter: 6.0, sweepsBeforeCd: 4,
+    ringScale: 0.333,     /* 蓄力环的总半径只有射程的 1/3，多个激光并排不糊屏 */
+    ringAlpha: 0.30,      /* 环的整体透明度压到 30% */
+    playerReload: 3.0,    /* 玩家松开开火键后的换弹时间 */
+    range: 840, width: 16, dmg: 1.5, tick: 0.1,  /* 光柱宽度 = 一整个单位直径 */
+    splashR: 72, splashDmg: 0.6,  /* 打在墙上时，落点周围一小圈也会被灼伤（英雄按体积等比放大） */
+    heatMax: 8.0, heatCool: 4.0,  /* 玩家连续照射 8 秒到最红，强制换弹；停火后按 4/s 降温 */
+    turnRate: 2.2,                /* 直射切换目标的转向阻尼（弧度/秒），不是瞬间甩枪 */
+    taper: 8,             /* 出膛过渡只有半个身位，几乎一出枪口就是全宽 */
+    sweepDeg: 54, sweepRate: 1.0,
+    heroRangeMul: 3, heroWidthMul: 5,
+    color: "#3fe0c0"
+  },
+  /* 坚守阵地（剧情指令）：把角色钉在一小片区域里。
+     这时的恐惧半径缩到 fearMul 倍，它不再用来逃跑，只用来躲开接触感染；
+     丧尸压力一减，单位就顺着位置约束顶回去，用火力把缺口重新封上 */
+  garrison: {
+    r: 150,          /* 默认坚守半径（px） */
+    fearMul: 0.4,    /* 坚守时的恐惧半径倍率 */
+    pullStart: 0.4,  /* 偏离超过半径的这个比例才开始往回拽 */
+    rgb: "120,200,255"
+  },
+  /* 每帧最多结算多少次寻路。尖峰时把超出的排到后续几帧，
+     宁可让几个单位晚两帧改道，也不要一帧内几十次寻路把画面卡住 */
+  astarPerFrame: 10,
+  /* 远处丧尸降频：镜头外、而且离镜头超过 dist 的丧尸，每 step 帧才算一次 AI，
+     其余帧沿用它上一帧的加速度继续滑行。玩家反正看不见它们，
+     行为上的细微滞后完全无感，但能省下大头，单步耗时基本和丧尸数成正比，
+     其中最贵的就是每只的索敌与寻路。 */
+  lod: { on: true, dist: 1600, step: 3 },
+  /* 中弹踉跄：被子弹打中时轻微击退 + 短暂减速，让火力真的能"压住"尸群。
+     cd 是同一只丧尸两次踉跄之间的冷却，否则机枪一秒能把目标钉在原地 */
+  hitStagger: { knock: 44, slowTime: 0.35, slowMul: 0.72, cd: 0.12, boostTime: 0.28 },
+  /* 行进路线：单位走到检查点多近算"到达" */
+  route: { arriveR: 46 },
+  /* 玩家操控时的镜头：跟着角色走，并朝准星方向带一点前瞻偏移，
+     这样视野重心落在"人和他要打的方向"之间，而不是死死钉在脚下 */
+  playerCam: { lead: 150, smooth: 9, hold: 0.9 },
+  /* 玩家操控时的击杀反馈：准星命中标记 + 右上角淘汰播报（CS:GO 那种） */
+  killfeed: { on: true, life: 4.5, max: 5, hitT: 0.14, killT: 0.42,
+             infectGap: 0.6 },   /* 尸潮咬人时一条接一条，感染播报按这个间隔去重 */
+  /* 玩家操控时的三种反馈各自独立开关（菜单里可切，记在本地） */
+  feedback: { feed: true, hitmark: true, killSfx: true },
+  /* 战争迷雾：只显示每个人类单位"朝向扇形 + 恐惧范围"内的东西，其余压暗。
+     纯视觉遮罩，完全不参与 AI，丧尸照样知道你在哪，只是你看不见它 */
+  /* alpha 是"视野外压多暗"：0.66 大致是"隐约能看出建筑轮廓、但看不清细节"。
+     敌人不靠这层遮，它们是在可见性判断里直接不画的 */
+  /* 画面亮度：1.0 是原色，只影响战场，不影响界面 */
+  brightness: 1.0,
+  /* 配色主题：地面、网格、建筑的色相/饱和度/明度都从这里取，
+     换主题不会影响任何玩法数值，纯视觉 */
+  palette: {
+    theme: "dusk",
+    ground: "#0a0c13", grid: "#161b2b",
+    wallHue: 44, wallSat: 28, wallLit: 60,
+    lowHue: 48, lowSat: 23, lowLit: 68
+  },
+  /* 实验性功能：默认关闭。它改的是"你能不能看见"，影响很大，先让人自己选 */
+  fog: { on: false, coneDeg: 60, alpha: 0.66,
+         /* 视野距离按"射程的七八倍"给足，实际计算会按屏幕对角线裁剪，
+            超出屏幕的部分画出来也看不见，没必要真去算 */
+         range: 6200, rangeMul: 7.4,
+         nearMul: 1.0,        /* 贴身全向感知圈 = 恐惧半径 × 这个系数 */
+         turnLock: 0.15,      /* AI 单位：视野朝向每锁这么久更新一次目标 */
+         turnSmooth: 0.42,    /* AI 单位：再叠一层跟随，压平频繁转头但不至于拖沓 */
+         /* 朝向变化不到这个角度就当没转。索敌、开火、被击退都会让 faceAng
+            在小范围里反复跳，视野锥跟着一起摆，屏幕上看着就是"视野在闪" */
+         deadZone: 0.35 },
+  /* 玩家开火：全自动 / 半自动两种模式（V 键切换）。
+     半自动是"点一下打一发"，完全不受射速限制，点多快就打多快，而且散布极小；
+     全自动走连发，散布大一点，压制用。 */
+  playerFire: { autoSpread: 3.0, semiSpread: 0.8, semiDmgMul: 1.0, modeName: ["全自动", "半自动"] },
+  /* 玩家操控时的"猛扑"：沿移动方向给一个瞬时速度脉冲，临时放宽速度上限，
+     所以能扑出去一段再收住。冷却防止按住空格一直弹射。
+     注意别叫 pounce，那个名字已经被丧尸的猛扑占用了 */
+  playerDash: { push: 430, dur: 0.30, cd: 0.75 },
+  /* 我方士兵打中丧尸时，屏幕极轻微地抖一下 */
+  shake: { hit: 1.6, hitDur: 0.12, enabled: true, scale: 1, max: 3, maxDur: 0.7, distance: true,
+           /* 持续开火单位：按各自的伤害频率一小下一小下地抖，而不是开一次火抖一次。
+              喷火兵 0.4 秒一次、激光兵 0.1 秒一次（规则见《创作准则》§7.3） */
+           flame: 1.1, flameDur: 0.09,
+           laser: 0.8, laserDur: 0.07 },
+  /* 自适应画质：按实时负载调整 canvas 渲染比例，不改模拟 */
+  quality: { enabled: true, min: 0.7, step: 0.08, lowLoad: 14, highLoad: 9, lowFps: 50, highFps: 57, hold: 2.0 },
+  glowLayer: { enabled: true, strength: 0.48, max: 48 },
+  minimalStats: true,
+  visualFx: { enabled: true, tracers: true, wallRim: true, bulletBloom: true, unitRim: true, projectileLight: true,
+              weaponColor: true, laserGlow: true, teslaGlow: true, muzzleWall: true, wetReflection: true, grade: true },
+  record: { fps: 30 },
+  replay: { enabled: false, interval: 0.5, max: 300 },
+  /* 换弹完成时头顶那排金色弹壳符号 */
+  reloadPop: { life: 1.0, rise: 26, width: 2.0, h: 4.4, gap: 5.0 },
+  /* 被冲击波掀飞的伪 3D 抛物线：抛起高度与滞空时长。
+     水平位移仍然由 pushUnit 决定，动画只是把它演出来 */
+  air: { peak: 34, dur: 0.55 },
+  /* 弹壳：从枪身中段甩出去的伪 3D 小抛物，落地弹两下后摊成地面贴图。
+     伤害越高的枪，弹壳越大 */
+  shell: { life: 1.2, g: 950, vz: 205, side: 46, bounce: 0.34,
+           max: 240, color: "#e8f04a",
+           /* 弹壳粗细：步枪与机枪只比子弹宽一丁点，狙击弹才配得上大颗弹壳 */
+           sizes: { rifle: 1.15, mg: 1.4, sniper: 3.2, shield: 1.0 } },
+  /* 混沌模式：地图随机生成、平民满场散布，
+     开局十秒倒计时之后所有人的身份来一次大洗牌 */
+  chaos: {
+    minCiv: 20, maxCiv: 1400, defCiv: 200,
+    countdown: 10.0,
+    /* 混沌模式的全局修正：丧尸血量三倍，同时把子弹击退翻倍作为补偿 */
+  zombieHpMul: 3.0, knockMul: 2.0,
+  /* 挨了一发之后有多快"顶回来"：这段时间里加速度暴涨，
+     看起来就是在跟击退较劲，但速度上限没变，所以永远抵消不完 */
+  recoverT: 0.4, recoverAcc: 2.4,
+  /* 每多这么多平民就多一只母体 */
+    motherPer: 200,
+    /* 转换时各兵种占平民总数的比例（合计 98%，剩下 2% 留作平民） */
+    /* 转换比例：奔跑者 30%、步枪兵 4%、机枪 0.8%、狙击 0.3%、盾兵 0.5%、平民保留 30%，
+       剩下的全部变成普通丧尸 */
+    mix: { runner: 0.30, rifle: 0.04, mg: 0.008, sniper: 0.003, shield: 0.005, civilian: 0.30 },
+    /* 开了英雄模式，母体数量加五成 */
+    heroMotherBonus: 0.5,
+    /* 散布用的网格边长：越小越均匀 */
+    spreadCell: 96
+  },
+  /* 尸潮威胁值：感知圈内的丧尸越多，人类的恐惧半径就越大，也就越早退走，
+     一小撮人顶着黑压压的尸潮硬扛本来就不合理 */
+  threat: { base: 12, per: 0.035, maxMul: 2.6, range: 620 },
+  /* 丧尸阵亡后留在地上的血迹：很淡、暗红、明度小幅浮动，组成不规则的曲线污渍 */
+  blood: { alpha: 0.30, max: 420, litLo: 30, litHi: 42 },
+  /* 结算特效：胜利放一串烟花，失败泛一层渐变红光 */
+  fx: { winDur: 6.5, fwInterval: 0.5, fwLife: 1.5, fwMaxR: 215,
+        loseDur: 3.4, losePeak: 0.24, loseEdge: 0.45 },
+  /* 屏幕边缘闪光：丧尸阵亡闪绿、我方被感染闪紫。depth 是那圈光带的厚度 */
+  glow: { depth: 46, green: "120,255,140", purple: "190,120,255",
+          greenLife: 0.5, purpleLife: 0.55, greenPeak: 0.30, purplePeak: 0.34, sightPad: 260 },
+  /* 是否让士兵自动值守防线岗位：默认关闭，士兵只认玩家指定的坚守点位 */
+  postDuty: false,
+  /* ===== 支援部队：三轮免费增援，第三轮为帝皇特使降临 ===== */
+  reinforce: {
+    wave1: 90.0,          /* 第一轮：增援抵达倒计时 */
+    wave2: 30.0,          /* 第二轮：特化部队抵达倒计时 */
+    wave3: 90.0,          /* 第三轮：帝皇特使活圣人降临倒计时 */
+    pillarDur: 1.0,       /* 光柱与粒子喷发持续时长 */
+    pillarH: 320,         /* 光柱高度（世界像素），做 z 轴伪 3D */
+    waveDur: 5.0,         /* 金光冲击波推行到全场所需时间 */
+    waveMax: 2600,        /* 冲击波最大半径：从地图中心足以覆盖最远角 */
+    spawnSpread: 96,      /* 增援落点围绕阵心的散布半径 */
+    /* 新编制：支援小队 / 特化部队 / 军团主力 / 帝皇特使 */
+    support: {
+      squad:   { name: "支援小队",     anim: "rappel",  discount: 0.9, spawnT: 2.1, dur: 14,
+                 shadowDur: 0.9, shadowDecel: 2.2, arcH: 120, ropeH: 72, ropeGap: 38, swayK: 16, swayC: 4.2,
+                 fireInterval: 0.24, rappelFireInterval: 0.085, clearR: 260, clearGrace: 0.35, descendDur: 1.0,
+                 retractDur: 0.7, departDur: 1.0, departAccel: 1200, hangMax: 7,
+                 grenadeFuse: 0.85, grenadeR: 520, grenadeDmg: 120,
+                 units: { rifle: 3, mg: 1 } },
+      special: { name: "特化部队增援", anim: "airdrop", discount: 0.8, spawnT: 2.8, dur: 8,
+                 fighterDur: 0.35, bombFuse: 0.5, bombDelay: 1.0, bombR: 1200, bombDmg: 6, bombDmgStep: 130, bombKnockMul: 1.2, bombImpactR: 130, bombImpactDmg: 0.1,
+                 transportDur: 0.55, paraStagger: 0.18, paraFall: 2.6, paraLandPop: 0.3, clearR: 260, paraFire: 0.12,
+                 units: { shield: 1, mg: 2, flame: 1, medic: 1, sniper: 1 } },
+      legion:  { name: "军团主力赶到", anim: "pod",     discount: 0.5, price: 10000, spawnT: 3.0, dur: 16.0,
+                 beaconDur: 3.0, shockR: 390, shockPush: 390, shockDmg: 0.1,
+                 domeR: 520, domeHp: 15, shieldDelay: 1.0, shieldExpand: 0.45, release: 0.3, explodeDur: 1.2,
+                 units: { rifle: 5, mg: 2, shield: 3, medic: 3, flame: 2, laser: 2, tesla: 2, cryo: 2 } },
+      emperor: { name: "帝皇特使降临", anim: "emperor", discount: 1, spawnT: 0, dur: 5.5, price: 30000,
+                 units: { rifle: 3, mg: 2, shield: 2, medic: 2, flame: 2, laser: 2, tesla: 2, cryo: 2 } }
+    }
+  },
+  /* ===== 护送模式 ===== */
+  escort: {
+    /* 撤离阶段的队形与意愿：一半武装去两翼兜后，离队伍多远、落后多少 */
+    wingDist: 132,          /* 侧翼岗离平民队伍质心的横向距离 */
+    wingBack: 46,           /* 侧翼岗落后队伍的距离 */
+    pressOn: 0.68,          /* 撤离阶段被丧尸逼到时，多大比例的方向仍然坚持往撤离点压 */
+    maxCivilians: 20,       /* 最多营救 20 名平民 */
+    econPerCivilian: 600,   /* 每名平民提供 600 经济（跟主经济同比例上调） */
+    scanR: 200,             /* 休眠丧尸的扫描半径（略大于人类恐惧范围） */
+    alertR: 145,            /* 警觉半径：这个范围内出现人类就自主锁定 */
+    doorInterval: 1.3,      /* 封锁大门每 1.3 秒放行一名平民（原来 2 秒，门口太熬人） */
+    evacInterval: 1.3,      /* 撤离点每 1.3 秒撤离一个单位（原来 2 秒） */
+    touchR: 46,             /* 触碰大门解锁的距离 */
+    evacR: 92,              /* 进入撤离点的距离（原来 70，最后一程更容易踩进去） */
+    spawnInterval: 2.6,     /* 刷怪间隔（原来 1.5 秒，退路上根本喘不过气） */
+    spawnMin: 4, spawnMax: 8,
+    spawnMinHot: 5, spawnMaxHot: 18,   /* 撤离期的狂潮规模砍掉约四成 */
+    /* 营救人数带来的威胁缩放：救的人越多，初始尸群与每波刷新的数量等比上升。
+       增幅刻意压得很小（以 baseCivilians 为基准，每多救一名 +civScale），
+       封顶 +civScaleMax，避免撤离压力失控 */
+    baseCivilians: 8, civScale: 0.025, civScaleMax: 1.3,
+    /* 兵力系数：按"开局玩家派出的武装单位数"做乘数级放大。
+       基准 5 名，每多一名刷新量乘 armedGrowth；少一名按同一比例缩小。
+       10 名约 2.3 倍、20 名约 10 倍压力，不再是"每多一人加几个百分点"的线性微调 */
+    armedBase: 5, armedGrowth: 1.18, armedScaleMax: 12,
+    house: { x: 150, y: 640, w: 620, h: 1030 },
+    evac: { x: 3880, y: 1152 },
+    mounds: [
+      { x: 1500, y: 520,  n: 14 },
+      { x: 1750, y: 1152, n: 16 },
+      { x: 1500, y: 1790, n: 14 }
+    ]
+  },
+  /* 场上没有任何武装单位时，平民和医疗兵朝彼此的质心聚拢，
+     按编号分到固定角度围成一圈，不会挤在同一个点上 */
+  cluster: {
+    r: 120,            /* 围成圈的半径 */
+    slack: 80,         /* 离自己的圈位多近就算到位，不必精确踩点 */
+    speed: 1300        /* 靠拢时的寻路速度 */
+  },
+  /* 护卫：武装单位顶在前面，平民紧跟身后；被尸潮隔开时武装单位杀开通路重新汇合 */
+  squad: { rebalance: 0.6, baseQuota: 3, followDist: 74, regroupDist: 420, fleeCohesion: 0.45,
+           /* 武装单位之间的抱团：离同伴群质心超过 cohesionKeep 就开始往回靠，权重上限 cohesionMax */
+           cohesionR: 460, cohesionKeep: 150, cohesionMax: 0.7, cohesionRate: 0.2,
+           /* 盾兵：站在武装队友朝威胁方向的一侧，距离保持在 [screenMin, screenMax] 这条带上，
+              贴太近会把围过来的丧尸顺带喂给队友，掉太远又失去掩护作用。
+              screenBias 是相对威胁轴线的偏转余弦（偏离约 20°），screenFace 是"已站到位"的朝向阈值 */
+           screenMin: 96, screenMax: 190, screenSearch: 780, screenBias: 0.94, screenFace: 0.86,
+           /* 队形同步：每个兵种侦测最近 2 个同兵种单位的移动方向，按 dirWeight 加权修正自己的方向。
+              dirVmin 是"算得上在移动"的速度门槛，dirAngDeg 是两个参考样本之间允许的角度差 */
+           dirR: 300, dirRate: 0.22, dirWeight: 0.42, dirVmin: 0.22, dirAngDeg: 50,
+           /* 平民跟队：目标点缓存多久重算一次（丧尸换目标时目标点会绕圈，必须锁住），
+              以及"离目标点多近就算到位"，不到位就一直微调，看起来就是原地打转 */
+           escortRepath: 0.9, escortEps: 36, escortSlack: 1.18,
+           /* 目标点挪动小于这个距离就不更新，护卫推进时的细微摆动不该让平民跟着改道 */
+           escortHold: 70, escortFrontCos: 0.55 },
+  pounce: { range: 70, dur: 0.8, accMul: 4.5, vmaxMul: 1.9, cd: 2.5 },
+  /* interval：丧尸扫描同类方向的最小间隔（秒）。
+     同类速度方向本身变化很慢，0.1 秒内最多走 15 像素，方向几乎不变，
+     所以节流后混合出来的方向看不出差别；每帧都扫纯属白烧。
+     注意：人类感知（senseZombies）没有任何节流，反应速度不受影响 */
+  herd: { n: 2, angDeg: 25, vmin: 0.35, weight: 0.35, interval: 0.1 },
+  /* 感染：只要擦到就立刻感染（不可逆），随后 2 秒无症状期，再进入 3 秒变色期；
+     整个过程中阵营判定不变，直到颜色完全变完、真正转化为丧尸单位 */
+  infect: { incubation: 2.0, fade: 3.0, touchPad: 5, lockedSlowMul: 0.6 },
+  line: { spacing: 96, coverMax: 64 },
+  /* 阵型：让士兵沿垂直于威胁轴的方向拉开，形成交叉火力而不是挤成一坨 */
+  formation: {
+    spread: 190,      /* 阵线半宽（像素）：槽位 -1~+1 映射到 ±190px */
+    slotJitter: 0.35  /* 槽位抖动，避免 id 相近的人挤在同一个位置 */
+  },
+  /* 地形智能选阵地的参数。
+     注意：我们的地图是"实心矩形障碍 + 大片空地"，没有《outbreak》那种空心房屋，
+     所以不找"房屋/通道"，改成给每个可走格打"掩体分"：
+     朝敌人方向上有没有墙可挡、两侧是不是墙、周围开不开阔。 */
+  terrain: {
+    sample: 2,          /* 扫描步长（格），2 表示每 2 格采一个样 */
+    coverR: 2,          /* 朝敌人方向几格内有障碍算"有掩体" */
+    flankR: 2,          /* 左右几格内有障碍算"有侧翼掩护" */
+    spacing: 88,        /* 岗位之间的最小间距（像素），避免挤成一堆 */
+    maxPosts: 80,       /* 岗位总数上限 */
+    minPosts: 16,       /* 低于这个数就补一条散兵线兜底 */
+    frontBias: 0.55     /* 岗位要落在人类质心靠敌人那一侧的程度 */
+  },
+  retarget: 0.25,
+  repath: 1.4,
+  repathHuman: 0.8,
+  herdR: 150,
+  nearZombieCache: 0.35,
+  astarWeight: 1.8,
+  stuckTime: 0.6,
+  stuckDist: 6,
+  stuckCooldown: 1.8,   /* 卡住后的重规划冷静期，防止堵墙时集体疯狂重算 */
+  waypointR: 14,
+  /* 平民是胜负的根本，价格与机枪兵持平；小队 = 1 平民 + 3 步枪兵 + 1 机枪兵 */
+  /* 经济数值整体放大 10 倍：击杀 +10、开打 300 起，量级比原来好看，又不至于后面数字长得离谱。
+     收入、成本、赐福价格、护送经济按同一比例同步 */
+  econ: { start: 300, perSec: 10, killZombie: 10, killMother: 100,
+          /* 舔舐者比普通丧尸值钱：击杀赏金与投放价都用这一个数，保持一致 */
+          killLicker: 20,
+          /* 资源上限必须明显高于最贵的项目（赐福 15000），否则攒到顶也买不起 */
+          cap: 999999,
+          cost: { rifle: 250, civilian: 600, militia: 600, mg: 600, sniper: 1200, shield: 800,
+                  medic: 1000, cryo: 800, flame: 750, tesla: 750, laser: 1200,
+                  sandbag: 120 } },
+  /* 人类上限维持原样：加它就是加 AI 负担，跟"想堆丧尸"是两回事 */
+  caps: { zombies: 3000, humans: 260, civilians: 150 },
+  /* 开局设置：增数 +0~200% 与乘数 ×1~×20，二者互斥 */
+  start: { baseZombies: 80, addSteps: [0, 0.5, 1.0, 1.5, 2.0], multSteps: [1, 2, 5, 10, 20] },
+  bulletCap: 1600,
+  saveKey: "zombieSandbox.save.v1",
+  autoSaveSec: 15
+};
+
+/* ------------------------------ 2. 工具函数 ------------------------------ */
+var TAU = Math.PI * 2;
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function lerp(a, b, t) { return a + (b - a) * t; }
+function hypot(x, y) { return Math.sqrt(x * x + y * y); }
+function dist2(ax, ay, bx, by) { var dx = bx - ax, dy = by - ay; return dx * dx + dy * dy; }
+function dist(ax, ay, bx, by) { return Math.sqrt(dist2(ax, ay, bx, by)); }
+function norm(x, y) { var m = Math.sqrt(x * x + y * y); if (m < 1e-9) return null; return { x: x / m, y: y / m }; }
+function angOf(x, y) { return Math.atan2(y, x); }
+function angDiff(a, b) { var d = (b - a) % TAU; if (d > Math.PI) d -= TAU; if (d < -Math.PI) d += TAU; return d; }
+function fmtTime(t) { var m = Math.floor(t / 60), s = Math.floor(t % 60); return (m < 10 ? "0" : "") + m + ":" + (s < 10 ? "0" : "") + s; }
+
+/* 可存档的随机数发生器（mulberry32）：保证读档后演化一致 */
+var RNG = {
+  s: 20240607,
+  seed: function (n) { this.s = (n >>> 0) || 1; },
+  next: function () {
+    var a = (this.s = (this.s + 0x6D2B79F5) | 0);
+    var t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  },
+  range: function (a, b) { return a + this.next() * (b - a); },
+  int: function (a, b) { return Math.floor(a + this.next() * (b - a + 1)); }
+};
+
+/* ------------------------- 3. 空间网格（固定分桶） ------------------------ */
+function Grid(w, h, cell) {
+  this.cell = cell;
+  this.cols = Math.max(1, Math.ceil(w / cell));
+  this.rows = Math.max(1, Math.ceil(h / cell));
+  this.buckets = new Array(this.cols * this.rows);
+  for (var i = 0; i < this.buckets.length; i++) this.buckets[i] = [];
+}
+Grid.prototype.clear = function () {
+  for (var i = 0; i < this.buckets.length; i++) this.buckets[i].length = 0;
+};
+Grid.prototype.add = function (o) {
+  var cx = clamp(Math.floor(o.x / this.cell), 0, this.cols - 1);
+  var cy = clamp(Math.floor(o.y / this.cell), 0, this.rows - 1);
+  this.buckets[cy * this.cols + cx].push(o);
+};
+/* 按矩形范围取候选：高速子弹的线段可能跨越十几个网格单元 */
+Grid.prototype.queryBox = function (x0, y0, x1, y1, out) {
+  out.length = 0;
+  var c = this.cell, cols = this.cols, rows = this.rows, buckets = this.buckets;
+  var lo = Math.min(x0, x1), hi = Math.max(x0, x1);
+  var lo2 = Math.min(y0, y1), hi2 = Math.max(y0, y1);
+  var cx0 = Math.floor(lo / c); if (cx0 < 0) cx0 = 0;
+  var cx1 = Math.floor(hi / c); if (cx1 > cols - 1) cx1 = cols - 1;
+  var cy0 = Math.floor(lo2 / c); if (cy0 < 0) cy0 = 0;
+  var cy1 = Math.floor(hi2 / c); if (cy1 > rows - 1) cy1 = rows - 1;
+  var n = 0;
+  for (var cy = cy0; cy <= cy1; cy++) {
+    var base = cy * cols;
+    for (var cx = cx0; cx <= cx1; cx++) {
+      var b = buckets[base + cx];
+      for (var i = 0; i < b.length; i++) out[n++] = b[i];
+    }
+  }
+  out.length = n;
+  return out;
+};
+Grid.prototype.query = function (x, y, r, out) {
+  /* 这个函数是全场最热的调用之一（分离、感知、集群每帧都在用）。
+     clamp 换成内联比较、push 换成直接索引写入，结果与原来完全一致 */
+  out.length = 0;
+  var c = this.cell, cols = this.cols, rows = this.rows, buckets = this.buckets;
+  var x0 = Math.floor((x - r) / c); if (x0 < 0) x0 = 0;
+  var x1 = Math.floor((x + r) / c); if (x1 > cols - 1) x1 = cols - 1;
+  var y0 = Math.floor((y - r) / c); if (y0 < 0) y0 = 0;
+  var y1 = Math.floor((y + r) / c); if (y1 > rows - 1) y1 = rows - 1;
+  var n = 0;
+  for (var cy = y0; cy <= y1; cy++) {
+    var base = cy * cols;
+    for (var cx = x0; cx <= x1; cx++) {
+      var b = buckets[base + cx];
+      for (var i = 0; i < b.length; i++) out[n++] = b[i];
+    }
+  }
+  out.length = n;      /* 手写索引写入不会自动改 length，必须补回来 */
+  return out;
+};
+
+/* --------------------------- 4. 导航网格 + A* ---------------------------- */
+var NAV = {
+  cols: 0, rows: 0, tile: 32, blocked: null,
+  /* 地形每重建一次就 +1。单位记住自己被判定"够不着"时的版本号，
+     版本一变（门开了、墙拆了、沙袋垒上了）就立刻重新评估 */
+  rev: 0,
+  build: function (world, obstacles, pad) {
+    this.rev++;
+    this.tile = CFG.world.tile;
+    this.cols = Math.ceil(world.w / this.tile);
+    this.rows = Math.ceil(world.h / this.tile);
+    this.blocked = new Uint8Array(this.cols * this.rows);
+    /* 视线阻挡网格：只有"实心墙"才挡视线。
+       矮墙（kind === "low"）子弹能穿过、眼睛也能看过去；门本身是墙上的缺口，
+       不在障碍列表里，天然可穿透。走位用的 blocked 仍然把矮墙算作障碍。 */
+    this.visBlock = new Uint8Array(this.cols * this.rows);
+    for (var k = 0; k < obstacles.length; k++) {
+      var o = obstacles[k];
+      var seeThrough = (o.kind === "low");
+      var x0 = Math.floor((o.x - pad) / this.tile), x1 = Math.floor((o.x + o.w + pad) / this.tile);
+      var y0 = Math.floor((o.y - pad) / this.tile), y1 = Math.floor((o.y + o.h + pad) / this.tile);
+      for (var cy = Math.max(0, y0); cy <= Math.min(this.rows - 1, y1); cy++) {
+        for (var cx = Math.max(0, x0); cx <= Math.min(this.cols - 1, x1); cx++) {
+          this.blocked[cy * this.cols + cx] = 1;
+          if (!seeThrough) this.visBlock[cy * this.cols + cx] = 1;
+        }
+      }
+    }
+    astarAlloc();
+    this.buildClearance();
+  },
+  /* 每个格子到最近障碍的距离（以格为单位，障碍格本身为 0）。
+     撤退时用它避开墙角，"离墙还有多远"决定了这个位置会不会被逼死 */
+  clearance: null,
+  /* 多源 BFS：从所有障碍格同时向外扩散，得到距离场。只在 NAV.rev 变化时重算 */
+  buildClearance: function () {
+    var n = this.cols * this.rows;
+    var cl = new Int16Array(n);
+    var q = new Int32Array(n), head = 0, tail = 0;
+    for (var i = 0; i < n; i++) {
+      if (this.blocked[i]) { cl[i] = 0; q[tail++] = i; }
+      else cl[i] = 999;
+    }
+    var cols = this.cols, rows = this.rows;
+    var DX4 = [1, -1, 0, 0], DY4 = [0, 0, 1, -1];
+    while (head < tail) {
+      var cur = q[head++];
+      var cx = cur % cols, cy = (cur - cx) / cols;
+      var d = cl[cur] + 1;
+      for (var k = 0; k < 4; k++) {
+        var nx = cx + DX4[k], ny = cy + DY4[k];
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        var ni = ny * cols + nx;
+        if (cl[ni] > d) { cl[ni] = d; q[tail++] = ni; }
+      }
+    }
+    this.clearance = cl;
+  },
+  /* 某个世界坐标附近的"开阔度"：越远离墙越高，钳在 0~8 格之间 */
+  openAt: function (x, y) {
+    if (!this.clearance) return 4;
+    var gx = Math.floor(x / this.tile), gy = Math.floor(y / this.tile);
+    if (gx < 0 || gy < 0 || gx >= this.cols || gy >= this.rows) return 0;
+    var v = this.clearance[gy * this.cols + gx];
+    return v > 8 ? 8 : v;
+  },
+  b: function (cx, cy) {
+    if (cx < 0 || cy < 0 || cx >= this.cols || cy >= this.rows) return 1;
+    return this.blocked[cy * this.cols + cx];
+  },
+  /* 从(cx,cy)向外环形搜索最近的可通行格 */
+  nearestFree: function (cx, cy) {
+    cx = clamp(cx, 0, this.cols - 1); cy = clamp(cy, 0, this.rows - 1);
+    if (!this.b(cx, cy)) return [cx, cy];
+    for (var r = 1; r <= 10; r++) {
+      for (var y = cy - r; y <= cy + r; y++) {
+        for (var x = cx - r; x <= cx + r; x++) {
+          if (Math.abs(x - cx) !== r && Math.abs(y - cy) !== r) continue;
+          if (!this.b(x, y)) return [x, y];
+        }
+      }
+    }
+    return null;
+  },
+  /* 视线检查：返回两点之间是否无障碍 */
+  los: function (x0, y0, x1, y1) {
+    var t = this.tile, d = dist(x0, y0, x1, y1);
+    var steps = Math.max(1, Math.ceil(d / (t * 0.5)));
+    for (var i = 1; i < steps; i++) {
+      var p = i / steps;
+      var cx = Math.floor(lerp(x0, x1, p) / t), cy = Math.floor(lerp(y0, y1, p) / t);
+      if (this.b(cx, cy)) return false;
+    }
+    return true;
+  }
+};
+
+var AST = {
+  g: null, f: null, from: null, stamp: null, closed: null, visit: 0,
+  heapI: null, heapF: null, heapN: 0, ready: false,
+  /* 索引堆所需：heapPos 记录每个节点在堆里的位置（0 = 不在堆中），
+     posStamp 标记这个位置信息属于哪一轮搜索，省掉每轮清零整张表 */
+  heapPos: null, posStamp: null, V: 0
+};
+function astarAlloc() {
+  var n = NAV.cols * NAV.rows;
+  AST.g = new Float32Array(n);
+  AST.f = new Float32Array(n);
+  AST.from = new Int32Array(n);
+  AST.stamp = new Int32Array(n);
+  AST.closed = new Uint8Array(n);
+  AST.heapPos = new Int32Array(n);
+  AST.posStamp = new Int32Array(n);
+  /* 改成索引堆之后每个节点在堆里最多占一个位置，容量不再需要 9 倍余量 */
+  var hn = n + 16;
+  AST.heapI = new Int32Array(hn);
+  AST.heapF = new Float32Array(hn);
+  AST.heapN = 0; AST.visit = 0; AST.V = 0; AST.ready = true;
+}
+/* 索引二叉堆：每个节点在堆里最多只有一个位置，
+   改进估价时做 decrease-key 而不是再塞一条重复条目，
+   原来的懒惰删除堆里 pop 次数是真实节点数的 1.7 倍，白干四成 */
+function hpPush(i, f) {
+  var hi = AST.heapI, hf = AST.heapF, pos = AST.heapPos, ps = AST.posStamp, V = AST.V;
+  if (ps[i] !== V) { ps[i] = V; pos[i] = 0; }
+  var k = pos[i], p, ti, tf;
+  if (k > 0) {
+    hf[k] = f;
+    while (k > 1) {
+      p = k >> 1;
+      if (hf[p] <= hf[k]) break;
+      ti = hi[p]; tf = hf[p];
+      hi[p] = hi[k]; hf[p] = hf[k];
+      hi[k] = ti; hf[k] = tf;
+      pos[ti] = k; pos[hi[p]] = p;
+      k = p;
+    }
+    return;
+  }
+  k = ++AST.heapN;
+  hi[k] = i; hf[k] = f; pos[i] = k;
+  while (k > 1) {
+    p = k >> 1;
+    if (hf[p] <= hf[k]) break;
+    ti = hi[p]; tf = hf[p];
+    hi[p] = hi[k]; hf[p] = hf[k];
+    hi[k] = ti; hf[k] = tf;
+    pos[ti] = k; pos[i] = p;
+    k = p;
+  }
+}
+function hpPop() {
+  var hi = AST.heapI, hf = AST.heapF, pos = AST.heapPos, ps = AST.posStamp, V = AST.V;
+  var top = hi[1], n = AST.heapN;
+  if (ps[top] === V) pos[top] = 0;
+  AST.heapN = n - 1;
+  if (n > 1) {
+    var li = hi[n], lf = hf[n];
+    hi[1] = li; hf[1] = lf; pos[li] = 1;
+    var k = 1, N = AST.heapN, c, ti, tf;
+    for (;;) {
+      c = k << 1;
+      if (c > N) break;
+      if (c + 1 <= N && hf[c + 1] < hf[c]) c++;
+      if (hf[k] <= hf[c]) break;
+      ti = hi[k]; tf = hf[k];
+      hi[k] = hi[c]; hf[k] = hf[c];
+      hi[c] = ti; hf[c] = tf;
+      pos[hi[k]] = k; pos[hi[c]] = c;
+      k = c;
+    }
+  }
+  return top;
+}
+var DX8 = [1, -1, 0, 0, 1, 1, -1, -1], DY8 = [0, 0, 1, -1, 1, -1, 1, -1];
+function hcost(x, y, gx, gy) {
+  var dx = Math.abs(x - gx), dy = Math.abs(y - gy);
+  return (dx + dy) + (1.41421356 - 2) * Math.min(dx, dy);
+}
+/* A* 主搜索：输入世界坐标，返回世界坐标路点数组（已平滑），失败返回 null */
+function navAreaClear(cx, cy, rad) {
+  if (!rad) return true;
+  var tile = NAV.tile, ext = Math.ceil(rad / tile);
+  for (var dy = -ext; dy <= ext; dy++) {
+    for (var dx = -ext; dx <= ext; dx++) {
+      var x = cx + dx, y = cy + dy;
+      if (x < 0 || y < 0 || x >= NAV.cols || y >= NAV.rows) return false;
+      if (NAV.blocked[y * NAV.cols + x]) return false;
+    }
+  }
+  return true;
+}
+function astar(sx, sy, tx, ty, maxNodes, rad) {
+  if (!AST.ready) return null;
+  maxNodes = maxNodes || 6000;
+  var tile = NAV.tile, cols = NAV.cols, rows = NAV.rows;
+  /* 热循环里直接读阻挡数组，省掉 NAV.b() 的方法调用开销（每个节点最多 16 次） */
+  var blk = NAV.blocked;
+  /* 世界宽度恰好是 2 的幂时（默认 4096/32=128），取行列可以用位移代替除法。
+     结果完全一致，只是省掉两次除法，每次 A* 要做上千次这个换算 */
+  var SH = 0, MSK = 0;
+  if ((cols & (cols - 1)) === 0 && cols > 0) { while ((1 << SH) < cols) SH++; MSK = cols - 1; }
+  var s = NAV.nearestFree(Math.floor(sx / tile), Math.floor(sy / tile));
+  var goalBlocked = NAV.b(Math.floor(tx / tile), Math.floor(ty / tile));
+  var g = NAV.nearestFree(Math.floor(tx / tile), Math.floor(ty / tile));
+  if (!s || !g) return null;
+  var si = s[1] * cols + s[0], gi = g[1] * cols + g[0];
+  var gx = g[0], gy = g[1];
+  AST.visit++; var V = AST.visit; AST.heapN = 0; AST.V = V;
+  var HW = CFG.astarWeight;
+  AST.g[si] = 0; AST.f[si] = hcost(s[0], s[1], gx, gy) * HW; AST.from[si] = -1;
+  AST.stamp[si] = V; AST.closed[si] = 0;
+  hpPush(si, AST.f[si]);
+  var nodes = 0, found = false, capped = false;
+  var bestI = si, bestH = hcost(s[0], s[1], gx, gy);
+  while (AST.heapN > 0) {
+    var cur = hpPop();
+    if (cur === gi) { found = true; break; }
+    if (AST.closed[cur] === 1 && AST.stamp[cur] === V) continue;
+    AST.closed[cur] = 1;
+    if (++nodes > maxNodes) { capped = true; break; }
+    var cx, cy;
+    if (SH) { cx = cur & MSK; cy = cur >> SH; }
+    else { cx = cur % cols; cy = (cur - cx) / cols; }
+    var hdx = cx - gx; if (hdx < 0) hdx = -hdx;
+    var hdy = cy - gy; if (hdy < 0) hdy = -hdy;
+    var ch = (hdx + hdy) - 0.58578644 * (hdx < hdy ? hdx : hdy);
+    if (ch < bestH) { bestH = ch; bestI = cur; }
+    var rowBase = cy * cols;
+    for (var d = 0; d < 8; d++) {
+      var nx = cx + DX8[d], ny = cy + DY8[d];
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+      if (blk[ny * cols + nx]) continue;
+      if (rad && !navAreaClear(nx, ny, rad)) continue;
+      /* 斜向移动不许切角：两侧的直角格必须都能走（越界一律当墙） */
+      if (d >= 4) {
+        var ax2 = cx + DX8[d];
+        if (ax2 < 0 || ax2 >= cols || blk[rowBase + ax2]) continue;
+        var ay2 = cy + DY8[d];
+        if (ay2 < 0 || ay2 >= rows || blk[ay2 * cols + cx]) continue;
+      }
+      var ni = ny * cols + nx;
+      if (AST.stamp[ni] !== V) { AST.stamp[ni] = V; AST.g[ni] = Infinity; AST.closed[ni] = 0; }
+      if (AST.closed[ni] === 1) continue;
+      var ng = AST.g[cur] + (d >= 4 ? 1.41421356 : 1);
+      if (ng < AST.g[ni] - 1e-9) {
+        var nx2 = nx - gx; if (nx2 < 0) nx2 = -nx2;
+        var ny2 = ny - gy; if (ny2 < 0) ny2 = -ny2;
+        AST.g[ni] = ng; AST.from[ni] = cur;
+        AST.f[ni] = ng + ((nx2 + ny2) - 0.58578644 * (nx2 < ny2 ? nx2 : ny2)) * HW;
+        hpPush(ni, AST.f[ni]);
+      }
+    }
+  }
+  var partial = false;
+  if (!found) {
+    if (capped && bestI !== si) { gi = bestI; partial = true; }
+    else return null;
+  }
+  var pts = [], i = gi, guard = 0;
+  while (i !== -1 && guard++ < 40000) {
+    var px = i % cols, py = (i - px) / cols;
+    pts.push({ x: (px + 0.5) * tile, y: (py + 0.5) * tile });
+    i = AST.from[i];
+  }
+  pts.reverse();
+  if (!partial) {
+    /* 目标格被墙占据时，终点必须落在最近可走格中心；
+       否则单位会一路走到墙里，最后一步永远顶在墙面上 */
+    if (goalBlocked) pts.push({ x: (g[0] + 0.5) * tile, y: (g[1] + 0.5) * tile });
+    else pts.push({ x: tx, y: ty });
+  }
+  var out = smoothPath(pts, sx, sy, rad);
+  out = filletPath(out, 12);
+  out.partial = partial;
+  out.goalAdjusted = !!goalBlocked;
+  return out;
+}
+/* 拐角折线化：把尖锐折角替换成两个切点，单位不再到点急停再转向。
+   半径取相邻线段长度的一半以内，避免切点越过下一段 */
+function filletPath(pts, radius) {
+  if (!pts || pts.length < 3) return pts;
+  var out = [pts[0]];
+  for (var i = 1; i < pts.length - 1; i++) {
+    var p = pts[i], a = pts[i - 1], b = pts[i + 1];
+    var ax = a.x - p.x, ay = a.y - p.y, bx = b.x - p.x, by = b.y - p.y;
+    var la = Math.hypot(ax, ay), lb = Math.hypot(bx, by);
+    if (la < 1e-6 || lb < 1e-6) { out.push(p); continue; }
+    ax /= la; ay /= la; bx /= lb; by /= lb;
+    var dot = ax * bx + ay * by;
+    if (dot < -0.96) { out.push(p); continue; }   /* 近乎直线，不需要切角 */
+    var r = Math.min(radius, la * 0.5, lb * 0.5);
+    out.push({ x: p.x + ax * r, y: p.y + ay * r });
+    out.push({ x: p.x + bx * r, y: p.y + by * r });
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+/* 路径拉直：能直达就跳过中间点 */
+function smoothPath(pts, sx, sy, rad) {
+  if (pts.length <= 1) return pts;
+  var out = [], curX = sx, curY = sy, i = 0, MAXLOOK = 26;
+  while (i < pts.length) {
+    var far = i;
+    var jEnd = Math.min(pts.length - 1, i + MAXLOOK);
+    for (var j = jEnd; j > i; j--) {
+      if (NAV.los(curX, curY, pts[j].x, pts[j].y) &&
+          (!rad || navAreaClear(Math.floor(pts[j].x / NAV.tile), Math.floor(pts[j].y / NAV.tile), rad))) { far = j; break; }
+    }
+    var p = pts[far];
+    out.push(p); curX = p.x; curY = p.y; i = far + 1;
+  }
+  return out;
+}
+
+/* ------------------------------ 5. 世界状态 ------------------------------ */
+var W = {};
+/* 游戏模式：defense = 防线模式（默认），escort = 护送模式 */
+var GAME_MODE = "defense";
+var ALLGRID = null, HUMGRID = null, ZGRID = null;
+var _qa = [], _qb = [], _qc = [];
+
+function isZombieKind(k) { return k === "zombie" || k === "mother" || k === "runner" || k === "licker" || k === "bomber" || k === "plagueNest" || k === "nestEgg" || k === "tyrant"; }
+function isZombie(u) { return isZombieKind(u.kind); }
+/* 阵营判定：只有真正完成转化（kind 变成丧尸单位）才改变阵营。
+   被感染者在无症状期和整个变色期都仍然按人类判定，颜色走完那一刻才换阵营。 */
+function isZombieSide(u) {
+  return u.kind === "zombie" || u.kind === "mother" || u.kind === "runner" ||
+         u.kind === "licker" || u.kind === "bomber" || u.kind === "plagueNest" || u.kind === "nestEgg" || u.kind === "tyrant";
+}
+function isBossUnit(u) {
+  return !!u && (u.kind === "plagueNest" || (CFG.unit[u.kind] && CFG.unit[u.kind].boss));
+}
+function controlMulOf(u) { return isBossUnit(u) ? 0.1 : 1; }
+function controlDurOf(u, d) { return d * controlMulOf(u); }
+function isHuman(u) {
+  if (!u) return false;
+  var k = u.kind;
+  return k === "civilian" || k === "rifle" || k === "militia" || k === "mg" ||
+         k === "sniper" || k === "shield" || k === "medic" ||
+         k === "cryo" || k === "flame" || k === "tesla" || k === "laser";
+}
+function isMilitia(u) { return !!(u && u.kind === "militia" && !u.dead); }
+function isCivilianRole(u) { return !!(u && (u.kind === "civilian" || u.kind === "militia")); }
+function isArmedKind(k) {
+  if (k === "militia") return false;
+  var c = CFG.unit[k];
+  if (c && c.gun) return true;           /* 自定义兵种只要配了枪就算武装 */
+  return k === "rifle" || k === "mg" || k === "sniper" || k === "shield";
+}
+function isArmed(u) { return isArmedKind(u.kind); }
+/* 场上没有真武装单位（步枪、机枪、狙击、盾兵）时，医疗兵按武装单位处理。
+   走位、寻路、掩护平民都走武装单位那套逻辑，开火仍然只有治疗弹 */
+function isCombatUnit(u) {
+  if (isArmed(u)) return true;
+  if (u.kind === "militia") return true;
+  return u.kind === "medic" && !!W.medicArmed;
+}
+/* 参与常规集群编队的兵种（狙击手与盾兵各有独立逻辑） */
+function isLineInfantry(u) {
+  if (u.kind === "rifle" || u.kind === "mg") return true;
+  var c = CFG.unit[u.kind];
+  return !!(c && c.gun && c.line);        /* 自定义兵种可以选择要不要参与编队 */
+}
+function hasShield(u) { return u.kind === "shield" && !u.shieldBroken; }
+/* 每个兵种的恐惧半径：按住 kind 覆盖，没覆盖就按预设规则算。
+   有了这层，兵种数据面板才能单独调某个兵种的恐惧半径而不牵连别人 */
+function fearBaseOf(kind) {
+  var o = CFG.fearRBy ? CFG.fearRBy[kind] : undefined;
+  if (typeof o === "number") return o;
+  if (kind === "civilian" || kind === "militia") return CFG.fearRCivilian;
+  if (kind === "sniper") return CFG.fearR * CFG.sniper.fearMul;   /* 狙击手恐惧范围双倍 */
+  /* 盾兵没有恐惧半径：丧尸再怎么逼近它也不后退，只按站位逻辑挡在队友身前。
+     它靠"举盾时对丧尸的吸引力"把尸群拉到自己身上，而不是靠逃跑 */
+  if (kind === "shield") return 0;
+  return CFG.fearR;
+}
+function fearRadiusOf(u) {
+  var base = fearBaseOf(u.kind);
+  /* 坚守阵地：恐惧半径压到很小。它不再负责"逃跑"，只负责躲开接触感染，
+     所以尸潮稍稍一退，这个人立刻就顶回自己的位置。
+     但这条只在"手上有子弹"时成立：打空或正在换弹时他没有火力，也就没有硬顶的资格，
+     恐惧半径恢复成普通单位的水准，先保命，换好弹再顶回去 */
+  if (u.gar && garrisonHasFire(u)) base *= CFG.garrison.fearMul;
+  return base;
+}
+/* 坚守阵地的底气来自火力：枪里有子弹、且不在换弹，才算"还能压得住"。
+   平民没有枪，谈不上火力中断，始终按坚守算 */
+function garrisonHasFire(u) {
+  if (!u.gar) return false;
+  if (!isArmed(u)) return true;
+  if (u.hero === "armed" && u.guns && u.guns.length) {
+    for (var gi = 0; gi < u.guns.length; gi++) if (u.guns[gi].mag > 0) return true;
+  }
+  return !(u.reloading || u.mag <= 0);
+}
+/* 开火参数：步枪兵近/远两档，机枪兵单档 */
+function gunOf(u) {
+  var c = CFG.unit[u.kind];
+  if (c && c.gun) return c.gun;          /* 自定义兵种自带一份独立的枪械参数 */
+  return u.kind === "mg" ? CFG.mg : CFG.far;
+}
+
+function resetWorld(seed) {
+  RNG.seed(seed || (Date.now() & 0x7fffffff));
+  if (typeof REPLAY !== "undefined") { REPLAY.frames = []; REPLAY.lastT = -1; }
+  CAM_FOCUS = null;
+  W = {
+    t: 0, units: [], obstacles: [], doors: [], bullets: [], flashes: [], trails: [], shocks: [], zones: [], zoneT: 0, spawners: [], holds: [], tiles: [],
+    posts: [], humanList: [], bulletSeq: 1, feed: [], pops: [], squadSize: 0, squadArmed: 0, tongues: [],
+    score: { total: 0, shown: 0, t: 0 },   /* 左下角的累积击杀得分 */
+    resources: CFG.econ.start, nextId: 1, over: false, result: "",
+    kills: 0, infected: 0, spawned: 0, paused: false, speed: 1, squadT: 0, hadCivilians: false,
+    bossStats: { tyrantSpawns: 0, tyrantAppearances: 0, tyrantShockHits: 0, tyrantDashHits: 0, plagueEggs: 0, bossPickHistory: [] },
+    stats: { byKind: {} },
+    mode: GAME_MODE, groanT: 0,
+    /* 屏幕反馈：命中抖动与边缘闪光的计时 */
+    shakeT: 0, shakeMag: 0, shakeDur: 1, glowG: 0, glowP: 0,
+    /* 结算特效：烟花与失败红光 */
+    fxWin: 0, fxLose: 0, fwT: 0, fireworks: [],
+    /* 本帧剩余的寻路配额 */
+    astarLeft: 0,
+    /* 英雄系统：升格标记、头顶金字、以及"曾经多于一个"的记录 */
+    armedHadMany: 0, civHadMany: 0, heroTexts: [], heroDuo: null,
+    /* 场上真武装单位的数量，以及"医疗兵是否顶上当武装单位用" */
+    armedN: 0, medicArmed: 0, clusterX: 0, clusterY: 0, clusterOn: 0,
+    /* 地上的血迹（每局重置时一起清掉） */
+    bloodstains: [], craters: [],
+    /* 当前生效的能量防护罩（每帧刷新） */
+    domes: [],
+    /* 飞行中的弹壳与落地后的弹壳贴图（每局重置时一起清掉） */
+    shells: [], casings: [],
+    /* 换弹完成时头顶弹出的那一排金色弹壳符号 */
+    reloadPops: [],
+    /* 飞行中的治疗弹，以及自爆丧尸炸开之后那些"稍后再落"的血点与光环 */
+    heals: [], bombFx: [],
+    /* 被治愈时头顶飘起来的绿色十字符号 */
+    healPops: [],
+    /* 混沌模式：开局倒计时（这段期间谁都不许动）与初始平民数 */
+    countdown: 0, chaosCiv0: 0,
+    /* 护送模式状态 */
+    doorOpen: false, released: 0, evacCount: 0, score: 0,
+    doorT: 0, evacT: 0, spawnT: 0, motherSpawned: false, hotPhase: false,
+    phase: "infiltrate",
+    /* 支援部队：null 表示本局没有开启。开启后是三轮倒计时与降临特效的状态机 */
+    reinf: null, supportOps: [], boss: null, bossFx: [],
+    /* 波次模式：null 表示本局按老规矩一次性铺满。开启后是分批涌入的进度 */
+    waves: null,
+    /* 1.3.3 新兵种在场上留下的东西：飞行中的液氮罐、寒冷圈、火墙、短命特效 */
+    cryoPots: [], cryoFields: [], firePatches: [], firePending: [], flameJets: [], flameParts: [], teslaArcs: [],
+    wallArt: [],
+    cryoClaims: [], teslaClaims: [], claimT: 0, laserParticles: [],
+  };
+  ALLGRID = new Grid(CFG.world.w, CFG.world.h, CFG.world.cell);
+  HUMGRID = new Grid(CFG.world.w, CFG.world.h, CFG.world.cell);
+  ZGRID = new Grid(CFG.world.w, CFG.world.h, CFG.world.cell);
+}
+
+/* ------------------------------ 6. 实体工厂 ------------------------------ */
+function newUnit(kind, x, y) {
+  var c = CFG.unit[kind];
+  return {
+    id: W.nextId++, kind: kind, x: x, y: y, vx: 0, vy: 0, ax: 0, ay: 0,
+    r: c.r, vmax: c.vmax * (CFG.speedScale || 1), vmaxCur: c.vmax * (CFG.speedScale || 1),
+    acc: c.acc, hp: c.hp, maxHp: c.hp,
+    dead: false, tempHp: 0, tempHpT: 0, energyShieldHp: 0, energyShieldMax: 0,
+    tyrantShieldHp: 0, tyrantShieldMax: 0, tyrantShieldT: 0, tyState: "idle",
+    tyChargeT: 0, tyAng: 0, tyDashT: 0, tyDashLen: 0, tyCd: 0, tySearchT: 0,
+    tySpawnT: 0, tyShockDone: 0, tyHitIds: null, tyShieldHits: null,
+    tyStuckT: 0, tyStuckX: x, tyStuckY: y, tyReverseDash: false,
+    pnStuckT: 0, pnStuckX: x, pnStuckY: y, pnAvoidT: 0, pnAvoidX: x, pnAvoidY: y,
+    tyrantInvuln: false, tyrantStageLock: false, tyrantStageSeq: 0,
+    bossSeg: (kind === "plagueNest" || kind === "tyrant") ? 5 : 0,
+    eggT: kind === "plagueNest" ? CFG.plagueNest.eggEvery : 0,
+    eggHatch: kind === "nestEgg" ? CFG.plagueNest.eggHatch : 0,
+    eggReleaseT: 0, eggReleased: 0,
+    /* pathT 是"多久之后才允许第一次寻路"。原来压在 2.2 秒内，
+       一大波刷出来时会挤在同一两秒里排队做 A*，表现为"刚涌出时卡一下"。
+       摊到 0~5 秒之后，尖峰被抹平，而且新单位本来也不需要立刻算路径 */
+    path: [], pathT: RNG.range(0.15, 5.0), target: null, retargetT: RNG.range(0, CFG.retarget),
+    nzT: 0, nzCache: null,
+    lastTx: -1, lastTy: -1, deployHold: 0,
+    pounceT: 0, pounceCd: RNG.range(0, 1.5), pdx: 0, pdy: 0,
+    herdN: 0, herdHit: 0, herdT: 0,   /* herdT：距离下次扫描同类方向还剩多久 */
+    laneSlot: 0,                      /* 阵型槽位 -1~+1：决定这个人站在阵线的哪个位置 */
+    formT: 0,                         /* 阵型意图剩余时间：>0 时压制"抱团"逻辑 */
+    fireFarT: RNG.range(0, CFG.far.interval), fireNearT: RNG.range(0, CFG.near.interval),
+    state: "idle", stateT: 0, post: null, postSearchT: 0,
+    infectT: 0, infectLocked: false, fadeT: 0,
+    stuckT: 0, stuckX: x, stuckY: y,
+    hStuckT: 0, hStuckX: x, hStuckY: y,
+    touchZ: 0, hitFlash: 0,
+    /* 弹药与换弹 */
+    mag: magOf(kind), magSize: magOf(kind),
+    reloading: false, reloadT: 0, swapGuard: 0,
+    /* 护卫关系 */
+    guardOf: null, guards: isArmedKind(kind) ? [] : null,
+    /* 坚守点位与射击状态 */
+    defend: null, retaking: 0, fireHold: 0,
+    incubT: 0, hitBy: 0,
+    /* 盾兵护盾 */
+    graceT: 0,
+    shieldHp: kind === "shield" ? CFG.shield.hp : 0,
+    shieldBroken: false, shieldT: 0,
+    /* 下一档"很弱冲击"的阈值 */
+    shieldNextWave: kind === "shield" ? CFG.shield.hp * (1 - CFG.shield.pulseStep) : 0,
+    /* 盾兵英雄的能量防护罩 */
+    domeHp: 0, domeNext: 0, domeIdle: 0, domeOn: false, domeDownT: 0,
+    /* 狙击手独立游走的落位点，以及"多久没开火"的计时与主动出击标记 */
+    sniperT: RNG.range(0, 1.5), sniperX: x, sniperY: y,
+    idleFireT: 0, hunting: 0,
+    /* 后坐力：抵消计时、射击方向，以及允许短暂超速的速度余量 */
+    recoilT: 0, recoilX: 0, recoilY: 0, recoilRate: 0, vmaxBoost: 0, boostT: 0,
+    /* 中弹踉跄：减速剩余时间，以及上次被击退的时刻 */
+    slowT: 0, kbT: -999,
+    /* 被击退后的"顶回来"计时 */
+    recoverT: 0,
+    /* 被冲击波掀飞后的失控时间：这段时间里自己使不上劲，只顺着惯性滑 */
+    stunT: 0,
+    /* 是否处在编辑器画的无敌区里（每帧由 rebuildGrids 刷新） */
+    safe: 0,
+    /* 英雄：hero 记升格类型（"armed" / "civilian"），防护服按秒计耐久 */
+    hero: null, suitHp: 0, suitBroken: false,
+    /* 武装英雄的附加武器（两把，各自独立记账） */
+    guns: null,
+    /* 上次开火（或主动换弹）的时刻，用于"久不开火自动补满弹匣"。
+       初值必须给 0 而不是一个很负的数，否则新单位一落地就满足"十秒没开火"，
+       玩家按 R 手动换弹的下一帧就会被自动补弹打断 */
+    lastFireT: 0,
+    /* 是否被平民英雄的光环覆盖（无限弹药 + 射速加成），每帧由 rebuildGrids 刷新 */
+    aura: 0,
+    /* 被冲击波掀飞时的伪 3D 抛物线状态，以及落地才结算的伤害 */
+    airT: 0, airDur: 0, airFromX: 0, airFromY: 0, airToX: 0, airToY: 0, airH: 0, pendingDmg: 0,
+    /* 纯视觉抛飞：被爆炸气浪带起来又落下，不影响任何实际状态（位置、移速、负面效果全都不动） */
+    flyT: 0, flyDur: 0, flyPeak: 0,
+    /* 综合射速倍率：英雄自身翻倍，光环再加两成，两者相乘 */
+    rateMul: 1,
+    /* 暂时放弃的目标、放弃冷却，以及反复够不着时的冷却倍率 */
+    giveUpTo: null, giveUpT: 0, giveUpCount: 0,
+    /* 判定"够不着"当时的地形版本与目标位置，两者之一变了才值得重新评估 */
+    giveUpRev: 0, giveUpX: 0, giveUpY: 0, giveUpHold: 0,
+    /* 没有目标时的游荡方向与换向计时 */
+    wanderT: 0, wanderAng: 0,
+    /* 行进路线：绑定的路线下标（-1 = 没有）与当前检查点序号 */
+    routeIdx: -1, routePt: 0,
+    /* 面朝方向：faceAng 是当前朝向；开火时记下瞄准角并保持一小段时间，
+       这样"边退边打"的士兵眼睛和枪仍然朝着敌人，而不是跟着后退方向翻过去 */
+    faceAng: RNG.range(0, TAU), aimAng: 0, aimT: 0,
+    /* 护送模式：休眠 / 警觉 / 被关押 / 撤离 */
+    native: 0, moving: 0, locked: 0, attacker: null, hot: 0, moveT: 0, stuckCd: 0,
+    /* 剧情模式：当前生效的剧本指令，以及待执行的指令队列（会覆盖 AI 走位） */
+    cue: null, cueQ: [], sayText: "", sayT: 0,
+    prevX: x, prevY: y,
+    scanT: RNG.range(0, 0.25), moveDirX: 1, moveDirY: 0,
+    penned: false, evacuating: 0, evacT: 0,
+    mateT: RNG.range(0, 0.2), mateOk: 0, mateX: 0, mateY: 0,
+    /* 队形同步的采样结果，以及盾兵站位的左右偏好（多个盾兵分列两侧而不是挤成一条线） */
+    dirT: RNG.range(0, CFG.squad.dirRate), dirOk: 0, side: RNG.next() < 0.5 ? -1 : 1,
+    /* 母体产卵阈值 */
+    nextSpawnHp: kind === "mother" ? CFG.unit.mother.hp * (1 - CFG.brood.step) : 0,
+    rot: RNG.range(0, TAU),
+    /* 阵型槽位：用 id 做种子，保证同一个人永远站在阵线的同一侧，
+       不会每帧跳来跳去。整型 hash 保证分布均匀 */
+    laneSlot: 0,
+    /* ---- 1.3.3 新兵种状态（默认值写全，逻辑里就不用到处判 undefined） ---- */
+    cryoT: 0, cryoSlow: 1, chillT: 0, frozen: 0, cryoDmgT: 0, throwT: 0, inCryo: 0,
+    flameAng: 0, flameTickT: 0, flameWallT: 0, flameHitT: 0,
+    burnT: 0, burnTickT: 0, burnSrc: null, emberT: 0,
+    teslaBurst: 0, teslaT: 0, teslaCdT: 0, zapT: 0, paralyzeT: 0,
+    laserPhase: 0, laserT: 0, laserAng: 0, laserSweeps: 0, laserCdT: 0, laserTickT: 0, laserHeat: 0
+  };
+}
+/* 给单位分配一个稳定的阵型槽位（-1~+1） */
+function laneSlotOf(u) {
+  if (!u || u.laneSlotInit) return u ? u.laneSlot : 0;
+  var h = (u.id * 2654435761) >>> 0;
+  var r = (h % 2000) / 1000 - 1;                 /* -1 ~ +1 均匀 */
+  u.laneSlot = r;
+  u.laneSlotInit = 1;
+  return r;
+}
+/* 枪的外形规格（世界像素）：长度与粗细。机枪最粗最长，狙击最长最细，破盾手枪最小 */
+var GUN_SPEC = {
+  rifle:  { len: 15, w: 2.6 },
+  mg:     { len: 20, w: 3.6 },
+  sniper: { len: 26, w: 2.8 },
+  shield: { len: 9,  w: 2.2 },
+  /* 新兵种手里的家伙：罐体投掷器、喷火枪、线圈枪、聚能炮 */
+  cryo:   { len: 14, w: 3.2 },
+  flame:  { len: 18, w: 3.4 },
+  tesla:  { len: 16, w: 3.0 },
+  laser:  { len: 22, w: 3.4 }
+};
+function gunSpecOf(kind) { return GUN_SPEC[kind] || null; }
+function magOf(kind) {
+  var cu = CFG.unit[kind];
+  if (cu && cu.gun && cu.gun.mag) return cu.gun.mag;
+  if (kind === "rifle") return CFG.far.mag;
+  if (kind === "mg") return CFG.mg.mag;
+  if (kind === "sniper") return CFG.sniper.mag;   /* 弹匣容量 1 */
+  if (kind === "shield") return CFG.shield.mag || 12;
+  if (kind === "medic") return CFG.medic.mag;
+  return 0;
+}
+/* 这个兵种一次换弹要多久：环形进度条与自动换弹都读它，避免到处写死 kind === "mg" */
+function reloadTimeOf(u) {
+  var t = 1.5;
+  if (!u) return t;
+  if (u.kind === "mg") t = CFG.mg.reload;
+  else if (u.kind === "sniper") t = CFG.sniper.reload;
+  else if (u.kind === "shield") t = 2.0;
+  else if (u.kind === "cryo") t = CFG.cryo.reload;
+  else if (u.kind === "flame") t = CFG.flame.reload;
+  else if (u.kind === "tesla") t = CFG.tesla.reload;
+  else if (u.kind === "laser") t = CFG.laser.playerReload;
+  else {
+    var cu = CFG.unit[u.kind];
+    t = (cu && cu.gun && cu.gun.reload) ? cu.gun.reload : CFG.far.reload;
+  }
+  return u.hero === "militia" ? t * 0.5 : t;
+}
+function manualReload() {
+  var pu = PLAYER.unit;
+  if (!pu || pu.dead || pu.aura) return false;
+  if (pu.reloading || pu.mag >= pu.magSize) return false;
+  pu.reloading = true;
+  pu.lastFireT = W.t;
+  pu.reloadT = reloadTimeOf(pu) * (pu.gearStats ? pu.gearStats.reloadMul : 1);
+  toast("换弹中…");
+  return true;
+}
+function toggleFullscreen() {
+  try {
+    if (!document.fullscreenElement) {
+      var el = document.documentElement;
+      if (el.requestFullscreen) el.requestFullscreen().catch(function () {});
+      else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    } else if (document.exitFullscreen) document.exitFullscreen();
+  } catch (e) {}
+}
+var MOBILE_POS = {
+  reload: { x: 86, y: 78, size: 52, alpha: 55, hidden: false },
+  ctrl:   { x: 8,  y: 78, size: 52, alpha: 55, hidden: false },
+  full:   { x: 88, y: 8,  size: 42, alpha: 55, hidden: false },
+  menu:   { x: 88, y: 22, size: 44, alpha: 55, hidden: false },
+  attack: { x: 84, y: 55, size: 64, alpha: 60, hidden: false },
+  pounce: { x: 72, y: 55, size: 64, alpha: 60, hidden: false }
+};
+function loadMobilePos() {
+  try {
+    var raw = localStorage.getItem("zombieSandbox.mobilePos.v1");
+    if (raw) {
+      var o = JSON.parse(raw);
+      for (var k in MOBILE_POS) if (o && o[k] && isFinite(o[k].x) && isFinite(o[k].y)) {
+        MOBILE_POS[k].x = clamp(o[k].x, 2, 94); MOBILE_POS[k].y = clamp(o[k].y, 2, 90);
+        if (isFinite(o[k].size)) MOBILE_POS[k].size = clamp(o[k].size, 34, 88);
+        if (isFinite(o[k].alpha)) MOBILE_POS[k].alpha = clamp(o[k].alpha, 10, 100);
+        MOBILE_POS[k].hidden = !!o[k].hidden;
+      }
+    }
+  } catch (e) {}
+}
+function mobileBattleActive() {
+  return !!(typeof W !== "undefined" && W && !EDIT.active && !HOME_PANEL && !START_PANEL && !W.over &&
+    overlayEl.className !== "show");
+}
+function mobileControlActive() {
+  return !!(PLAYER.on && PLAYER.unit && !PLAYER.unit.dead);
+}
+function mobileFloatAllowed(k) {
+  if (!mobileBattleActive()) return false;
+  if (k === "ctrl") return true;
+  return mobileControlActive();
+}
+function updateMobileFloat() {
+  var root = document.getElementById("mobileFloat");
+  if (!root) return;
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  root.style.display = (touch && mobileBattleActive()) ? "block" : "none";
+  var map = { reload: "mReload", ctrl: "mCtrl", full: "mFull", menu: "mMenu", attack: "mAttack", pounce: "mPounce" };
+  for (var k in map) {
+    var el = document.getElementById(map[k]);
+    if (!el) continue;
+    var o = MOBILE_POS[k];
+    var hideAttack = (k === "attack" && PLAYER.attackMode !== "three");
+    el.style.display = (o.hidden || hideAttack || !mobileFloatAllowed(k)) ? "none" : "block";
+  }
+}
+function applyMobilePos() {
+  var map = { reload: "mReload", ctrl: "mCtrl", full: "mFull", menu: "mMenu", attack: "mAttack", pounce: "mPounce" };
+  for (var k in map) {
+    var el = document.getElementById(map[k]);
+    if (!el) continue;
+    var o = MOBILE_POS[k];
+    el.style.left = o.x + "%"; el.style.top = o.y + "%";
+    el.style.right = "auto"; el.style.bottom = "auto";
+    el.style.width = o.size + "px"; el.style.height = o.size + "px";
+    el.style.opacity = (o.alpha / 100).toFixed(2);
+    var hideAttack = (k === "attack" && PLAYER.attackMode !== "three");
+    el.style.display = (o.hidden || hideAttack || !mobileFloatAllowed(k)) ? "none" : "block";
+  }
+  updateMobileFloat();
+}
+function saveMobilePos() {
+  try { localStorage.setItem("zombieSandbox.mobilePos.v1", JSON.stringify(MOBILE_POS)); } catch (e) {}
+}
+function encodeMobilePos() {
+  try { return btoa(JSON.stringify(MOBILE_POS)); } catch (e) { return ""; }
+}
+function decodeMobilePos(code) {
+  try {
+    var o = JSON.parse(atob(String(code || "").trim()));
+    for (var k in MOBILE_POS) if (o && o[k] && isFinite(o[k].x) && isFinite(o[k].y)) {
+      MOBILE_POS[k].x = clamp(o[k].x, 2, 94); MOBILE_POS[k].y = clamp(o[k].y, 2, 90);
+      if (isFinite(o[k].size)) MOBILE_POS[k].size = clamp(o[k].size, 34, 88);
+      if (isFinite(o[k].alpha)) MOBILE_POS[k].alpha = clamp(o[k].alpha, 10, 100);
+      MOBILE_POS[k].hidden = !!o[k].hidden;
+    }
+    applyMobilePos(); saveMobilePos(); return true;
+  } catch (e) { return false; }
+}
+function addUnit(kind, x, y) {
+  var u = newUnit(kind, x, y);
+  W.units.push(u);
+  if (kind === "tyrant" && W.bossStats) W.bossStats.tyrantAppearances = (W.bossStats.tyrantAppearances || 0) + 1;
+  if (kind === "plagueNest") {
+    W.boss = u;
+    u.bossSeg = 5;
+    u.eggT = CFG.plagueNest.eggEvery;
+    /* 首领不吃治愈护盾，避免多首领互相叠出无限护盾 */
+    u.energyShieldHp = 0; u.energyShieldMax = 0;
+  } else if (kind === "nestEgg") {
+    u.eggHatch = CFG.plagueNest.eggHatch;
+    u.eggReleaseT = 0;
+    u.eggReleased = 0;
+  }
+  return u;
+}
+/* 四套配色。改的是"看得顺不顺眼"，不碰任何数值 */
+var PALETTE_THEMES = {
+  dusk:    { name: "暮色（默认）", ground: "#0a0c13", grid: "#161b2b",
+             wallHue: 44, wallSat: 28, wallLit: 60, lowHue: 48, lowSat: 23, lowLit: 68 },
+  ruin:    { name: "废墟褐",       ground: "#100c0a", grid: "#241a14",
+             wallHue: 26, wallSat: 24, wallLit: 46, lowHue: 30, lowSat: 20, lowLit: 56 },
+  military:{ name: "军事绿",       ground: "#080d0a", grid: "#12200f",
+             wallHue: 108, wallSat: 14, wallLit: 42, lowHue: 112, lowSat: 12, lowLit: 52 },
+  night:   { name: "夜战蓝",       ground: "#060a12", grid: "#0e1a2c",
+             wallHue: 212, wallSat: 22, wallLit: 48, lowHue: 208, lowSat: 18, lowLit: 58 }
+};
+function applyPaletteTheme(id) {
+  var t = PALETTE_THEMES[id];
+  if (!t) return;
+  var p = CFG.palette;
+  p.theme = id;
+  p.ground = t.ground; p.grid = t.grid;
+  p.wallHue = t.wallHue; p.wallSat = t.wallSat; p.wallLit = t.wallLit;
+  p.lowHue = t.lowHue; p.lowSat = t.lowSat; p.lowLit = t.lowLit;
+  /* 已经在场上的建筑也跟着换色 */
+  var obs = W.obstacles, i, o;
+  for (i = 0; i < obs.length; i++) {
+    o = obs[i];
+    if (o.kind === "low") {
+      o.hue = p.lowHue + RNG.range(-3, 3); o.sat = p.lowSat; o.lit = p.lowLit + RNG.range(-4, 4);
+    } else {
+      o.hue = p.wallHue + RNG.range(-4, 4); o.sat = p.wallSat; o.lit = p.wallLit + RNG.range(-5, 5);
+    }
+  }
+  try { localStorage.setItem("zombieSandbox.palette", id); } catch (e) {}
+}
+function loadPalette() {
+  try {
+    var id = localStorage.getItem("zombieSandbox.palette");
+    if (id && PALETTE_THEMES[id]) applyPaletteTheme(id);
+  } catch (e) {}
+}
+function makeObstacle(x, y, w, h, kind) {
+  /* 颜色来自调色板主题，换主题整张图的建筑一起变色 */
+  var p = CFG.palette;
+  var o = { x: x, y: y, w: w, h: h, kind: kind || "wall",
+    hue: p.wallHue + RNG.range(-4, 4), sat: p.wallSat, lit: p.wallLit + RNG.range(-5, 5) };
+  /* 矮墙（子弹能穿过的那种）比实体墙再亮一点，好一眼区分 */
+  if (o.kind === "low") {
+    o.hue = p.lowHue + RNG.range(-3, 3); o.sat = p.lowSat; o.lit = p.lowLit + RNG.range(-4, 4);
+  }
+  return o;
+}
+/* ============================================================================
+   配件市场：两个栏位（改装枪械 / 角色升级）。
+   同一槽位只能装一件，重复购买会把旧的顶掉，所以不可能同时挂两个弹匣、
+   也不可能既买 +10% 又买 +30% 移速。装备挂在单位身上，交还 AI 之后照样生效。
+   ============================================================================ */
+var GEAR_ITEMS = [
+  /* ---- 改装枪械 ---- */
+  { id: "brake",  tab: "gun",  slot: "muzzle", name: "制退器",        price: 50,   desc: "后坐力 -45%" },
+  { id: "choke",  tab: "gun",  slot: "muzzle", name: "枪口收束器",    price: 150,  desc: "子弹散布 -55%" },
+  { id: "extend", tab: "gun",  slot: "muzzle", name: "枪口延展器",    price: 150,  desc: "激发威力 +25%" },
+  /* 弹匣配件是"增量"，不是"设定成多少发"，
+     写死容量的话，机枪兵装上反而会从 100 变成 45，越买越少 */
+  { id: "mag15",  tab: "gun",  slot: "mag",    name: "扩容弹匣 +15",  price: 50,   desc: "弹匣容量 +15 发（步枪 30→45）" },
+  { id: "mag45",  tab: "gun",  slot: "mag",    name: "弹鼓 +45",      price: 100,  desc: "弹匣容量 +45 发（步枪 30→75）" },
+  { id: "fast",   tab: "gun",  slot: "mag",    name: "快速弹匣",      price: 75,   desc: "换弹速度 +45%" },
+  { id: "fast15", tab: "gun",  slot: "mag",    name: "快速扩容 +15",  price: 125,  desc: "+15 发 + 换弹加快" },
+  { id: "fast45", tab: "gun",  slot: "mag",    name: "快速弹鼓 +45",  price: 175,  desc: "+45 发 + 换弹加快" },
+  { id: "reddot", tab: "gun",  slot: "sight",  name: "红点瞄具",      price: 25,   desc: "十字准星 + 红点，散布 -10%" },
+  { id: "hollow", tab: "gun",  slot: "sight",  name: "快速瞄具",      price: 25,   desc: "括号准星 + 红点，散布 -10%" },
+  /* ---- 角色升级 ---- */
+  { id: "spd10",  tab: "body", slot: "boots",  name: "疾行靴 +10%",   price: 120,  desc: "移动速度 +10%" },
+  { id: "spd30",  tab: "body", slot: "boots",  name: "疾行靴 +30%",   price: 300,  desc: "移动速度 +30%" },
+  { id: "suit1",  tab: "body", slot: "suit",   name: "一级防护服",    price: 75,   desc: "抗接触感染 2 秒" },
+  { id: "suit2",  tab: "body", slot: "suit",   name: "二级防护服",    price: 350,  desc: "抗接触感染 4 秒" },
+  { id: "suit3",  tab: "body", slot: "suit",   name: "三级防护服",    price: 700,  desc: "抗接触感染 8 秒" },
+  { id: "antidote", tab: "body", slot: "suit", name: "抗毒血清",      price: 3000, desc: "抗接触感染 12 秒" },
+  { id: "bless",  tab: "body", slot: "bless",  name: "帝皇赐福",      price: 15000, desc: "当场升格为英雄" }
+];
+var GEAR_SLOT_NAMES = { muzzle: "枪口", mag: "弹匣", sight: "瞄具", boots: "靴子", suit: "防护服", bless: "赐福" };
+var GEAR_TAB = "gun";
+function gearItemById(id) {
+  for (var i = 0; i < GEAR_ITEMS.length; i++) if (GEAR_ITEMS[i].id === id) return GEAR_ITEMS[i];
+  return null;
+}
+function gearOf(u) { if (!u.gear) u.gear = {}; return u.gear; }
+/* 把装备换算成实际数值。每次装备变动都调一次，柱状图就是靠它实时刷新 */
+function gearStats(u) {
+  var g = gearOf(u), s = {
+    recoilMul: 1, magAdd: 0, reloadMul: 1, spreadMul: 1, dmgMul: 1,
+    speedMul: 1, suitTime: 0, sight: "", bless: false
+  };
+  if (g.muzzle === "brake") s.recoilMul *= 0.55;
+  if (g.muzzle === "choke") s.spreadMul *= 0.45;
+  if (g.muzzle === "extend") s.dmgMul *= 1.25;
+  if (g.mag === "mag15") s.magAdd = Math.max(s.magAdd, 15);
+  if (g.mag === "mag45") s.magAdd = Math.max(s.magAdd, 45);
+  if (g.mag === "fast") s.reloadMul *= 0.55;
+  if (g.mag === "fast15") { s.magAdd = Math.max(s.magAdd, 15); s.reloadMul *= 0.55; }
+  if (g.mag === "fast45") { s.magAdd = Math.max(s.magAdd, 45); s.reloadMul *= 0.55; }
+  if (g.sight === "reddot") { s.sight = "cross"; s.spreadMul *= 0.9; }
+  if (g.sight === "hollow") { s.sight = "bracket"; s.spreadMul *= 0.9; }
+  if (g.boots === "spd10") s.speedMul *= 1.10;
+  if (g.boots === "spd30") s.speedMul *= 1.30;
+  if (g.suit === "suit1") s.suitTime = 2;
+  if (g.suit === "suit2") s.suitTime = 4;
+  if (g.suit === "suit3") s.suitTime = 8;
+  if (g.suit === "antidote") s.suitTime = 12;
+  if (g.bless) s.bless = true;
+  return s;
+}
+/* 换装后立刻把数值刷到单位身上 */
+function applyGear(u) {
+  if (!u || u.dead) return;
+  var s = gearStats(u);
+  u.gearStats = s;
+  var baseMag = magOf(u.kind);
+  if (u.gearBaseMag === undefined) u.gearBaseMag = baseMag;
+  /* 增量叠加在本体容量上：步枪 30 → 45/75，机枪 100 → 115/145，狙击 5 → 20/50 */
+  if (u.kind === "cryo") {
+    /* 液氮兵按"瓶"算：扩容 15 只多一瓶，弹鼓只多两瓶，封顶三瓶。
+       它没有"每发打几颗"的概念，所以增量规则要单独换算，不能套用子弹数 */
+    var bottles = 1 + (s.magAdd >= 45 ? 2 : (s.magAdd > 0 ? 1 : 0));
+    u.magSize = bottles;
+    u.mag = bottles;
+  } else {
+    var nm = u.gearBaseMag + s.magAdd;
+    if (nm > 0) {
+      var keep = (u.magSize > 0) ? (u.mag / u.magSize) : 1;
+      u.magSize = nm;
+      u.mag = Math.min(nm, Math.max(1, Math.round(nm * keep)));
+    }
+  }
+  if (u.gearBaseVmax === undefined) u.gearBaseVmax = u.vmax;
+  u.vmax = u.gearBaseVmax * s.speedMul;
+  u.vmaxCur = u.vmax;
+  if (s.suitTime > 0) {
+    u.suitHp = Math.max(u.suitHp || 0, s.suitTime);
+    u.suitBroken = false;
+  }
+}
+
+/* ---------------- 市场界面 ---------------- */
+var MARKET_OPEN = false;
+/* 现在在跟谁打交道：接管了就是他；只是点开看了一眼，那就是被选中的那个人。
+   配件和升级装在具体的人身上，看谁就配谁，不必先抢过操控权 */
+function gearTarget() {
+  if (PLAYER.unit && !PLAYER.unit.dead) return PLAYER.unit;
+  if (UI.peek && !UI.peek.dead) return UI.peek;
+  return null;
+}
+function showMarket() {
+  MARKET_OPEN = true;
+  panelEl.className = "";
+  var u = gearTarget();
+  if (!u) {
+    panelEl.innerHTML = "<h2>装备市场</h2>" +
+      "<div class='warn'>先点选一名士兵再来配装，配件是装在他身上的，不是装给全队的。<br>" +
+      "点一下就选中（AI 继续控制，你只看着），这时候就能买；要自己下场开枪再按「操控」。</div>" +
+      "<p style='text-align:right'><button id='mkClose'>关闭</button></p>";
+    HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+    var c0 = document.getElementById("mkClose");
+    if (c0) c0.addEventListener("click", hideOverlay);
+    return;
+  }
+  var g = gearOf(u), s = gearStats(u);
+  var gs = gunNameOf(u);
+  var html = "<h2>装备市场</h2>" +
+    "<p style='margin:-4px 0 8px;color:#9fb4dd;font-size:12.5px'>当前" +
+    (PLAYER.unit === u ? "操控" : "查看（AI 操控中，照样能配装）") +
+    "：<b style='color:#ffd479'>" +
+    CFG.unit[u.kind].name + "</b> · 手持 " + gs + " · 资源 <b style='color:#8fe0a0'>" + Math.floor(W.resources) + "</b>" +
+    "　·　同一槽位只能装一件，买新的会顶掉旧的；再点一次已装的就卸下。</p>";
+
+  /* 槽位一览 */
+  html += "<div class='opts'>";
+  var slots = ["muzzle", "mag", "sight", "boots", "suit", "bless"];
+  for (var i = 0; i < slots.length; i++) {
+    var it = g[slots[i]] ? gearItemById(g[slots[i]]) : null;
+    html += "<button class='slotbtn" + (it ? " on" : "") + "' style='min-width:120px'>" +
+      GEAR_SLOT_NAMES[slots[i]] + "：" + (it ? it.name : "—") + "</button>";
+  }
+  html += "</div>";
+
+  /* 两个栏位 */
+  html += "<div class='opts' style='margin-top:10px'>" +
+    "<button data-mktab='gun'" + (GEAR_TAB === "gun" ? " class='on'" : "") + ">改装枪械</button>" +
+    "<button data-mktab='body'" + (GEAR_TAB === "body" ? " class='on'" : "") + ">角色升级</button></div>";
+
+  html += "<div style='display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap'>";
+  html += "<div style='flex:1;min-width:280px'>";
+  for (var k = 0; k < GEAR_ITEMS.length; k++) {
+    var it2 = GEAR_ITEMS[k];
+    if (it2.tab !== GEAR_TAB) continue;
+    var owned = (g[it2.slot] === it2.id);
+    var afford = W.resources >= it2.price;
+    html += "<div class='buyrow'><button data-buy2='" + it2.id + "' style='min-width:120px;" +
+      (owned ? "background:#2b4a86;border-color:#4b76d1" : (afford ? "" : "opacity:.45")) + "'>" +
+      (owned ? "✓ " : "") + it2.name + "</button>" +
+      "<span class='price'>" + it2.price + "</span>" +
+      "<span style='color:#9fb4dd;font-size:12px'>" + it2.desc + "</span></div>";
+  }
+  html += "</div>";
+
+  /* 实时数值柱状图 + 实机演示 */
+  html += "<div class='mktPrevBox' style='width:280px'>" +
+    "<div style='font-size:12px;color:#9fb4dd;margin-bottom:4px'>实机演示（配件即时生效）</div>" +
+    "<canvas id='mktPrev' width='300' height='110' style='width:100%;height:110px;background:#081016;" +
+    "border:1px solid #22304d;border-radius:2px;display:block;margin-bottom:8px'></canvas>" +
+    "<div style='font-size:12px;color:#9fb4dd;margin-bottom:6px'>实时数值（买完立刻变化）</div>" +
+    gearBarsHtml(u, s) + "</div>";
+  html += "</div>";
+  html += "<p style='text-align:right;margin-top:12px'><button id='mkClose'>关闭</button></p>";
+  panelEl.innerHTML = html;
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+
+  var tabs = panelEl.querySelectorAll("[data-mktab]");
+  for (var t = 0; t < tabs.length; t++) {
+    (function (b) {
+      b.addEventListener("click", function () { GEAR_TAB = b.getAttribute("data-mktab"); showMarket(); });
+    })(tabs[t]);
+  }
+  var buys = panelEl.querySelectorAll("[data-buy2]");
+  for (var z = 0; z < buys.length; z++) {
+    (function (b) {
+      b.addEventListener("click", function () { buyGear(b.getAttribute("data-buy2")); });
+    })(buys[z]);
+  }
+  var cl = document.getElementById("mkClose");
+  if (cl) cl.addEventListener("click", hideOverlay);
+  marketPreviewStart(u);
+}
+var MKT_PREV = { raf: 0, on: false, gen: 0, t: 0, fireT: 0, flash: 0, bullets: [], hp: 30 };
+function marketPreviewStop() {
+  MKT_PREV.on = false;
+  MKT_PREV.gen = (MKT_PREV.gen || 0) + 1;
+  if (MKT_PREV.raf && typeof cancelAnimationFrame === "function") {
+    try { cancelAnimationFrame(MKT_PREV.raf); } catch (e) {}
+  }
+  MKT_PREV.raf = 0;
+}
+function marketPreviewStart(u) {
+  marketPreviewStop();
+  var cv = document.getElementById("mktPrev");
+  if (!cv || !cv.getContext) return;
+  var g = null;
+  try { g = cv.getContext("2d"); } catch (e) { g = null; }
+  if (!g) return;
+  /* 市场演示直接跑兵种的真实模拟与真实渲染，特殊武器/电弧/喷射都不会退化成普通子弹 */
+  demoBuild(u.kind);
+  MKT_PREV.on = true;
+  var myGen = (MKT_PREV.gen = (MKT_PREV.gen || 0) + 1);
+  var last = 0;
+  function frame(ts) {
+    if (!MKT_PREV.on || myGen !== MKT_PREV.gen) return;
+    var dt = last ? Math.min(0.05, (ts - last) / 1000) : 0.016;
+    last = ts;
+    demoStep(dt);
+    var oldCTX = CTX, oldVW = VW, oldVH = VH, oldDPR = DPR, oldW = W;
+    var oldCX = CAM.x, oldCY = CAM.y, oldCZ = CAM.zoom;
+    try {
+      CTX = g; VW = 300; VH = 110; DPR = 1; W = DEMO.world;
+      RENDER_NO_HUD = true;
+      var _mktFog = CFG.fog.on;
+      CFG.fog.on = false;
+      CAM.x = 480; CAM.y = 300; CAM.zoom = 0.62;
+      g.setTransform(1, 0, 0, 1, 0, 0);
+      g.clearRect(0, 0, 300, 110);
+      render();
+    } catch (e) {
+      try { g.fillStyle = "#081016"; g.fillRect(0, 0, 300, 110); } catch (e2) {}
+    } finally {
+      CTX = oldCTX; VW = oldVW; VH = oldVH; DPR = oldDPR; W = oldW;
+      RENDER_NO_HUD = false;
+      CFG.fog.on = _mktFog;
+      CAM.x = oldCX; CAM.y = oldCY; CAM.zoom = oldCZ;
+    }
+    if (MKT_PREV.on && requestAnimationFrame) MKT_PREV.raf = requestAnimationFrame(frame);
+  }
+  if (requestAnimationFrame) MKT_PREV.raf = requestAnimationFrame(frame);
+}
+function gearBarsHtml(u, s) {
+  var c = CFG.unit[u.kind];
+  var base0 = u.gearBaseMag || magOf(u.kind);
+  var rows = [
+    ["弹匣", Math.round(u.magSize), base0 * 3, "#7fc4ff"],
+    ["激发威力", Math.round((gunOf(u).dmg || 0) * s.dmgMul * 10) / 10, 40, "#ff9a6b"],
+    ["射速", Math.round(60 / Math.max(0.02, gunOf(u).interval || 1)), 1200, "#ffd479"],
+    ["散布", Math.round((gunOf(u).spreadDeg || 0) * s.spreadMul * 10) / 10, 20, "#c9a7eb"],
+    ["后坐力", Math.round((u.recoilRate || 0) * s.recoilMul), 1200, "#ff7a7a"],
+    ["移速", Math.round(u.vmax), 400, "#8fe0a0"],
+    ["防护", Math.round(u.suitHp || 0), 12, "#7fe0e0"]
+  ];
+  var h = "";
+  for (var i = 0; i < rows.length; i++) {
+    var r = rows[i];
+    var pct = Math.max(0, Math.min(100, (r[1] / Math.max(1, r[2])) * 100));
+    h += "<div style='margin:5px 0;font-size:12px;color:#9fb4dd'>" + r[0] +
+      "<div style='height:9px;background:#131a2b;border-radius:5px;margin-top:2px;position:relative'>" +
+      "<div style='height:9px;border-radius:5px;width:" + pct.toFixed(0) + "%;background:" + r[3] + "'></div>" +
+      "</div><span style='float:right;color:#dfe6f5;font-variant-numeric:tabular-nums'>" + r[1] + "</span></div>";
+  }
+  return h;
+}
+function buyGear(id) {
+  var it = gearItemById(id);
+  var u = gearTarget();
+  if (!it || !u || u.dead) return;
+  var g = gearOf(u);
+  /* 已装则卸下 */
+  if (g[it.slot] === id) {
+    g[it.slot] = null;
+    applyGear(u);
+    toast("已拆卸：" + it.name);
+    showMarket();
+    return;
+  }
+  if (W.resources < it.price) { toast("资源不足（需要 " + it.price + "）"); return; }
+  W.resources -= it.price;
+  g[it.slot] = id;
+  if (id === "bless") {
+    promoteHero(u, isArmed(u) ? "armed" : "civilian", true);
+    heroShockwave(u);
+  }
+  applyGear(u);
+  toast("已装备：" + it.name);
+  showMarket();
+}
+
+/* ------------------------------ 7. 物理 ---------------------------------- */
+/* 圆 vs 轴对齐矩形：位置推出 + 切向滑动 */
+function collideObstacles(u) {
+  if (u.rappeli) return;   /* 挂绳单位在高空层，不参与地面碰撞 */
+  var obs = W.obstacles;
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (u.x + u.r < o.x || u.x - u.r > o.x + o.w || u.y + u.r < o.y || u.y - u.r > o.y + o.h) continue;
+    var nx = clamp(u.x, o.x, o.x + o.w), ny = clamp(u.y, o.y, o.y + o.h);
+    var dx = u.x - nx, dy = u.y - ny, d2 = dx * dx + dy * dy;
+    if (d2 > u.r * u.r) continue;
+    var px, py, d = Math.sqrt(d2), pen;
+    if (d > 1e-6) {
+      px = dx / d; py = dy / d; pen = u.r - d;
+    } else {
+      /* 圆心已经陷进矩形内部：按它上一帧所在的侧面推出去。
+         薄墙（比如封锁大门）如果按最短轴推，方向可能是错的，会把单位送进墙的另一边。 */
+      var lft2 = u.x - o.x, rgt2 = o.x + o.w - u.x, top2 = u.y - o.y, bot2 = o.y + o.h - u.y;
+      if (u.prevX <= o.x) { px = -1; py = 0; pen = u.r + lft2; }
+      else if (u.prevX >= o.x + o.w) { px = 1; py = 0; pen = u.r + rgt2; }
+      else if (u.prevY <= o.y) { px = 0; py = -1; pen = u.r + top2; }
+      else if (u.prevY >= o.y + o.h) { px = 0; py = 1; pen = u.r + bot2; }
+      else {
+        var m = Math.min(lft2, rgt2, top2, bot2);
+        if (m === lft2) { px = -1; py = 0; pen = u.r + lft2; }
+        else if (m === rgt2) { px = 1; py = 0; pen = u.r + rgt2; }
+        else if (m === top2) { px = 0; py = -1; pen = u.r + top2; }
+        else { px = 0; py = 1; pen = u.r + bot2; }
+      }
+    }
+    u.x += px * pen; u.y += py * pen;
+    var vn = u.vx * px + u.vy * py;
+    if (vn < 0) { u.vx -= px * vn; u.vy -= py * vn; }
+  }
+  var m2 = u.r;
+  if (u.x < m2) { u.x = m2; if (u.vx < 0) u.vx = 0; }
+  if (u.y < m2) { u.y = m2; if (u.vy < 0) u.vy = 0; }
+  if (u.x > CFG.world.w - m2) { u.x = CFG.world.w - m2; if (u.vx > 0) u.vx = 0; }
+  if (u.y > CFG.world.h - m2) { u.y = CFG.world.h - m2; if (u.vy > 0) u.vy = 0; }
+}
+/* 单位间分离：绝对刚体、不允许堆叠 */
+/* 人类与丧尸的最高速都提高了，单帧位移变大，分离迭代从 3 提到 4：
+   否则尸群挤在一起时会出现将近 10px 的穿透，圆体看着就叠在一起了 */
+var SEP_ITER = 4, SEP_K = 0.6, SEP_E = 0.05;
+function separateUnits() {
+  for (var it = 0; it < SEP_ITER; it++) {
+    for (var i = 0; i < W.units.length; i++) {
+      var u = W.units[i];
+      if (u.dead || u.rappeli || u.kind === "nestEgg") continue;
+      ALLGRID.query(u.x, u.y, u.r + 16, _qa);
+      for (var k = 0; k < _qa.length; k++) {
+        var v = _qa[k];
+        if (v === u || v.dead || v.rappeli || v.kind === "nestEgg" || v.id < u.id) continue;
+        var dx = v.x - u.x, dy = v.y - u.y;
+        var rr = u.r + v.r, d2 = dx * dx + dy * dy;
+        if (d2 >= rr * rr || d2 < 1e-9) continue;
+        var d = Math.sqrt(d2), nx = dx / d, ny = dy / d, pen = (rr - d) * SEP_K;
+        var mu = u.r * u.r, mv = v.r * v.r, tot = mu + mv;
+        var cu = mv / tot, cv = mu / tot;
+        u.x -= nx * pen * cu; u.y -= ny * pen * cu;
+        v.x += nx * pen * cv; v.y += ny * pen * cv;
+        var rvx = v.vx - u.vx, rvy = v.vy - u.vy, vn = rvx * nx + rvy * ny;
+        if (vn < 0) {
+          var j = -(1 + SEP_E) * vn / (1 / mu + 1 / mv);
+          u.vx -= j * nx / mu; u.vy -= j * ny / mu;
+          v.vx += j * nx / mv; v.vy += j * ny / mv;
+        }
+      }
+    }
+  }
+}
+/* 能量防护罩只放人类过去：丧尸一碰到球面就被顶回外侧 */
+function pushOutOfDomes(u) {
+  if (!isZombieSide(u) || u.kind === "nestEgg") return;
+  for (var i = 0; i < W.domes.length; i++) {
+    var d = W.domes[i];
+    if (d.dead || !d.domeOn) continue;
+    var R = CFG.fearRCivilian;
+    var dx = u.x - d.x, dy = u.y - d.y;
+    var dd = Math.sqrt(dx * dx + dy * dy);
+    if (dd >= R + u.r || dd < 1e-6) continue;
+    u.x = d.x + dx / dd * (R + u.r);
+    u.y = d.y + dy / dd * (R + u.r);
+    collideObstacles(u);
+  }
+}
+function rebuildGrids() {
+  ALLGRID.clear(); HUMGRID.clear(); ZGRID.clear();
+  var hl = W.humanList;
+  hl.length = 0;
+  var i, u;
+  /* 平民英雄的光环要先找出来，才能发给圈里的其他人 */
+  var auraSrc = null;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (!u.dead && (u.hero === "civilian" || u.hero === "militia")) { auraSrc = u; break; }
+  }
+  var auraR2 = 0;
+  if (auraSrc) {
+    var ar = fearRadiusOf(auraSrc) * CFG.hero.auraR;
+    auraR2 = ar * ar;
+  }
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead) continue;
+    u.aura = (auraSrc && dist2(u.x, u.y, auraSrc.x, auraSrc.y) <= auraR2) ? 1 : 0;
+    if (u.hero === "militia") u.aura = 0;   /* 自身只吃武装赐福，光环留给队友 */
+    /* 射速倍率：英雄自身翻倍，站在平民英雄光环里再快两成，两者叠乘 */
+    u.rateMul = (u.hero === "armed" ? CFG.hero.rateMul : (u.hero === "militia" ? 3 : 1)) *
+              ((u.aura && !auraNoAmmo(u.kind)) ? CFG.hero.auraRate : 1);
+    ALLGRID.add(u);
+    /* 被关押的平民照样算可见目标：外面的丧尸会一路追到封锁大门外扑门（刻意保留的画面效果） */
+    if (isHuman(u) && !isZombieSide(u)) { HUMGRID.add(u); hl.push(u); }
+    /* 丧尸单独一张表：索敌、群集同步、感染检测都只关心丧尸，
+       混在总表里会让它们把一半的遍历花在人类身上 */
+    if (isZombieSide(u)) ZGRID.add(u);
+    /* 无敌区标记：每帧算一次，之后各处直接读这个字段，不必反复做矩形判定 */
+    u.safe = inSafeZone(u.x, u.y) ? 1 : 0;
+  }
+}
+function integrate(dt) {
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead) continue;
+    u.prevX = u.x; u.prevY = u.y;
+    /* 飞在空中的不参与常规积分，交给抛飞动画自己走 */
+    if (stepAir(u, dt)) continue;
+    u.vx += u.ax * dt; u.vy += u.ay * dt;
+    if (u.paralyzeT > 0) {
+      /* 麻痹：这一小段时间里速度被按住，解麻后从静止重新加速，不继承旧速度 */
+      u.paralyzeT -= dt;
+      u.vx = 0; u.vy = 0;
+      u.ax = 0; u.ay = 0;
+    }
+    /* 后坐力带来的速度余量：让"边退边打"真的能比平时退得更快 */
+    if (u.boostT > 0) {
+      u.boostT -= dt;
+      if (u.boostT <= 0) { u.boostT = 0; u.vmaxBoost = 0; }
+      /* 余量随时间收窄：速度平滑滑回正常水平，而不是到点被上限硬切 */
+      else u.vmaxBoost *= Math.exp(-dt * CFG.boostDecay);
+    }
+    if (u.slowT > 0) u.slowT -= dt;
+    if (u.stunT > 0) u.stunT -= dt;
+    if (u.recoverT > 0) u.recoverT -= dt;
+    /* 踉跄期间速度上限降低；被击退那一下的额外速度单独加回来，
+       否则会被同一个上限一起压掉，看起来就"推不动" */
+    /* 被舌头锁住：几乎动弹不得，只能被对方往回拖 */
+    if (u.tongueHeld) u.vmaxCur = Math.min(u.vmaxCur, 20);
+    /* 液氮减速：进圈越久越慢，满 3 秒彻底冻住（cryoSlow = 0） */
+    var cryoK = (u.cryoSlow === undefined) ? 1 : u.cryoSlow;
+    var lim = u.vmaxCur * cryoK * (u.slowT > 0 ? (u.slowMul || CFG.hitStagger.slowMul) : 1) + u.vmaxBoost;
+    var sp = hypot(u.vx, u.vy);
+    if (sp > lim) { var k = lim / sp; u.vx *= k; u.vy *= k; }
+    /* 朝向：刚开过火就保持瞄准方向，否则跟着移动方向转 */
+    if (u.aimT > 0) u.aimT -= dt;
+    else if (sp > 12) u.faceAng = Math.atan2(u.vy, u.vx);
+    u.x += u.vx * dt; u.y += u.vy * dt;
+  }
+}
+/* ------------------------------ 8. AI ----------------------------------- */
+var _sense = { near: 0, far: 0, fear: 0, cx: 0, cy: 0, fearN: 0, nearest: null, dNear: Infinity };
+/* 一次远射圈查询，同时分类出恐惧圈/速射圈/远射圈内的丧尸 */
+function senseZombies(u, farR, fearR) {
+  var o = _sense;
+  o.near = 0; o.far = 0; o.fear = 0; o.cx = 0; o.cy = 0; o.fearN = 0;
+  o.nearest = null; o.dNear = Infinity;
+  if (fearR === undefined) fearR = fearRadiusOf(u);
+  var fr2 = farR * farR, nr2 = CFG.near.r * CFG.near.r, fe2 = fearR * fearR;
+  ZGRID.query(u.x, u.y, farR + 300, _qb);
+  for (var i = 0; i < _qb.length; i++) {
+    var v = _qb[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (v.armT > 0) continue;      /* 蓄爆中的自爆丧尸不再算作威胁，也不该被锁 */
+    var d2 = dist2(u.x, u.y, v.x, v.y);
+    var ed = Math.max(0, Math.sqrt(d2) - (v.r || 0));
+    var ed2 = ed * ed;
+    if (ed > farR) continue;
+    o.far++;
+    if (ed2 < o.dNear) { o.dNear = ed2; o.nearest = v; }
+    if (ed <= CFG.near.r) o.near++;
+    if (ed <= fearR) { o.fear++; o.cx += v.x; o.cy += v.y; o.fearN++; }
+  }
+  if (o.fearN > 0) { o.cx /= o.fearN; o.cy /= o.fearN; }
+  return o;
+}
+/* 丧尸群集同步：侦测最近 2 只同阵营单位的位移方向 */
+/* 方向计算全部走标量输出，避免每帧为单位分配向量对象（GC 是这类模拟的主要隐性成本） */
+var _hx = 0, _hy = 0;
+function herdSample(u) {
+  u.herdN = 0; u.herdHit = 0;
+  ZGRID.query(u.x, u.y, CFG.herdR, _qc);
+  var b1 = null, b2 = null, d1 = Infinity, d2 = Infinity;
+  var i, v, d;
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v === u || v.dead || !isZombie(v) || v.safe) continue;   /* 无敌区里的同类不参与队列同步 */
+    d = dist2(u.x, u.y, v.x, v.y);
+    if (d < d1) { d2 = d1; b2 = b1; d1 = d; b1 = v; }
+    else if (d < d2) { d2 = d; b2 = v; }
+  }
+  if (!b1 || !b2) return false;
+  u.herdN = 2;
+  var minV = u.vmax * CFG.herd.vmin;
+  var sa = hypot(b1.vx, b1.vy), sb = hypot(b2.vx, b2.vy);
+  if (sa < minV || sb < minV) return false;
+  var angTol = CFG.herd.angDeg * Math.PI / 180;
+  if (Math.abs(angDiff(angOf(b1.vx, b1.vy), angOf(b2.vx, b2.vy))) > angTol) return false;
+  var mx = b1.vx / sa + b2.vx / sb, my = b1.vy / sa + b2.vy / sb;
+  var m = Math.sqrt(mx * mx + my * my);
+  if (m < 1e-9) return false;
+  _hx = mx / m; _hy = my / m;
+  u.herdHit = 1;
+  return true;
+}
+function nearestHuman(u) {
+  var best = null, bd = Infinity;
+  var list = W.humanList;
+  for (var i = 0; i < list.length; i++) {
+    var v = list[i];
+    if (v.dead || v.rappeli) continue;
+    if (v.safe) continue;             /* 无敌区里的单位：丧尸根本看不见它 */
+    if (v === u.giveUpTo) continue;   /* 放弃中的目标直接跳过，判据是"是否还在放弃"，不是冷却有没有走完 */
+
+
+    var d = dist2(u.x, u.y, v.x, v.y);
+    if (hasShield(v)) d *= 0.2;   /* 举盾的盾兵对丧尸更有吸引力，会被优先锁定 */
+    if (d < bd) { bd = d; best = v; }
+  }
+  return best;
+}
+/* 判定某个目标够不着：记下它并进入冷却，同时清掉索敌缓存好去挑下一个目标 */
+function giveUpOn(u, tgt) {
+  if (!tgt) return;
+  if (u.giveUpTo === tgt) u.giveUpCount++;
+  else { u.giveUpTo = tgt; u.giveUpCount = 1; }
+  /* 同一个目标反复够不着，冷却就一次比一次长（最多 8 倍），
+     否则它每几秒就要白试一次，看起来跟没放弃一样 */
+  u.giveUpT = CFG.giveUp.time * Math.min(CFG.giveUp.maxMul, u.giveUpCount);
+  u.giveUpRev = NAV.rev;                    /* 记下当时的地形版本 */
+  u.giveUpX = tgt.x; u.giveUpY = tgt.y;     /* 记下目标当时的位置 */
+  u.giveUpHold = 0;
+  u.nzCache = null;
+}
+function stuckEscapeDir(u) {
+  if (!u || !W.obstacles || !W.obstacles.length) return null;
+  var best = null, bd = 1e18;
+  for (var i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    var nx = clamp(u.x, o.x, o.x + o.w), ny = clamp(u.y, o.y, o.y + o.h);
+    var d2 = dist2(u.x, u.y, nx, ny);
+    if (d2 < bd) { bd = d2; best = { x: nx, y: ny }; }
+  }
+  if (!best || bd > 120 * 120) return null;
+  var dx = u.x - best.x, dy = u.y - best.y;
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-6) {
+    /* 正贴在同一面墙上：沿速度的反方向或墙的切线脱出 */
+    dx = -(u.vx || 1); dy = -(u.vy || 0);
+    m = Math.sqrt(dx * dx + dy * dy) || 1;
+  }
+  return { x: dx / m, y: dy / m };
+}
+function repathTo(u, tx, ty, maxNodes, cd, tgt) {
+  /* 同一目标、短时间内有效路径还在：直接复用，不再扣预算 */
+  if (u.path && u.path.length && u.pathGoal &&
+      dist2(tx, ty, u.pathGoal.x, u.pathGoal.y) < 24 * 24 &&
+      (W.t - (u.pathAt === undefined ? -99 : u.pathAt)) < 1.5) {
+    return u.path;
+  }
+  /* 每帧寻路配额：超出的排到下一帧再算。
+     u.pathT 归零表示"这帧没轮到，下帧立刻再试"，旧的路径继续用着，所以不会站着不动 */
+  if (W.astarLeft <= 0) { u.pathT = 0; return null; }
+  W.astarLeft--;
+  var np = astar(u.x, u.y, tx, ty, maxNodes, bossPathRadius(u));
+  if (!np) {
+    /* 首领不走普通放弃流程：先退开，再重新找宽路 */
+    if (isBossUnit(u)) {
+      u.path = [];
+      u.pathT = 0.55;
+      return null;
+    }
+    /* 整个可达区域都探完了也没走到，目标确实够不着 */
+    if (tgt) giveUpOn(u, tgt);
+    u.path = [];
+    u.pathT = cd * 2 + RNG.next() * 0.8;
+    return null;
+  }
+  /* 探索被上限打断、只拿到半截路径时，看这半截停在哪儿：
+     如果它既没贴近目标、又已经看不见目标了，说明中间横着过不去的东西，
+     目标躲在密闭空间里就是这个表现，路径只能停在墙根。
+     单看距离不行：墙根到目标的远近取决于那个空间有多大 */
+  if (np.partial && tgt) {
+    var endPt = np[np.length - 1];
+    var dd = dist2(endPt.x, endPt.y, tx, ty);
+    if (dd > CFG.giveUp.dist * CFG.giveUp.dist && !NAV.los(endPt.x, endPt.y, tx, ty)) giveUpOn(u, tgt);
+  }
+  u.path = np;
+  u.pathGoal = { x: tx, y: ty };
+  u.pathAt = W.t;
+  u.pathT = np.partial ? cd * (0.25 + RNG.next() * 0.35) : cd * (0.75 + RNG.next() * 0.5);
+  return np;
+}
+function followPath(u) {
+  var p = u.path;
+  if (!p || p.length === 0) return null;
+  var wr2 = CFG.waypointR * CFG.waypointR, guard = 0;
+  while (p.length && dist2(u.x, u.y, p[0].x, p[0].y) < wr2 && guard++ < 8) p.shift();
+  /* 提前看下一个点：当前点已经很近、下一点又通视时直接跳过，
+     单位不用先到点再转向，过弯更顺 */
+  if (p.length > 1) {
+    var near2 = CFG.waypointR * 2;
+    if (dist2(u.x, u.y, p[0].x, p[0].y) < near2 * near2 &&
+        NAV.los(u.x, u.y, p[1].x, p[1].y) &&
+        (!(u.r > 11) || navAreaClear(Math.floor(p[1].x / NAV.tile), Math.floor(p[1].y / NAV.tile), bossPathRadius(u)))) {
+      p.shift();
+    }
+  }
+  return p.length ? p[0] : null;
+}
+/* 护送模式：休眠中的初始丧尸。会扫描两件事，范围内有没有人类、范围内有没有同类在移动 */
+function aiZombieSleep(u, dt) {
+  u.ax = 0; u.ay = 0; u.vmaxCur = u.vmax;
+  u.scanT -= dt;
+  if (u.scanT <= 0) {
+    u.scanT = 0.22;
+    /* ① 警觉半径内出现人类 → 自主锁定 */
+    var h = nearestHumanIn(u, CFG.escort.alertR);
+    if (h) { u.locked = 1; u.target = h; return; }
+    /* ② 扫描半径内有同类在动 → 跟着它一起动 */
+    var md = movingMateNear(u, CFG.escort.scanR);
+    if (md) { u.moving = 1; u.moveDirX = md.dx; u.moveDirY = md.dy; u.moveT = 1.4; }
+  }
+  if (u.moving) {
+    u.moveT -= dt;
+    if (u.moveT <= 0) u.moving = 0;
+    u.state = "wander";
+    u.ax = u.moveDirX * u.acc * 0.5;
+    u.ay = u.moveDirY * u.acc * 0.5;
+    return;
+  }
+  /* 真正睡着：主动刹停，保持原地不动 */
+  u.state = "dormant";
+  var sp = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+  if (sp > 2) { u.ax = -u.vx / sp * 500; u.ay = -u.vy / sp * 500; }
+}
+/* 某个半径内是否有人类（被关押的平民不算） */
+function nearestHumanIn(u, range) {
+  var best = null, bd = range * range;
+  var list = W.humanList;
+  for (var i = 0; i < list.length; i++) {
+    var v = list[i];
+    if (v.dead || v.rappeli || v.penned || v.safe) continue;
+    var d = dist2(u.x, u.y, v.x, v.y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  return best;
+}
+/* 扫描半径内最近的一只"正在移动的同类"，返回它的移动方向 */
+function movingMateNear(u, range) {
+  ZGRID.query(u.x, u.y, range, _qc);
+  var best = null, bd = Infinity, minSp = 24;
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v === u || v.dead || !isZombie(v)) continue;
+    var sp = Math.sqrt(v.vx * v.vx + v.vy * v.vy);
+    if (sp < minSp) continue;
+    var d = dist2(u.x, u.y, v.x, v.y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  if (!best) return null;
+  var m = Math.sqrt(best.vx * best.vx + best.vy * best.vy) || 1;
+  return { dx: best.vx / m, dy: best.vy / m };
+}
+/* ============================================================================
+   舔舐者的舌头
+   一条从舔舐者身上伸出去的细长条：先按固定速度生长，够到目标就锁住并往回拽；
+   过程中可以被子弹打断（有血量），打断后双方都恢复行动，舔舐者反方向逃跑。
+   ============================================================================ */
+function lickerTongueOf(u) {
+  var i;
+  if (!W.tongues) return null;
+  for (i = 0; i < W.tongues.length; i++) {
+    if (W.tongues[i].owner === u && !W.tongues[i].dead) return W.tongues[i];
+  }
+  return null;
+}
+function shootTongue(u, tgt) {
+  if (!W.tongues) W.tongues = [];
+  var L = CFG.licker;
+  var d = Math.sqrt(dist2(u.x, u.y, tgt.x, tgt.y));
+  W.tongues.push({
+    owner: u, target: tgt,
+    ang: Math.atan2(tgt.y - u.y, tgt.x - u.x),
+    len: u.r + 4, maxLen: Math.max(d + 24, 60),
+    hp: L.tongueHp, maxHp: L.tongueHp,
+    speed: CFG.bullet.speed / L.speedDiv,
+    drag: u.vmax / L.dragDiv * L.dragBoost,
+    hit: false, dead: false, t: 0
+  });
+  u.tongueFired = 1;
+  tgt.lickerLock = u;        /* 占住这个目标，别的舔舐者排队等它收工 */
+  /* 一口"呕"；0.12 秒的去重闸门，防止一次投放十几只舔舐者时糊成一团 */
+  if (SFX.ok && SFX.enabled && SFX.gate("lickerVomit", 120)) SFX.vomit({ peak: 0.34, wet: 0.22 });
+}
+/* 舌头撞上能量护盾：收回舌头，而不是判定舌头断裂 */
+function shieldBlocksTongue(q) {
+  var ow = q.owner, tg = q.target;
+  if (!ow || !tg) return false;
+  var i;
+  for (i = 0; i < W.domes.length; i++) {
+    var d = W.domes[i];
+    if (!d.domeOn || d === ow) continue;
+    var R = CFG.fearRCivilian;
+    if (dist2(ow.x, ow.y, d.x, d.y) <= R * R) continue;   /* 主人已在护盾内，不挡 */
+    if (segCircleT(ow.x, ow.y, tg.x, tg.y, d.x, d.y, R) >= 0) return true;
+  }
+  var ops = W.supportOps || [];
+  for (i = 0; i < ops.length; i++) {
+    var op = ops[i];
+    if (op.key !== "legion" || !op.dome || !op.dome.on) continue;
+    var defL = supportDefOf("legion");
+    var RR = op.dome.R * Math.min(1, (op.dome.deployT || 0) / (defL.shieldExpand || 0.45));
+    if (RR < 4) continue;
+    if (dist2(ow.x, ow.y, op.dome.x, op.dome.y) <= RR * RR) continue;
+    if (segCircleT(ow.x, ow.y, tg.x, tg.y, op.dome.x, op.dome.y, RR) >= 0) return true;
+  }
+  return false;
+}
+function stepTongues(dt) {
+  if (!W.tongues || !W.tongues.length) return;
+  var L = CFG.licker;
+  for (var i = W.tongues.length - 1; i >= 0; i--) {
+    var q = W.tongues[i];
+    var ow = q.owner, tg = q.target;
+    /* 主人或目标没了，舌头自然消失 */
+    if (q.dead || !ow || ow.dead || !tg || tg.dead) {
+      if (ow && !ow.dead) { ow.tongueFired = 0; ow.tongueT = 0; }
+      /* 舌头消失的每一条路径都必须把被粘住的人放开。
+         以前漏了这一行：直接打死舔舐者本体时，舌头被移除，
+         但那根绳子的"限制移动"永远留在人身上，这个人从此再也走不动 */
+      if (tg && !tg.dead) { tg.tongueLock = null; tg.tongueHeld = null; }
+      W.tongues.splice(i, 1);
+      continue;
+    }
+    q.t += dt;
+    if (!q.retract && shieldBlocksTongue(q)) { loseTongue(q); continue; }
+
+    /* 断线回收：舌头飞快缩回去，缩到 0 就移除 */
+    if (q.retract) {
+      q.len -= L.retract * dt;
+      if (q.len <= 0) { q.len = 0; q.dead = true; }
+      continue;
+    }
+
+    var dNow = Math.sqrt(dist2(ow.x, ow.y, tg.x, tg.y));
+    var wantAng = Math.atan2(tg.y - ow.y, tg.x - ow.x);
+
+    /* 断线条件：目标跑到射程 1.5 倍以外，或者躲进了掩体后面 */
+    var maxReach = CFG.fearRCivilian * L.reachMul * L.loseMul;
+    var lost = (dNow > maxReach);
+    if (!lost && segBlockedByWall(ow.x, ow.y, tg.x, tg.y)) lost = true;
+    if (lost) {
+      loseTongue(q);
+      continue;
+    }
+
+    if (!q.hit) {
+      /* 还没粘住：弱追踪，每帧朝"本体 → 目标"的方向拧一点，目标小范围移动也甩不掉 */
+      var da = wantAng - q.ang;
+      while (da > Math.PI) da -= TAU;
+      while (da < -Math.PI) da += TAU;
+      q.ang += da * L.track;
+      q.maxLen = Math.max(dNow, 40);
+      q.len += q.speed * dt;
+      /* 够到目标：锁住并开始往回拽。命中之前对方是自由的，想跑就跑 */
+      if (q.len >= dNow) {
+        q.hit = true;
+        tg.tongueLock = ow;
+        tg.slowT = Math.max(tg.slowT || 0, 0.2);
+      }
+    } else {
+      /* 已经粘住了：像蛛丝一样紧绷成一条直线，角度直指目标不再平滑，
+         长度每帧重算成"本体到目标的距离"，末端始终贴在被粘住的东西上，
+         往回拖的时候能亲眼看到这根丝在变短 */
+      q.ang = wantAng;
+      q.maxLen = Math.max(dNow, 1);
+      q.len = Math.max(0, dNow - tg.r * 0.6);
+      /* 拉够时间就松手：这一轮到此为止，下一位排队的人立刻接上 */
+      if (q.t >= L.holdT) { loseTongue(q); continue; }
+      /* 已命中：把目标沿舌头方向往回拖，速度是丧尸移速的 1/5 */
+      var dx = ow.x - tg.x, dy = ow.y - tg.y;
+      var dd = Math.sqrt(dx * dx + dy * dy);
+      if (dd > 1e-4) {
+        var mv = Math.min(q.drag * dt, dd);
+        tg.x += dx / dd * mv;
+        tg.y += dy / dd * mv;
+      }
+      tg.tongueHeld = ow;
+      /* 目标被拖到很近就松开 */
+      if (dd < ow.r + tg.r + 8) q.dead = true;
+    }
+  }
+}
+/* 舌头受击：喷火/激光/磁暴都走这里，避免绕过舌头血量 */
+function damageTongue(q, dmg, attacker) {
+  if (!q || q.dead) return false;
+  q.hp -= dmg;
+  if (q.hp <= 0) breakTongue(q);
+  return true;
+}
+function tonguePointAt(q, t) {
+  return { x: q.owner.x + Math.cos(q.ang) * q.len * t,
+           y: q.owner.y + Math.sin(q.ang) * q.len * t };
+}
+/* 舌头被打断 */
+function breakTongue(q) {
+  if (!q || q.dead) return;
+  q.dead = true;
+  var ow = q.owner;
+  var tg = q.target;
+  if (ow && !ow.dead) {
+    ow.tongueFired = 0;
+    ow.tongueT = 0;
+    ow.fleeT = 3.0;            /* 断舌后反方向逃一段 */
+    ow.tongueCd = CFG.licker.cd;   /* 之后还有 4 秒不能再读条 */
+    /* 逃跑方向：掉头背离刚才想抓的那个人。以前这里只置了 fleeT 却没给方向，
+       结果它只是把状态改成「逃跑」、人却杵在原地不动 */
+    var tx, ty;
+    if (tg) { tx = ow.x - tg.x; ty = ow.y - tg.y; }
+    else { tx = -Math.cos(q.ang); ty = -Math.sin(q.ang); }
+    var fm = Math.sqrt(tx * tx + ty * ty);
+    if (fm < 1e-6) { tx = -Math.cos(q.ang); ty = -Math.sin(q.ang); fm = Math.sqrt(tx * tx + ty * ty) || 1; }
+    ow.fleeX = tx / fm; ow.fleeY = ty / fm;
+  }
+  if (tg && !tg.dead) { tg.tongueLock = null; tg.tongueHeld = null; }
+  if (SFX.ok && SFX.enabled) SFX.band({ freq: 240, peak: 0.4, decay: 0.16, q: 1.2, wet: 0.25 });
+}
+/* 断线（不是被打断）：舌头缩回去，但舔舐者不进入冷却，可以接着锁敌 */
+function loseTongue(q) {
+  if (!q || q.dead || q.retract) return;
+  q.retract = true;
+  var ow = q.owner;
+  if (ow && !ow.dead) { ow.tongueFired = 0; ow.tongueT = 0; }
+  var tg = q.target;
+  if (tg && !tg.dead) { tg.tongueLock = null; tg.tongueHeld = null; }
+}
+function aiZombie(u, dt) {
+  /* 护送模式：初始丧尸只有被同类带动、被人类惊到或被攻击后才会行动 */
+  if (W.mode === "escort" && !u.hot && !u.locked && !u.attacker) { aiZombieSleep(u, dt); return; }
+  if (u.kind === "licker") { aiLicker(u, dt); return; }
+  aiZombieChase(u, dt);
+}
+/* 舔舐者：站到"平民恐惧半径的直径"处读条两秒，读满伸舌头。
+   舌头发射后自己钉在原地不能动；舌头被打断就反方向逃一小段 */
+function aiLicker(u, dt) {
+  u.ax = 0; u.ay = 0;
+  u.vmaxCur = u.vmax;
+  var L = CFG.licker;
+  var reach = CFG.fearRCivilian * L.reachMul;
+
+  /* 冷却每帧都要走，放在逃跑分支前面，否则逃跑那三秒里它是不减的 */
+  if (u.tongueCd > 0) u.tongueCd -= dt;
+
+  /* 断舌后的逃跑窗口 */
+  if (u.fleeT > 0) {
+    u.fleeT -= dt;
+    u.state = "lickerFlee";
+    u.vmaxCur = u.vmax * L.fleeMul;
+    var fx = u.fleeX, fy = u.fleeY;
+    if (fx !== undefined) {
+      var fm = Math.sqrt(fx * fx + fy * fy);
+      if (fm > 1e-6) { u.ax = fx / fm * u.acc; u.ay = fy / fm * u.acc; }
+    }
+    return;
+  }
+
+  /* 舌头发射中：钉在原地 */
+  var tq = lickerTongueOf(u);
+  if (u.tongueFired && tq) {
+    u.state = "lickerHold";
+    return;
+  }
+  if (u.tongueFired && !tq) { u.tongueFired = 0; u.tongueT = 0; }
+
+  /* 断舌冷却：这期间该追还是追，只是不许再读条 */
+  if (u.tongueCd > 0) {
+    u.state = "lickerCd";
+    u.tongueT = 0;
+    aiZombieChase(u, dt);
+    return;
+  }
+
+  /* 找目标：优先平民（它专门抓平民）。
+     一旦咬定就死盯着不换，之前每帧重算，两个目标距离接近时来回切，
+     表现出来就是站在原地"犹豫不决" */
+  var tgt = u.tongueTarget;
+  var fresh = nearestHumanForLicker(u);
+  if (!tgt || tgt.dead || !isHuman(tgt) || isZombieSide(tgt) || tgt.penned) {
+    tgt = fresh;
+  } else if (fresh && fresh !== tgt) {
+    /* 咬定一个不换，但新来的明显更近（六成以内）就改吃它，
+       否则会出现"放着眼前的人不抓、死盯远处那个" */
+    var dCur = Math.sqrt(dist2(u.x, u.y, tgt.x, tgt.y));
+    var dNew = Math.sqrt(dist2(u.x, u.y, fresh.x, fresh.y));
+    if (dNew < dCur * 0.6) tgt = fresh;
+  }
+  u.tongueTarget = tgt;
+  if (!tgt) {
+    u.state = "chase";
+    aiZombieChase(u, dt);
+    return;
+  }
+  var d = Math.sqrt(dist2(u.x, u.y, tgt.x, tgt.y));
+
+  /* 同一个目标上同时只挂一条舌头：别人还粘着就等着。
+     等归等，读条照攒，对方一脱战（舌头没了、被打断、正在逃、或者死了），
+     这边攒满的舌头立刻就能弹出去。打不同目标的两只互不影响 */
+  var holder = tgt.lickerLock;
+  var waiting = !!(holder && holder !== u && !holder.dead && holder.tongueFired && lickerTongueOf(holder));
+
+  var blocked = segBlockedByWall(u.x, u.y, tgt.x, tgt.y);
+
+  if (d > reach * 1.08 || blocked) {
+    /* 还没到位，或者中间隔着实心墙：走过去找视线。
+       这里不清读条进度，边走边攒，一到位就能出手 */
+    u.state = "chase";
+    aiZombieChase(u, dt);
+  } else if (d < reach * 0.45) {
+    /* 贴得太近往后退半步，但读条照攒不误 */
+    u.state = "lickerBack";
+    var bx = u.x - tgt.x, by = u.y - tgt.y;
+    var bm = Math.sqrt(bx * bx + by * by) || 1;
+    u.ax = bx / bm * u.acc * 0.7;
+    u.ay = by / bm * u.acc * 0.7;
+  } else {
+    u.state = "lickerAim";
+  }
+  if (waiting) u.state = "lickerWait";   /* 只影响表现，读条照样往下走 */
+
+  /* 只要目标进了射程就毫不犹豫地攒条：被墙挡着也攒满等着，
+     视线一开通立刻弹出去。只有冷却和彻底失去目标才会清零 */
+  if (d <= reach * 1.08) {
+    u.tongueT = (u.tongueT || 0) + dt;
+    if (u.tongueT >= L.windup && !blocked && !waiting) {
+      /* 读满的这一刻重新就近挑一次，这两秒里谁近谁远可能完全变了，
+         不能拿两秒前的结论去弹舌头 */
+      var fireTgt = nearestHumanForLicker(u, reach * 1.08) || tgt;
+      u.tongueT = 0;
+      u.tongueTarget = fireTgt;
+      shootTongue(u, fireTgt);
+    }
+  }
+}
+/* 舔舐者挑目标：优先平民，没有就找最近的别的人类 */
+function nearestHumanForLicker(u, maxR) {
+  var R = maxR || 2600;
+  var best = null, bd = Infinity, i, v, dd, sc;
+  HUMGRID.query(u.x, u.y, R, _qb);
+  for (i = 0; i < _qb.length; i++) {
+    v = _qb[i];
+    if (v.dead || v.rappeli || !isHuman(v) || isZombieSide(v) || v.penned) continue;
+    dd = dist2(u.x, u.y, v.x, v.y);
+    if (dd > R * R) continue;
+    sc = (isCivilianRole(v)) ? dd * 0.45 : dd;   /* 平民优先级更高 */
+    if (sc < bd) { bd = sc; best = v; }
+  }
+  return best;
+}
+/* 线段是否穿过矩形：判断可破坏墙是否真的挡在丧尸与目标之间 */
+function segHitsRect(x0, y0, x1, y1, rx, ry, rw, rh) {
+  var dx = x1 - x0, dy = y1 - y0, t0 = 0, t1 = 1;
+  function clip(p, q) {
+    if (Math.abs(p) < 1e-9) return q >= 0;
+    var r = q / p;
+    if (p < 0) { if (r > t1) return false; if (r > t0) t0 = r; }
+    else { if (r < t0) return false; if (r < t1) t1 = r; }
+    return true;
+  }
+  if (!clip(-dx, x0 - rx)) return false;
+  if (!clip(dx, rx + rw - x0)) return false;
+  if (!clip(-dy, y0 - ry)) return false;
+  if (!clip(dy, ry + rh - y0)) return false;
+  return t0 <= t1;
+}
+/* 丧尸拆墙：只拆挡在目标与自身之间、伸手够得到的可破坏墙 */
+function zombieSmashWall(u, dt, tgt) {
+  var D = CFG.zombieWall, best = null, bd = Infinity, bi = -1;
+  var reach = (D.range || 46) + u.r;
+  for (var i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    if (!o.destructible || o.hp <= 0) continue;
+    var cx = clamp(u.x, o.x, o.x + o.w), cy = clamp(u.y, o.y, o.y + o.h);
+    var dd = dist2(u.x, u.y, cx, cy);
+    if (dd > reach * reach) continue;
+    if (!segHitsRect(u.x, u.y, tgt.x, tgt.y, o.x, o.y, o.w, o.h)) continue;
+    if (dd < bd) { bd = dd; best = o; bi = i; }
+  }
+  if (!best) return false;
+  u.wallAtkT = (u.wallAtkT || 0) - dt;
+  u.state = "smash";
+  u.ax = 0; u.ay = 0; u.vx = 0; u.vy = 0;
+  if (u.wallAtkT <= 0) {
+    u.wallAtkT = D.interval || 0.45;
+    best.hp = (best.hp || best.maxHp || 240) - (D.dmg || 7);
+    addShock(best.x + best.w / 2, best.y + best.h / 2, Math.min(best.w, 46), "rgba(220,210,190,.5)", 0.18);
+    if (SFX && SFX.hit) SFX.hit(best.x + best.w / 2, best.y + best.h / 2);
+    if (best.hp <= 0) {
+      W.obstacles.splice(bi, 1);
+      NAV.build(CFG.world, W.obstacles, 9);
+      if (typeof rebuildGrids === "function") rebuildGrids();
+      storyLine("防线结构受损", { col: "220,200,160", life: 2.5 });
+    }
+  }
+  return true;
+}
+function bossPathRadius(u) {
+  return isBossUnit(u) ? Math.max(32, u.r * 1.15) : (u.r > 11 ? u.r : 0);
+}
+function bossLineClear(u, tgt) {
+  if (!NAV.los(u.x, u.y, tgt.x, tgt.y)) return false;
+  var rad = bossPathRadius(u);
+  if (!rad) return true;
+  var dx = tgt.x - u.x, dy = tgt.y - u.y;
+  var d = Math.sqrt(dx * dx + dy * dy);
+  var steps = Math.max(2, Math.min(16, Math.ceil(d / (NAV.tile * 2))));
+  for (var i = 1; i <= steps; i++) {
+    var px = u.x + dx * i / steps, py = u.y + dy * i / steps;
+    if (!navAreaClear(Math.floor(px / NAV.tile), Math.floor(py / NAV.tile), rad)) return false;
+  }
+  return true;
+}
+function aiZombieChase(u, dt) {
+  u.ax = 0; u.ay = 0; u.vmaxCur = u.vmax; u.state = "chase";
+  /* 猛扑中：锁定方向、无法转向 */
+  if (u.pounceT > 0) {
+    u.pounceT -= dt;
+    u.state = "pounce";
+    u.ax = u.pdx * u.acc * CFG.pounce.accMul;
+    u.ay = u.pdy * u.acc * CFG.pounce.accMul;
+    u.vmaxCur = u.vmax * CFG.pounce.vmaxMul;
+    return;
+  }
+  u.pounceCd -= dt;
+  /* 这里判的是"是否还处于放弃状态"，而不是"冷却有没有走完"，
+     写成后者的话，冷却一倒数完整个检查就停摆，之后门开了、目标跑了也不会解除，
+     那就真把它永久拉黑了。同理 nearestHuman 那边也只看放弃状态 */
+  if (u.giveUpTo) {
+    if (u.giveUpT > 0) u.giveUpT -= dt;
+    /* 只有两种情况值得重新评估：地形动过了（门开了、墙拆了、沙袋垒上了），
+       或者那个目标自己跑远了。除此之外一直不理它，
+       地形和目标都没变的话，再算一百次结果也一样，纯属白烧寻路 */
+    var envChanged = (u.giveUpRev !== NAV.rev);
+    var tgtMoved = !u.giveUpTo.dead &&
+      dist2(u.giveUpTo.x, u.giveUpTo.y, u.giveUpX, u.giveUpY) > CFG.giveUp.recheck * CFG.giveUp.recheck;
+    if (envChanged || tgtMoved) {
+      u.giveUpTo = null; u.giveUpCount = 0; u.giveUpT = 0; u.giveUpHold = 0;
+    } else {
+      if (u.target === u.giveUpTo) u.target = null;   /* 当场换人 */
+      /* 兜底：万一当初判错了（其实走得通），最多两分钟后放它再试一次 */
+      u.giveUpHold += dt;
+      if (u.giveUpHold > CFG.giveUp.maxHold) { u.giveUpTo = null; u.giveUpHold = 0; }
+    }
+  }
+  u.retargetT -= dt;
+  if (u.retargetT <= 0 || !u.target || u.target.dead) {
+    u.retargetT = CFG.retarget;
+    u.target = nearestHuman(u);
+  }
+  var dirX = 0, dirY = 0, hasDir = false;
+  var tgt = u.target;
+  if (tgt && !tgt.dead && zombieSmashWall(u, dt, tgt)) return;
+  if (tgt && !tgt.dead) {
+    u.pathT -= dt;
+    var moved = u.lastTx >= 0 ? dist2(u.lastTx, u.lastTy, tgt.x, tgt.y) : Infinity;
+    if (u.pathT <= 0 || u.path === null || moved > 62500) {
+      /* 视线直达目标时不必查地图：没有遮挡的情况下，A* 求出来的本来就是这条直线。
+         这样做只是省掉了"能一眼看见却还要翻地图"的那笔开销，追谁、跟不跟队一概没动。
+         注意赋的是空数组而不是 null，让 followPath 返回 null 走直线，
+         同时不会因为 u.path === null 在下一帧又触发重算 */
+      if (isBossUnit(u) ? bossLineClear(u, tgt) : NAV.los(u.x, u.y, tgt.x, tgt.y)) {
+        u.path = [];
+        u.pathT = CFG.repath * 0.6;
+      } else {
+        repathTo(u, tgt.x, tgt.y, 1800, CFG.repath, tgt);
+      }
+      u.lastTx = tgt.x; u.lastTy = tgt.y;
+    }
+    var wp = followPath(u);
+    var dx, dy;
+    if (isBossUnit(u) && !wp && !bossLineClear(u, tgt)) {
+      /* 大体型没有可走的路：先退开，不在窄口继续顶墙 */
+      dx = u.x - tgt.x; dy = u.y - tgt.y;
+      u.state = "bossReposition";
+    } else if (wp) { dx = wp.x - u.x; dy = wp.y - u.y; }
+    else { dx = tgt.x - u.x; dy = tgt.y - u.y; }
+    var m = Math.sqrt(dx * dx + dy * dy);
+    if (m > 1e-9) { dirX = dx / m; dirY = dy / m; hasDir = true; }
+    /* 猛扑判定：很近且冷却完毕（母体永不猛扑） */
+    if (u.kind !== "mother" && u.kind !== "plagueNest" && u.kind !== "nestEgg" && u.pounceCd <= 0) {
+      var rx = tgt.x - u.x, ry = tgt.y - u.y;
+      var pr = CFG.pounce.range + tgt.r;
+      if (rx * rx + ry * ry < pr * pr) {
+        var pm = Math.sqrt(rx * rx + ry * ry);
+        if (pm > 1e-9) {
+          u.pdx = rx / pm; u.pdy = ry / pm;
+          u.pounceT = CFG.pounce.dur; u.pounceCd = CFG.pounce.cd;
+          u.state = "pounce";
+          u.ax = u.pdx * u.acc * CFG.pounce.accMul;
+          u.ay = u.pdy * u.acc * CFG.pounce.accMul;
+          u.vmaxCur = u.vmax * CFG.pounce.vmaxMul;
+          return;
+        }
+      }
+    }
+  }
+  if (!hasDir) {
+    /* 手上一个可达目标都没有（都被暂时放弃了）：改成慢慢游荡。
+       不能沿用"保持惯性满速直冲"，那样会一路蹭着墙跑，
+       看上去就是一堆丧尸堵在够不着的那堵墙外面 */
+    u.wanderT -= dt;
+    if (u.wanderT <= 0) { u.wanderT = RNG.range(1.2, 3.0); u.wanderAng = RNG.range(0, TAU); }
+    dirX = Math.cos(u.wanderAng); dirY = Math.sin(u.wanderAng);
+    hasDir = true;
+    u.vmaxCur *= CFG.zombieWanderMul;
+    u.state = "wander";
+  }
+  /* 群集同步：侦测最近 2 只同阵营单位的位移方向，与本单位的追击方向加权混合。
+     扫描本身按 CFG.herd.interval 节流（同类方向在 0.1 秒内几乎不变），
+     但加权混合仍然每帧都做，用的是上一次的采样结果 */
+  u.herdT -= dt;
+  if (u.herdT <= 0) { u.herdT = CFG.herd.interval; herdSample(u); }
+  if (u.herdHit) {
+    var w = CFG.herd.weight;
+    var mx = dirX * (1 - w) + _hx * w, my = dirY * (1 - w) + _hy * w;
+    var mm = Math.sqrt(mx * mx + my * my);
+    if (mm > 1e-9) { dirX = mx / mm; dirY = my / mm; }
+  }
+  /* 卡住检测：强制重规划并给出扰动。
+     狂热扑门时会有大量丧尸贴着同一堵墙原地打转，这里加冷静期，避免每 0.6 秒全量重算 */
+  if (u.stuckCd > 0) u.stuckCd -= dt;
+  u.stuckT += dt;
+  if (u.stuckT > CFG.stuckTime) {
+    if (u.stuckCd <= 0 && dist2(u.x, u.y, u.stuckX, u.stuckY) < CFG.stuckDist * CFG.stuckDist) {
+      u.pathT = 0;
+      u.stuckCd = CFG.stuckCooldown;
+      var esc = stuckEscapeDir(u);
+      if (esc) {
+        dirX = esc.x; dirY = esc.y;
+        u.vx += esc.x * u.vmax * 0.45;
+        u.vy += esc.y * u.vmax * 0.45;
+      } else {
+        var jx = dirX + RNG.range(-1, 1) * 0.8, jy = dirY + RNG.range(-1, 1) * 0.8;
+        var jm = Math.sqrt(jx * jx + jy * jy);
+        if (jm > 1e-9) { dirX = jx / jm; dirY = jy / jm; }
+      }
+    }
+    u.stuckT = 0; u.stuckX = u.x; u.stuckY = u.y;
+  }
+  /* 刚被冲击波掀飞：这一小会儿使不上劲，只能顺着惯性往外滑 */
+  var accMul = (u.stunT > 0) ? CFG.shield.stunAccMul : 1;
+  /* 混沌模式里挨了子弹的丧尸会拼命往回顶：加速度短暂暴涨，
+     但速度上限没放宽，所以只能更快回正、抵消不掉全部击退 */
+  if (u.recoverT > 0) accMul *= CFG.game.recoverAcc;
+  u.ax = dirX * u.acc * accMul;
+  u.ay = dirY * u.acc * accMul;
+}
+/* ---------- 掩体、护卫、机枪索敌：第二轮新增的战场行为 ---------- */
+var _mx = 0, _my = 0;
+/* 朝目标点移动：近且通视就直走，远或有遮挡才动用 A*（省下大量寻路开销） */
+function moveDirTo(u, tx, ty, dt, maxNodes) {
+  var dx = tx - u.x, dy = ty - u.y;
+  var d2t = dx * dx + dy * dy;
+  if (d2t < 25) return false;
+  if (d2t > 3600 || !NAV.los(u.x, u.y, tx, ty)) {
+    u.pathT -= dt;
+    if (u.pathT <= 0 || u.path === null) repathTo(u, tx, ty, maxNodes, CFG.repathHuman);
+    var wp = followPath(u);
+    if (wp) { dx = wp.x - u.x; dy = wp.y - u.y; }
+  }
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-9) return false;
+  _mx = dx / m; _my = dy / m;
+  return true;
+}
+/* 机枪兵索敌：找丧尸最密集的区域，而不是离自己最近的个体 */
+var _dens = new Int32Array(1024), _densStamp = new Int32Array(1024), _densVisit = 0, _denseList = [];
+function densestZombie(u) {
+  var cell = 64, R = CFG.mg.r, cols = Math.ceil((2 * R) / cell);
+  var ox = u.x - R, oy = u.y - R, r2 = R * R;
+  _densVisit++;
+  ZGRID.query(u.x, u.y, R, _qc);
+  _denseList.length = 0;
+  var i, v, dx, dy, gx, gy, gi, bestGi = -1, bestN = 0;
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    dx = v.x - u.x; dy = v.y - u.y;
+    if (dx * dx + dy * dy > r2) continue;
+    _denseList.push(v);
+    gx = Math.floor((v.x - ox) / cell); gy = Math.floor((v.y - oy) / cell);
+    if (gx < 0 || gy < 0 || gx >= cols || gy >= cols) continue;
+    gi = gy * cols + gx;
+    if (_densStamp[gi] !== _densVisit) { _densStamp[gi] = _densVisit; _dens[gi] = 0; }
+    _dens[gi]++;
+    if (_dens[gi] > bestN) { bestN = _dens[gi]; bestGi = gi; }
+  }
+  if (bestGi < 0) return null;
+  var bgx = bestGi % cols, bgy = (bestGi - bgx) / cols;
+  var best = null, bd = Infinity;
+  for (i = 0; i < _denseList.length; i++) {
+    v = _denseList[i];
+    gx = Math.floor((v.x - ox) / cell); gy = Math.floor((v.y - oy) / cell);
+    if (gx !== bgx || gy !== bgy) continue;
+    dx = v.x - u.x; dy = v.y - u.y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 < bd) { bd = d2; best = v; }
+  }
+  return best;
+}
+/* 武装单位之间的抱团：求附近武装同伴的质心，结果写入 _mateX/_mateY */
+var _mateX = 0, _mateY = 0, _mateN = 0;
+function mateCenter(u, radius) {
+  HUMGRID.query(u.x, u.y, radius, _qc);
+  var cx = 0, cy = 0, n = 0, i, v;
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v === u || v.dead || !isLineInfantry(v) || v.safe) continue;   /* 狙击手/盾兵不参与集群，无敌区里的也不算 */
+
+    cx += v.x; cy += v.y; n++;
+  }
+  _mateN = n;
+  if (n === 0) return false;
+  _mateX = cx / n; _mateY = cy / n;
+  return true;
+}
+/* 队形同步：侦测最近 2 个同兵种单位的移动方向，结果写入 _px/_py。
+   与丧尸的 herdSample 同一套思路，区别是要求两个样本的方向本身足够接近才采纳，
+   否则队形会被两个朝相反方向跑的人带乱。平民同样吃这套机制，防止各自乱跑 */
+var _px = 0, _py = 0;
+function mateDirSample(u) {
+  HUMGRID.query(u.x, u.y, CFG.squad.dirR, _qc);
+  var b1 = null, b2 = null, d1 = Infinity, d2 = Infinity;
+  var i, v, d;
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v === u || v.dead || v.kind !== u.kind || v.safe) continue;   /* 无敌区里的一致队列不参与 */
+    d = dist2(u.x, u.y, v.x, v.y);
+    if (d < d1) { d2 = d1; b2 = b1; d1 = d; b1 = v; }
+    else if (d < d2) { d2 = d; b2 = v; }
+  }
+  if (!b1) return false;
+  var minV = u.vmax * CFG.squad.dirVmin;
+  var mx = 0, my = 0, use = 0;
+  var sa = hypot(b1.vx, b1.vy);
+  if (sa >= minV) { mx += b1.vx / sa; my += b1.vy / sa; use++; }
+  if (b2) {
+    var sb = hypot(b2.vx, b2.vy);
+    /* 两个参考样本自己就南辕北辙时，只认最近的那个，免得队形被带乱 */
+    if (sb >= minV && Math.abs(angDiff(angOf(b1.vx, b1.vy), angOf(b2.vx, b2.vy))) <= CFG.squad.dirAngDeg * Math.PI / 180) {
+      mx += b2.vx / sb; my += b2.vy / sb; use++;
+    }
+  }
+  if (use === 0) return false;
+  var m = Math.sqrt(mx * mx + my * my);
+  if (m < 1e-9) return false;
+  _px = mx / m; _py = my / m;
+  return true;
+}
+/* 找出被尸潮冲散的护卫平民：武装单位会杀开通路回去汇合 */
+function guardsStrayed(u) {
+  var gs = u.guards;
+  if (!gs || !gs.length) return null;
+  var best = null, bd = 0, i;
+  var lim2 = CFG.squad.regroupDist * CFG.squad.regroupDist;
+  for (i = 0; i < gs.length; i++) {
+    var c = gs[i];
+    if (c.dead) continue;
+    var d = dist2(u.x, u.y, c.x, c.y);
+    if (d > lim2 && d > bd) { bd = d; best = c; }
+  }
+  return best;
+}
+/* 盾兵用：找最近的武装队友（不含自己），盾兵要挡在他与丧尸之间。
+   只看武装单位，盾兵的任务是给火力点当肉盾，不是给平民当保姆 */
+function nearestArmedAlly(u) {
+  var best = null, bd = Infinity;
+  HUMGRID.query(u.x, u.y, CFG.squad.screenSearch, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v === u || v.dead || !isArmed(v) || isZombieSide(v)) continue;
+    var d = dist2(u.x, u.y, v.x, v.y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  return best;
+}
+/* 狙击手用：在附近采样，找出"离最近丧尸最远、且仍能直视它"的落位点 */
+function sniperSpotSearch(u) {
+  var z = nearestZombie(u);
+  if (!z) { u.sniperX = u.x; u.sniperY = u.y; return; }
+  var base = dist(u.x, u.y, z.x, z.y);
+  var bestX = u.x, bestY = u.y, bestScore = -Infinity;
+  for (var ring = 1; ring <= 9; ring++) {
+    var rad = ring * 170;
+    for (var k = 0; k < 16; k++) {
+      var a = TAU * k / 16;
+      var px = clamp(u.x + Math.cos(a) * rad, 40, CFG.world.w - 40);
+      var py = clamp(u.y + Math.sin(a) * rad, 40, CFG.world.h - 40);
+      if (blockedForPlacement(px, py, 14)) continue;
+      if (!NAV.los(u.x, u.y, px, py)) continue;         /* 自己得走得过去 */
+      var d = dist(px, py, z.x, z.y);
+      if (d <= base + 20) continue;                     /* 必须比现在更远 */
+      if (countWallsOnSegment(px, py, z.x, z.y) > CFG.sniper.wallPierce) continue;  /* 还得能直视 */
+      /* 拉开距离的意愿很强：距离收益给高权重，绕路代价只算一点点 */
+      var score = d * 1.8 - rad * 0.18;
+      if (score > bestScore) { bestScore = score; bestX = px; bestY = py; }
+    }
+  }
+  u.sniperX = bestX; u.sniperY = bestY;
+}
+/* 找出另一个可依托的武装单位（换弹退守、平民抱团都用它） */
+var _hostX = 0, _hostY = 0;
+function nearestOtherArmed(u, skipReloading) {
+  var best = null, bd = Infinity;
+  for (var i = 0; i < W.units.length; i++) {
+    var a = W.units[i];
+    if (a === u || a.dead || !isArmed(a) || a.infectLocked) continue;
+    if (skipReloading && a.reloading) continue;
+    var d = dist2(u.x, u.y, a.x, a.y);
+    if (d < bd) { bd = d; best = a; }
+  }
+  return best;
+}
+/* 计算"站到 host 背向威胁一侧 dist 处"的坐标，结果写入 _hostX/_hostY */
+function standBehind(host, fromX, fromY, dist) {
+  var dx = host.x - fromX, dy = host.y - fromY;
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-9) { dx = 1; dy = 0; m = 1; }
+  _hostX = clamp(host.x + dx / m * dist, 20, CFG.world.w - 20);
+  _hostY = clamp(host.y + dy / m * dist, 20, CFG.world.h - 20);
+}
+/* 护卫编组：每名武装单位最多掩护 3 名平民；平民总数超过武装单位 3 倍时上调名额 */
+function rebalanceGuards() {
+  var armed = [], civs = [], i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead) continue;
+    if (isArmed(u) && !isZombieSide(u)) armed.push(u);
+    /* 所有非武装的人类都算"要跟着走的人"，以前只认 civilian，
+       医疗兵于是永远分不到护卫，撤离阶段那条"跟护卫走"的分支也就进不去，站在撤离点前面不动 */
+    else if (isHuman(u) && !isArmed(u)) civs.push(u);
+  }
+  /* 没有真武装单位时，医疗兵按临时武装单位参与编组，其余的人跟着它走 */
+  W.armedN = armed.length;
+  W.medicArmed = (armed.length === 0) ? 1 : 0;
+  if (W.medicArmed) {
+    /* 顶上来的人要从"被护送的人"名单里摘出去，否则他会把自己分配成自己的护卫 */
+    var rest = [];
+    for (i = 0; i < civs.length; i++) {
+      u = civs[i];
+      if (u.kind === "medic") {
+        if (!u.guards) u.guards = [];
+        armed.push(u);
+      } else rest.push(u);
+    }
+    civs = rest;
+  }
+  for (i = 0; i < armed.length; i++) {
+    if (!armed[i].guards) armed[i].guards = [];
+    armed[i].guards.length = 0;
+  }
+  if (armed.length === 0) {
+    /* 连医疗兵都没有，剩余人员按质心聚成一团 */
+    var cx = 0, cy = 0, cn = 0;
+    for (i = 0; i < civs.length; i++) {
+      if (civs[i].dead) continue;
+      cx += civs[i].x; cy += civs[i].y; cn++;
+    }
+    if (cn > 0) { cx /= cn; cy /= cn; }
+    W.clusterOn = cn > 1 ? 1 : 0;
+    W.clusterX = cx; W.clusterY = cy;
+    for (i = 0; i < civs.length; i++) civs[i].guardOf = null;
+    return;
+  }
+  W.clusterOn = 0;
+  var quota = CFG.squad.baseQuota;
+  if (civs.length > armed.length * 3) quota = Math.ceil(civs.length / armed.length);
+  function quotaOf(a) {
+    if (a.kind === "sniper") return CFG.sniper.guards;
+    if (a.kind === "shield") return 0;      /* 盾兵只负责挡在前面，不带平民 */
+    return quota;
+  }
+  /* 狙击手优先认领固定的两名平民（它要带这两人单独转移） */
+  var taken = {};
+  for (i = 0; i < armed.length; i++) {
+    var sn = armed[i];
+    if (sn.kind !== "sniper") continue;
+    var need = CFG.sniper.guards;
+    while (need-- > 0) {
+      var pick = null, pd = Infinity;
+      for (var ci = 0; ci < civs.length; ci++) {
+        var cc = civs[ci];
+        if (taken[cc.id]) continue;
+        var dd = dist2(sn.x, sn.y, cc.x, cc.y);
+        if (dd < pd) { pd = dd; pick = cc; }
+      }
+      if (!pick) break;
+      taken[pick.id] = 1;
+      sn.guards.push(pick);
+      pick.guardOf = sn;
+    }
+  }
+  for (i = 0; i < civs.length; i++) {
+    var c = civs[i];
+    if (taken[c.id]) continue;
+    var best = null, bd = Infinity, k;
+    for (k = 0; k < armed.length; k++) {
+      var a = armed[k];
+      if (a.guards.length >= quotaOf(a)) continue;
+      var d = dist2(c.x, c.y, a.x, a.y);
+      if (d < bd) { bd = d; best = a; }
+    }
+    if (best) { best.guards.push(c); c.guardOf = best; }
+    else c.guardOf = null;
+  }
+}
+/* 选一个"退得过去"的落点：不是单纯背对敌人直线后退，
+   而是同时看三件事，是不是更远离威胁、那里离墙有多远、走不走得过去。
+   第三项是关键：原来只朝正后方退，遇到房间就会一路顶到墙角。 */
+function pickRetreatSpot(u, baseX, baseY) {
+  var threatX = _sense.cx, threatY = _sense.cy;
+  var baseAng = Math.atan2(baseY, baseX);
+  var curD = Math.sqrt(dist2(u.x, u.y, threatX, threatY));
+  var best = null, bestScore = -1e9;
+  var i, j;
+  /* "被困"判定：贴墙，或者敌人就在近处却被墙挡住视线（说明两者不在同一片空地上，
+     中间隔着一段墙）。只有这种情况下才值得特意去找墙上的缺口钻出去，
+     开阔地里这么做会让士兵莫名其妙往墙缝里跑。 */
+  var trappedNow = (NAV.openAt(u.x, u.y) <= 2) ||
+                   (curD > 80 && curD < 900 && !NAV.los(u.x, u.y, threatX, threatY));
+  /* 9 个方向（正后方 + 左右各 ±30/±60/±90/±120）× 1 个距离。
+     原来 13×2=26 次 LOS 查询，实测会拖慢 0.4ms/步；减到 9 次后效果几乎一样 */
+  for (i = 0; i < 9; i++) {
+    var off = (i === 0) ? 0 : Math.ceil(i / 2) * (Math.PI / 6) * ((i % 2) ? 1 : -1);
+    var ang = baseAng + off;
+    for (j = 0; j < 1; j++) {
+      var dist0 = 210;
+      var px = u.x + Math.cos(ang) * dist0;
+      var py = u.y + Math.sin(ang) * dist0;
+      px = clamp(px, 40, CFG.world.w - 40);
+      py = clamp(py, 40, CFG.world.h - 40);
+      /* 走不过去的地方不用考虑（穿墙"撤退"没意义） */
+      if (!NAV.los(u.x, u.y, px, py)) continue;
+      var nd = Math.sqrt(dist2(px, py, threatX, threatY));
+      var s = 0;
+      s += (nd - curD) * 0.045;          /* 比现在更远离威胁 */
+      s += NAV.openAt(px, py) * 1.80;    /* 离墙越远越好，这是不钻角落的关键，权重必须压过"别绕路" */
+      s -= Math.abs(off) * 0.55;         /* 别为了绕路而绕路（代价调低，否则永远选正后方） */
+      s -= dist0 / 700;                  /* 能少走就少走 */
+      /* 全局威胁：候选点附近所有丧尸加权，不只看最近那一批。
+         否则平民会被下方尸群推着，直接撞进上方另一批尸群里 */
+      var danger = 0, nearestZD = 1e9;
+      ZGRID.query(px, py, 320, _qc);
+      for (var dz = 0; dz < _qc.length; dz++) {
+        var zz = _qc[dz];
+        if (zz.dead || !isZombieSide(zz)) continue;
+        var zd2 = dist2(px, py, zz.x, zz.y);
+        if (zd2 > 320 * 320) continue;
+        var zd = Math.sqrt(zd2);
+        danger += 1 - zd / 320;
+        if (zd < nearestZD) nearestZD = zd;
+      }
+      /* 再看整段撤退路线的中段：不能只看终点安全，
+         否则会选出一条"终点没事、半路穿过另一群丧尸"的路 */
+      var mpx = (u.x + px) * 0.5, mpy = (u.y + py) * 0.5;
+      ZGRID.query(mpx, mpy, 360, _qc);
+      for (var mz = 0; mz < _qc.length; mz++) {
+        var mzz = _qc[mz];
+        if (mzz.dead || !isZombieSide(mzz)) continue;
+        var mzd2 = dist2(mpx, mpy, mzz.x, mzz.y);
+        if (mzd2 > 360 * 360) continue;
+        danger += (1 - Math.sqrt(mzd2) / 360) * 0.75;
+      }
+      s -= danger * 4.6;
+      if (nearestZD < 150) s -= (150 - nearestZD) * 0.08;
+      /* 靠近出口加分：门 / 撤离点意味着"活路"，
+         被堵在房间里时，朝门口退比朝墙角退有意义得多 */
+      var ex = TERRAIN.doors;
+      if (ex && ex.length) {
+        for (var q = 0; q < ex.length; q++) {
+          if (dist2(px, py, ex[q].x, ex[q].y) < 150 * 150) { s += 2.6; break; }
+        }
+      }
+      /* 墙缺口：编辑器画出来的房子留的口子，从那儿一样能钻出去。
+         权重压得住"贴着墙"的扣分，才能在正后方是实墙时把人引向侧面的口子 */
+      if (trappedNow && gapNear(px, py, 150)) s += 3.2;
+      if (s > bestScore) { bestScore = s; best = { x: px, y: py }; }
+    }
+  }
+  /* 九个方向全被墙挡死（小隔间 / 死角）时，朝附近的缺口退，总比原地贴墙强。
+     只在这种情况下兜底，正常选点路径完全不受影响 */
+  if (best === null && trappedNow && TERRAIN.gapGrid) {
+    TERRAIN.gapGrid.query(u.x, u.y, 560, _gapOut);
+    var bg = null, bgd = 1e9;
+    for (var gi = 0; gi < _gapOut.length; gi++) {
+      var q2 = _gapOut[gi];
+      if (!NAV.los(u.x, u.y, q2.x, q2.y)) continue;
+      if (dist2(q2.x, q2.y, threatX, threatY) < curD * curD) continue;  /* 别朝威胁那侧的口子钻 */
+      var d22 = dist2(u.x, u.y, q2.x, q2.y);
+      if (d22 < bgd) { bgd = d22; bg = q2; }
+    }
+    if (bg) return { x: bg.x, y: bg.y };
+  }
+  return best;
+}
+
+/* 同伴被围：优先朝包围圈靠救援者的一侧开火，先撕开一条口子 */
+function rescueTargetFor(u) {
+  var bestAlly = null, bestAllyScore = 0, i, j;
+  var humans = W.humanList || W.units;
+  for (i = 0; i < humans.length; i++) {
+    var a = humans[i];
+    if (!a || a === u || a.dead || !isHuman(a) || isZombieSide(a)) continue;
+    var ad2 = dist2(u.x, u.y, a.x, a.y);
+    if (ad2 > 560 * 560) continue;
+    var count = 0;
+    ZGRID.query(a.x, a.y, 150, _qc);
+    for (j = 0; j < _qc.length; j++) {
+      var z = _qc[j];
+      if (z.dead || !isZombieSide(z)) continue;
+      if (dist2(a.x, a.y, z.x, z.y) <= 150 * 150) count++;
+    }
+    if (count < 3) continue;
+    var score = count - Math.sqrt(ad2) / 260;
+    if (score > bestAllyScore) { bestAllyScore = score; bestAlly = a; }
+  }
+  if (!bestAlly) return null;
+  var ax = bestAlly.x, ay = bestAlly.y;
+  var tdx = u.x - ax, tdy = u.y - ay;
+  var tm = Math.sqrt(tdx * tdx + tdy * tdy) || 1;
+  tdx /= tm; tdy /= tm;
+  var bestZ = null, bestScore = -1e9;
+  ZGRID.query(ax, ay, 190, _qc);
+  for (j = 0; j < _qc.length; j++) {
+    var zz = _qc[j];
+    if (zz.dead || !isZombieSide(zz)) continue;
+    var zd2 = dist2(ax, ay, zz.x, zz.y);
+    if (zd2 > 190 * 190) continue;
+    if (segBlockedByWall(u.x, u.y, zz.x, zz.y)) continue;
+    var proj = ((zz.x - ax) * tdx + (zz.y - ay) * tdy) / Math.max(1, Math.sqrt(zd2));
+    var scoreZ = proj * 2.2 - Math.sqrt(zd2) / 220;
+    if (scoreZ > bestScore) { bestScore = scoreZ; bestZ = zz; }
+  }
+  if (bestZ) { u.rescueAlly = bestAlly; }
+  return bestZ;
+}
+/* 阵位：全队共用一条阵线，垂直于威胁方向铺开。
+   每个人属于自己的槽位（id 做种子，稳定不跳），所以队伍会自然排成一道横线。
+   只在"交战 / 接近"阶段起作用，逃跑和回救时一律让位。 */
+function formationSpotFor(u) {
+  var tx = TERRAIN.threatX, ty = TERRAIN.threatY;
+  if (tx === 0 && ty === 0) return null;
+  var cx = 0, cy = 0, n = 0, i, v;
+  for (i = 0; i < W.units.length; i++) {
+    v = W.units[i];
+    if (v.dead || !isHuman(v) || isZombieSide(v) || !isArmed(v)) continue;
+    cx += v.x; cy += v.y; n++;
+  }
+  if (n < 3) return null;               /* 人太少谈不上阵型 */
+  cx /= n; cy /= n;
+  var px = -ty, py = tx;                /* 垂直威胁轴 */
+  var slot = laneSlotOf(u);
+  var sx = cx + px * slot * CFG.formation.spread;
+  var sy = cy + py * slot * CFG.formation.spread;
+  /* 落在墙里或图外就不给阵位，让这个人走常规逻辑 */
+  var gx = Math.floor(sx / NAV.tile), gy = Math.floor(sy / NAV.tile);
+  if (gx < 1 || gy < 1 || gx >= NAV.cols - 1 || gy >= NAV.rows - 1) return null;
+  if (NAV.b(gx, gy) || !inMain(gx, gy)) return null;
+  return { x: sx, y: sy };
+}
+
+/* 附近有没有同兵种正在换弹：有人换弹就先顶住，避免整条防线同时空仓 */
+function allyReloadingNear(u, range) {
+  var r2 = range * range;
+  HUMGRID.query(u.x, u.y, range, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var o = _qc[i];
+    if (o === u || o.dead || o.kind !== u.kind) continue;
+    if (dist2(u.x, u.y, o.x, o.y) > r2) continue;
+    if (o.reloading) return true;
+  }
+  return false;
+}
+/* AI 装填节奏：只在"弹匣型"兵种上启用，不改寻路、不改索敌。
+   · 没敌人 / 最近敌人还远（>180px）且压力低时，先把弹匣补上；
+   · 弹匣 <40% 也算"该补"；
+   · 250px 内同兵种已经在换弹，就不跟着换，留人顶线；
+   · 激光/液氮/喷火有各自节奏，保持原样。 */
+function tryProactiveReload(u, s, auraAmmo, dt) {
+  if (u.proReloadCd > 0) { u.proReloadCd -= dt; return; }
+  if (auraAmmo || u.reloading || u.mag >= u.magSize) return;
+  if (!isCombatUnit(u)) return;
+  if (u.kind === "laser" || u.kind === "cryo" || u.kind === "flame") return;
+  if (u.kind === "tesla" && u.teslaBurst > 0) return;
+  if (s.fear > 0) return;
+  var nearestD = s.nearest ? Math.sqrt(s.dNear) : Infinity;
+  var quiet = nearestD > 180;
+  var lowMag = u.mag <= 0 || u.mag / u.magSize < 0.4;
+  if (!quiet && !lowMag) return;
+  if (quiet && u.mag > 0 && u.mag / u.magSize >= 0.85 && s.nearest) return;
+  if (allyReloadingNear(u, 250)) return;
+  u.reloading = true;
+  u.reloadT = reloadTimeOf(u) * (u.gearStats ? u.gearStats.reloadMul : 1);
+  u.proReloadCd = 2.5;
+}
+function tyrantChargeDodgeTarget(u) {
+  var best = null, i;
+  for (i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (!z || z.dead || z.kind !== "tyrant" || z.tyState !== "charge") continue;
+    var dx = u.x - z.x, dy = u.y - z.y;
+    var ca = Math.cos(z.tyAng), sa = Math.sin(z.tyAng);
+    var along = dx * ca + dy * sa;
+    var dash = z.tyDashLen || (CFG.fearRCivilian * CFG.tyrant.dashLenMul);
+    if (along < -30 || along > dash + 100) continue;
+    var perp = -sa * dx + ca * dy;
+    if (Math.abs(perp) > z.r + u.r + 85) continue;
+    var d = u.r + z.r + 95;
+    var side = perp >= 0 ? 1 : -1;
+    var tries = [side, -side], k;
+    for (k = 0; k < tries.length; k++) {
+      var tx = u.x - sa * tries[k] * d, ty = u.y + ca * tries[k] * d;
+      var rp = freeSpotNear(tx, ty, 40);
+      if (rp && dist2(rp.x, rp.y, u.x, u.y) > (u.r + 24) * (u.r + 24)) {
+        best = { x: rp.x, y: rp.y, t: 0.68 };
+        break;
+      }
+    }
+    if (!best) {
+      var bx = u.x - ca * d, by = u.y - sa * d;
+      var br = freeSpotNear(bx, by, 40);
+      if (br && dist2(br.x, br.y, u.x, u.y) > (u.r + 24) * (u.r + 24)) best = { x: br.x, y: br.y, t: 0.58 };
+    }
+    if (best) break;
+  }
+  return best;
+}
+function nearestBossFor(u, maxD) {
+  var best = null, bd = maxD * maxD;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (!z || z.dead || !isBossUnit(z)) continue;
+    var d2 = dist2(u.x, u.y, z.x, z.y);
+    if (d2 < bd) { bd = d2; best = z; }
+  }
+  return best;
+}
+function aiHuman(u, dt) {
+  u.ax = 0; u.ay = 0;
+  if (u.deployHold > 0) {
+    u.deployHold -= dt;
+    u.mag = u.magSize;
+    u.reloading = false; u.reloadT = 0;
+    return;
+  }
+  /* 人类防卡墙：长时间贴着墙角不动时，沿墙法线给一次脱困速度。
+     不移动的情况不强制传送，避免破坏坚守点位与正常待命 */
+  u.hStuckT = (u.hStuckT || 0) + dt;
+  if (u.hStuckT > 1.4) {
+    var hmoved = dist2(u.x, u.y, u.hStuckX === undefined ? u.x : u.hStuckX, u.hStuckY === undefined ? u.y : u.hStuckY);
+    var hpost = u.defend ? dist2(u.x, u.y, u.defend.x, u.defend.y) : 1e9;
+    if (hmoved < 14 * 14 && hpost > 55 * 55) {
+      var hesc = stuckEscapeDir(u);
+      if (hesc) {
+        u.path = []; u.pathT = 0;
+        u.vx += hesc.x * Math.min(140, u.vmax * 0.9);
+        u.vy += hesc.y * Math.min(140, u.vmax * 0.9);
+        u.state = "unstuck";
+      }
+    }
+    u.hStuckT = 0; u.hStuckX = u.x; u.hStuckY = u.y;
+  }
+  /* 护送模式：还锁在房屋里的平民原地待命 */
+  if (u.penned) {
+    u.state = "penned";
+    var psp = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+    if (psp > 2) { u.ax = -u.vx / psp * CFG.humanBrake; u.ay = -u.vy / psp * CFG.humanBrake; }
+    return;
+  }
+  u.vmaxCur = u.infectLocked ? u.vmax * CFG.infect.lockedSlowMul : u.vmax;
+  /* 看到暴君蓄力轨迹：有侧向空间就提前躲避 */
+  if (typeof PLAYER === "undefined" || PLAYER.unit !== u) {
+    if (u.tyDodgeT > 0) {
+      u.tyDodgeT -= dt;
+      var ddx = u.tyDodgeX - u.x, ddy = u.tyDodgeY - u.y, ddm = Math.sqrt(ddx * ddx + ddy * ddy);
+      if (ddm > 12) {
+        u.state = "tyrantDodge";
+        u.faceAng = Math.atan2(ddy, ddx);
+        if (moveDirTo(u, u.tyDodgeX, u.tyDodgeY, dt, u.vmax * 1.8)) {
+          u.ax = _mx * u.acc * 1.8;
+          u.ay = _my * u.acc * 1.8;
+        } else {
+          u.ax = (ddx / ddm) * u.acc * 1.8;
+          u.ay = (ddy / ddm) * u.acc * 1.8;
+        }
+      }
+      return;
+    }
+    var dodge = tyrantChargeDodgeTarget(u);
+    if (dodge) {
+      u.tyDodgeT = dodge.t; u.tyDodgeX = dodge.x; u.tyDodgeY = dodge.y;
+      u.state = "tyrantDodge";
+      u.faceAng = Math.atan2(dodge.y - u.y, dodge.x - u.x);
+      if (moveDirTo(u, dodge.x, dodge.y, dt, u.vmax * 1.8)) {
+        u.ax = _mx * u.acc * 1.8;
+        u.ay = _my * u.acc * 1.8;
+      } else {
+        var ddx0 = dodge.x - u.x, ddy0 = dodge.y - u.y, ddm0 = Math.sqrt(ddx0 * ddx0 + ddy0 * ddy0) || 1;
+        u.ax = (ddx0 / ddm0) * u.acc * 1.8;
+        u.ay = (ddy0 / ddm0) * u.acc * 1.8;
+      }
+      return;
+    }
+  }
+  /* 处在平民英雄的光环里：弹药无限，弹匣始终是满的，也不会有换弹空档。
+     喷火兵与液氮兵在黑名单里，照常打空、照常换弹 */
+  var auraAmmo = u.aura && !auraNoAmmo(u.kind);
+  if (auraAmmo) {
+    if (u.mag < u.magSize) u.mag = u.magSize;
+    if (u.reloading) { u.reloading = false; u.reloadT = 0; }
+  }
+  if (u.nzT > 0) u.nzT -= dt;
+  if (u.fireHold > 0) u.fireHold -= dt;
+  /* armed 是"这一帧按武装单位走位"，canFight 才是"手里真有能开火的枪"。
+     平时两者一致；场上没有真武装单位时医疗兵会把 armed 顶起来，
+     但它不能因此开枪，它只有治疗弹 */
+  var armed = isCombatUnit(u) && !isCivilianRole(u);
+  /* 十秒没开枪就把弹匣补满：蹲守的单位不该一直卡在换弹状态里 */
+  if (armed && !auraAmmo && u.mag < u.magSize && W.t - u.lastFireT > CFG.noFireReload) {
+    u.mag = u.magSize;
+    if (u.reloading) { u.reloading = false; u.reloadT = 0; }
+  }
+  /* 先判定是否处于"夺回坚守点位"状态，它影响本帧的恐惧半径，必须在本帧就生效 */
+  if (u.defend) {
+    u.retaking = (dist2(u.x, u.y, u.defend.x, u.defend.y) > CFG.defendLeave * CFG.defendLeave) ? 1 : 0;
+  } else u.retaking = 0;
+  var fearR = fearRadiusOf(u) * (u.retaking ? CFG.retakeFearMul : 1);
+  /* 狙击手射程远，感知范围也放大 */
+  var senseR = (u.kind === "sniper") ? 2000 : CFG.far.r;
+  /* 非武装单位本来只感知恐惧圈那么远，但要判断"对面到底来了多少"，
+     就得看远一点，否则永远感觉不到尸潮的规模 */
+  if (!armed) senseR = Math.max(fearR, CFG.threat.range);
+  var s = senseZombies(u, senseR, fearR);
+  /* 尸潮威胁值：感知圈里丧尸越多，恐惧半径放得越大，人会越早开始退。
+     坚守阵地的单位不吃这一条，它们就是要顶着尸潮站着，人多也不许退 */
+  if (fearR > 0 && s.far > CFG.threat.base && !u.gar) {
+    var threatMul = 1 + Math.min(CFG.threat.maxMul - 1, (s.far - CFG.threat.base) * CFG.threat.per);
+    if (threatMul > 1.001) s = senseZombies(u, senseR, fearR * threatMul);
+  }
+  /* 掉队补偿：最高速是应急储备。平时按巡航速度走，
+     只有被吓到（恐惧圈里有丧尸）或者掉队太远时才放开到满速去追/去逃 */
+  if (!u.infectLocked) {
+    var strayed = false;
+    if (u.guardOf && !u.guardOf.dead) {
+      strayed = dist2(u.x, u.y, u.guardOf.x, u.guardOf.y) > CFG.strayDist * CFG.strayDist;
+    } else if (isLineInfantry(u) && u.mateOk === 0) {
+      strayed = true;
+    }
+    u.strayed = strayed ? 1 : 0;
+    if (!strayed && !(s.fear > 0)) u.vmaxCur *= CFG.cruiseMul;
+  }
+  /* 正在尸变期间（无症状期与变色期）的武装单位仍然可以开火还击 */
+  /* 盾兵也始终能开火：举着盾挡人不代表放弃还击权，破没破盾都用手枪打 */
+  var canFight = isArmed(u) || isMilitia(u);
+  if (!PLAYER || PLAYER.unit !== u) {
+    u.probeT = (u.probeT || 0) - dt;
+    if (u.probeT <= 0) {
+      u.probeT = CFG.reloadThink + (u.id % 5) * 0.03;
+      if (CFG.proactiveReload) tryProactiveReload(u, s, auraAmmo, dt);
+    }
+  }
+  if (CFG.postDuty && !u.post && u.postSearchT <= 0) { u.postSearchT = 1.0; assignPost(u); }
+  u.postSearchT -= dt;
+  if (u.reloading) {
+    u.reloadT -= dt;
+    if (u.reloadT <= 0) {
+      u.reloading = false; u.mag = u.magSize;
+      /* 1.3.3：喷火兵 / 磁爆兵换完弹，脚边退下一个大号灰色燃料罐或电池匣 */
+      if (u.kind === "flame" || u.kind === "tesla") addMagDrop(u);
+      /* 液氮兵换完弹立刻可以继续抛：0.5 秒是"弹匣里还有瓶"时的峰值间隔，
+         不是换弹后的额外冷却。不清零的话，每轮爆发前都会白等半秒 */
+      if (u.kind === "cryo") u.throwT = 0;
+      /* 换弹完成：头顶弹出一排金色小弹壳 */
+      if (W.reloadPops.length < 40) W.reloadPops.push({ u: u, t: CFG.reloadPop.life, max: CFG.reloadPop.life });
+    }
+  }
+  /* 附近没有直接威胁时，武装单位主动把远处首领设为目标，走现有交战逻辑推进 */
+  if (armed && isArmed(u) && s.fear === 0 && s.far === 0 && PLAYER.unit !== u) {
+    var hb = nearestBossFor(u, CFG.bossHunt.range || 2800);
+    if (hb) {
+      s.nearest = hb; s.dNear = dist2(u.x, u.y, hb.x, hb.y); s.far = 1;
+      u.state = "bossHunt";
+    }
+  }
+  var dirX = 0, dirY = 0, hasDir = false;
+  var nearDist = (s.nearest ? Math.sqrt(s.dNear) : Infinity);
+  /* 同伴被围时，优先把火力压到包围圈靠救援者的一侧 */
+  if (armed && u.kind !== "shield" && PLAYER.unit !== u) {
+    u.rescueT = (u.rescueT || 0) - dt;
+    if (u.rescueT <= 0) {
+      u.rescueT = 0.45;
+      u.rescueTarget = (!s.fear || nearDist > CFG.fireDistMin * 1.15) ? rescueTargetFor(u) : null;
+    }
+    if (u.rescueTarget && !u.rescueTarget.dead) {
+      var rtd = Math.sqrt(dist2(u.x, u.y, u.rescueTarget.x, u.rescueTarget.y));
+      if (rtd < senseR) {
+        s.nearest = u.rescueTarget;
+        s.dNear = rtd * rtd;
+        nearDist = rtd;
+        u.state = "rescue";
+      }
+    }
+  }
+  /* 有平民掉队时不许跑太快，否则队列会被自己人甩散（编队速度上限 = 平民速度） */
+  if (armed && u.guards && u.guards.length) {
+    for (var gi = 0; gi < u.guards.length; gi++) {
+      var gc = u.guards[gi];
+      if (!gc.dead && dist2(u.x, u.y, gc.x, gc.y) > 3600 && u.vmaxCur > CFG.unit.civilian.vmax) {
+        u.vmaxCur = CFG.unit.civilian.vmax;
+        break;
+      }
+    }
+  }
+  /* 视线是否被实体墙挡住（矮墙不挡弹，因此不算阻断） */
+  var sightBlocked = (armed && s.nearest) ? segBlockedByWall(u.x, u.y, s.nearest.x, s.nearest.y) : false;
+  var stray = armed ? guardsStrayed(u) : null;
+  /* 玩家接管的角色跳过后面全部 AI 决策；移动、碰撞、感染、被丧尸锁敌一律照旧 */
+  var playerDriven = (PLAYER.on && PLAYER.unit === u && !u.dead);
+  /* 剧情模式里的单位同理：只要有剧本指令，就走位决策全部让位给剧本。
+     注意只覆盖"去哪"，开火、受伤、感染、碰撞一概照旧。 */
+  if (u.sayT > 0) u.sayT -= dt;
+  /* 坚守阵地是"姿态"而不是"走位脚本"：设置完立刻把控制权交回常规 AI，
+     所以必须在判定 cueDriven 之前先把它消化掉，否则它会像 hold 一样把人钉死，
+     连开枪都不做了。循环是为了几条连续指令能一次吃完 */
+  var gLoop = 0;
+  while (u.cue && u.cue.act === "garrison" && gLoop++ < 8) {
+    u.gar = { x: u.cue.x !== null ? u.cue.x : u.x, y: u.cue.y !== null ? u.cue.y : u.y,
+      r: u.cue.r || CFG.garrison.r };
+    cueAdvance(u);
+  }
+  var cueDriven = (!playerDriven && !!u.cue) ? 1 : 0;
+  if (cueDriven && u.cue.t > 0) {
+    u.cue.t -= dt;
+    if (u.cue.t <= 0 && (u.cue.act === "wait" || u.cue.act === "say" || u.cue.act === "hold")) cueAdvance(u);
+  }
+
+  if (playerDriven) {
+    u.state = "player";
+    var pmx = PLAYER.moveX, pmy = PLAYER.moveY;
+    var pmm = Math.sqrt(pmx * pmx + pmy * pmy);
+    if (pmm > 0.12) { dirX = pmx / pmm; dirY = pmy / pmm; hasDir = true; }
+    /* 朝向只跟准星走，所以能倒着走、边退边打 */
+    if (PLAYER.aimLen > 0.1) {
+      u.faceAng = Math.atan2(PLAYER.aimY, PLAYER.aimX);
+      u.aimAng = u.faceAng;
+      u.aimT = 0.25;
+    }
+  } else if (u.cmdTo) {
+    /* 玩家用指挥模式点名的目标：优先级高于常规 AI 走位，但不管开火，
+       只锁"去哪"，怎么打由 AI 自己决定 */
+    u.state = "command";
+    if (moveDirTo(u, u.cmdTo.x, u.cmdTo.y, dt, 1800)) {
+      dirX = _mx; dirY = _my; hasDir = true;
+    }
+    if (dist2(u.x, u.y, u.cmdTo.x, u.cmdTo.y) < 3600) u.cmdTo = null;   /* 到附近就解除 */
+  } else if (cueDriven) {
+    /* 剧情指令接管走位：moveTo 走向目标点，follow 跟着某个单位，其余指令原地站定 */
+    u.state = "cue";
+    var cq = u.cue;
+    if (cq && cq.act === "moveTo" && cq.x !== null) {
+      if (moveDirTo(u, cq.x, cq.y, dt, cq.speed)) {
+        dirX = _mx; dirY = _my; hasDir = true;
+      }
+      if (dist2(u.x, u.y, cq.x, cq.y) <= CFG.route.arriveR * CFG.route.arriveR) cueAdvance(u);
+    } else if (cq && cq.act === "follow" && cq.unitId !== null) {
+      var fol = cueUnitById(cq.unitId);
+      if (fol && !fol.dead && dist2(u.x, u.y, fol.x, fol.y) > CFG.squad.followDist * CFG.squad.followDist) {
+        if (moveDirTo(u, fol.x, fol.y, dt, cq.speed)) { dirX = _mx; dirY = _my; hasDir = true; }
+      }
+    }
+    if (cq && cq.act === "face" && cq.ang !== null) {
+      u.faceAng = cq.ang; u.aimAng = cq.ang; u.aimT = 0.6;
+      cueAdvance(u);
+    }
+  } else if (s.fear > 0) {
+    /* 1) 贴身恐惧：撤 */
+    u.state = "flee";
+    var ax = u.x - s.cx, ay = u.y - s.cy;
+    var am = Math.sqrt(ax * ax + ay * ay);
+    var awayX, awayY;
+    if (am > 1e-9) { awayX = ax / am; awayY = ay / am; }
+    else {
+      var vm = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+      if (vm > 1e-9) { awayX = -u.vx / vm; awayY = -u.vy / vm; } else { awayX = 1; awayY = 0; }
+    }
+    /* 撤离阶段：哪怕丧尸就堵在撤离点，也要继续往撤离点压，
+       把"远离威胁"的方向掰一部分到目标点方向上，别被一个堵门的丧尸牵着往回退 */
+    if (W.mode === "escort" && W.phase === "retreat") {
+      var pobj = escortObjective();
+      if (pobj) {
+        var pdx = pobj.x - u.x, pdy = pobj.y - u.y;
+        var pdm = Math.sqrt(pdx * pdx + pdy * pdy);
+        if (pdm > 1e-6) {
+          var pw = CFG.escort.pressOn;
+          awayX = awayX * (1 - pw) + (pdx / pdm) * pw;
+          awayY = awayY * (1 - pw) + (pdy / pdm) * pw;
+          var pnm = Math.sqrt(awayX * awayX + awayY * awayY);
+          if (pnm > 1e-9) { awayX /= pnm; awayY /= pnm; }
+        }
+      }
+    }
+    /* 平民撤退时仍往自己的护卫身边靠，队形不会被尸潮一冲就散 */
+    if (!armed && u.guardOf && !u.guardOf.dead) {
+      var gx = u.guardOf.x - u.x, gy = u.guardOf.y - u.y;
+      var gm = Math.sqrt(gx * gx + gy * gy);
+      if (gm > 1e-9) {
+        var cw = CFG.squad.fleeCohesion;
+        awayX = awayX * (1 - cw) + (gx / gm) * cw;
+        awayY = awayY * (1 - cw) + (gy / gm) * cw;
+        var nm = Math.sqrt(awayX * awayX + awayY * awayY);
+        if (nm > 1e-9) { awayX /= nm; awayY /= nm; }
+      }
+    }
+    /* 找一个真正退得过去、而且不会退进墙角的落点 */
+    var rs = pickRetreatSpot(u, awayX, awayY);
+    if (rs && moveDirTo(u, rs.x, rs.y, dt, 1400)) {
+      dirX = _mx; dirY = _my; hasDir = true;
+    } else if (moveDirTo(u, clamp(u.x + awayX * 320, 24, CFG.world.w - 24), clamp(u.y + awayY * 320, 24, CFG.world.h - 24), dt, 1400)) {
+      dirX = _mx; dirY = _my; hasDir = true;
+    } else { dirX = awayX; dirY = awayY; hasDir = true; }
+  } else if (u.hero && W.heroDuo && !heroPairSettled(u)) {
+    /* 3) 两名英雄同时在场且还没凑到一起：拼命往对方那边赶。
+       一旦进入对方的恐惧半径就把控制权交还给常规逻辑，
+       之前这里只判"距离是否超过 90px"，凑近之后整个分支什么都不做，
+       两名英雄于是只会发呆和躲丧尸，成了活靶子 */
+    var pairMate = (u === W.heroDuo.a) ? W.heroDuo.b : W.heroDuo.a;
+    if (pairMate && !pairMate.dead) {
+      u.state = "heroPair";
+      if (moveDirTo(u, pairMate.x, pairMate.y, dt, 1800)) { dirX = _mx; dirY = _my; hasDir = true; }
+    }
+  } else if (armed && u.reloading && u.kind !== "medic") {
+    /* 4) 换弹：退到其他武装单位身后，寻路逻辑等同平民。
+       医疗兵不参与：它的换弹由治疗枪自己的循环管，退守只会让它离开需要治疗的人 */
+    u.state = "reload";
+    /* 不再跳过同样在换弹的同伴，之前那样写，只要身边的人都恰好在换弹，
+       这里就会返回 null，接着既没有岗位也没有坚守点位，单位就原地杵着不动 */
+    var host = nearestOtherArmed(u, false);
+    if (host) {
+      var tz = (host.nzCache && !host.nzCache.dead) ? host.nzCache : nearestZombie(u);
+      if (tz) standBehind(host, tz.x, tz.y, CFG.squad.followDist);
+      else standBehind(host, u.x - 1, u.y, CFG.squad.followDist);
+      if (moveDirTo(u, _hostX, _hostY, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+    }
+    if (!hasDir && u.defend && moveDirTo(u, u.defend.x, u.defend.y, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+    if (!hasDir && CFG.postDuty && u.post && moveDirTo(u, u.post.x, u.post.y, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+    /* 兜底：真的一个可依托的同伴都没有，也不能站着当靶子，
+       朝远离最近丧尸的方向退，同时把交战距离拉开 */
+    if (!hasDir && s.nearest) {
+      var rbx = u.x - s.nearest.x, rby = u.y - s.nearest.y;
+      var rbm = Math.sqrt(rbx * rbx + rby * rby);
+      if (rbm > 1e-9 && nearDist < CFG.fireDistMin * 1.5) {
+        if (moveDirTo(u, clamp(u.x + rbx / rbm * 240, 24, CFG.world.w - 24),
+                        clamp(u.y + rby / rbm * 240, 24, CFG.world.h - 24), dt, 1400)) {
+          dirX = _mx; dirY = _my; hasDir = true;
+        }
+      }
+    }
+  } else if (stray) {
+    /* 3) 自己的平民被尸潮隔开：杀开通路回去汇合 */
+    u.state = "regroup";
+    if (moveDirTo(u, stray.x, stray.y, dt, 1600)) { dirX = _mx; dirY = _my; hasDir = true; }
+  } else if (u.routeIdx >= 0 && W.routes && W.routes[u.routeIdx]) {
+    /* 4) 行进路线：按顺序走过每个检查点。
+       被打断（恐惧撤退、回救掉队的平民、换弹退守）之后，下一帧会自己回到当前检查点继续走，
+       和"夺回坚守点位"是同一套思路，不会把队伍丢在半路 */
+    var RT = W.routes[u.routeIdx];
+    var rwp = RT.pts[u.routePt];
+    if (!rwp) {
+      u.state = "routeDone";          /* 走完了，交回常规警戒逻辑 */
+    } else {
+      u.state = "route";
+      if (dist2(u.x, u.y, rwp.x, rwp.y) <= CFG.route.arriveR * CFG.route.arriveR) u.routePt++;
+      else if (moveDirTo(u, rwp.x, rwp.y, dt, 1800)) { dirX = _mx; dirY = _my; hasDir = true; }
+    }
+  } else if (!armed && u.guardOf && !u.guardOf.dead) {
+    /* 5) 平民：跟在武装单位身后，但不许乱窜 */
+    u.state = "escort";
+    var gd = u.guardOf;
+    var gz = (gd.nzCache && !gd.nzCache.dead) ? gd.nzCache : nearestZombie(u);
+    var fd5 = CFG.squad.followDist;
+    var dh5 = Math.sqrt(dist2(u.x, u.y, gd.x, gd.y));
+    /* 撤离阶段：平民的第一目标是撤离点，不是护卫。
+       否则一旦有人被派去后面兜两翼，平民就跟着往后跑，一个愿意跟、一个愿意走，
+       整支队伍会一起往后退，谁都不撤离。护卫距离太远时才兜底去找他 */
+    if (W.mode === "escort" && W.phase === "retreat" && dh5 <= CFG.strayDist) {
+      var gop2 = escortObjective();
+      if (gop2 && moveDirTo(u, gop2.x, gop2.y, dt, 1300)) {
+        u.state = "escortGo";
+        dirX = _mx; dirY = _my; hasDir = true;
+      }
+    }
+    if (hasDir) {
+      /* 已经朝撤离点在走了，不再按护卫站位 */
+    } else if (gz) {
+      /* 站在护卫"背对敌人"的那一侧。目标点必须锁住一段时间，
+         丧尸一换目标，方向就整个翻过来，平民于是绕着护卫转圈，
+         每转一圈都从护卫身前穿过去，看起来就是"兜圈子还绕到前面"。
+         这里按 escortRepath 节流，并且只在换了敌人时才立即重算 */
+      u.escortT = (u.escortT || 0) - dt;
+      if (u.escortT <= 0 || u.escortOk !== gz.id) {
+        u.escortT = CFG.squad.escortRepath;
+        var idChanged = (u.escortOk !== gz.id);
+        u.escortOk = gz.id;
+        standBehind(gd, gz.x, gz.y, fd5);
+        /* 新目标点跟旧目标点差不多就不换，护卫推进时的细微摆动会让平民一路改道 */
+        if (idChanged || u.escortX === undefined ||
+            dist2(_hostX, _hostY, u.escortX, u.escortY) > CFG.squad.escortHold * CFG.squad.escortHold) {
+          u.escortX = _hostX;
+          u.escortY = _hostY;
+        }
+      }
+      if (u.escortX === undefined) { u.escortX = _hostX; u.escortY = _hostY; }
+      var near5 = Math.sqrt(dist2(u.x, u.y, u.escortX, u.escortY));
+      /* 已经在护卫身边、而且没站在敌人那一侧，就安心待着，
+         护卫推进时平民跟着动，但不会被要求精确踩点，自然不会来回摆 */
+      var stayPut = false;
+      if (dh5 <= fd5 * CFG.squad.escortSlack) {
+        var zdx = gz.x - gd.x, zdy = gz.y - gd.y;
+        var zdl = Math.sqrt(zdx * zdx + zdy * zdy);
+        if (zdl > 1e-6 && dh5 > 1e-6) {
+          var cosSide = ((u.x - gd.x) * zdx + (u.y - gd.y) * zdy) / (dh5 * zdl);
+          if (cosSide <= CFG.squad.escortFrontCos) stayPut = true;
+        } else stayPut = true;
+      }
+      /* 光"站在护卫背敌面"还不够：如果最近那只丧尸已经压到很近（恐惧圈的一多半），
+         就不能原地站住，否则护卫一被推走，平民还杵在原地，看起来就是往尸堆里贴 */
+      if (stayPut && s.dNear < fearR * fearR * 0.55) stayPut = false;
+      if (!stayPut && near5 > CFG.squad.escortEps && moveDirTo(u, u.escortX, u.escortY, dt, 1200)) {
+        dirX = _mx; dirY = _my; hasDir = true;
+      }
+    } else {
+      /* 没有敌人时只做一件事：跟上护卫。
+         这里绝不能算"穿过护卫到另一侧"的站位点，那会让平民永远越过护卫再折返 */
+      if (dh5 > fd5 * CFG.squad.escortSlack) {
+        if (moveDirTo(u, gd.x, gd.y, dt, 1200)) { dirX = _mx; dirY = _my; hasDir = true; }
+      }
+    }
+  } else if (W.mode === "escort" && (isLineInfantry(u) || (u.kind === "medic" && isCombatUnit(u)))) {
+    /* 护送模式里医疗兵顶上来时，跟正规步兵一样朝阶段目标点推进。
+       不这样写它会带着全队守在原地：它是唯一"能打的"，却不肯撤 */
+    /* 5) 护送模式：武装单位朝当前阶段的目标点推进；潜入阶段会绕开休眠丧尸的扫描圈。
+       撤离阶段分一半人拉到平民队伍的两翼，全挤在前面领队，
+       队伍屁股后面就没人管，平民会被从后面咬住 */
+    u.state = "escortMove";
+    var obj = escortObjective();
+    var wing = (W.phase === "retreat" && armed) ? escortWingSpot(u) : null;
+    if (wing && moveDirTo(u, wing.x, wing.y, dt, 1600)) {
+      dirX = _mx; dirY = _my; hasDir = true;
+    } else if (obj && moveDirTo(u, obj.x, obj.y, dt, 1600)) {
+      dirX = _mx; dirY = _my; hasDir = true;
+      if (W.phase === "infiltrate") {
+        var av = stealthAvoid(u);
+        if (av) {
+          var mx3 = dirX * 0.6 + av.x * 0.8, my3 = dirY * 0.6 + av.y * 0.8;
+          var mm3 = Math.sqrt(mx3 * mx3 + my3 * my3);
+          if (mm3 > 1e-9) { dirX = mx3 / mm3; dirY = my3 / mm3; }
+        }
+      }
+    }
+  } else if (u.kind === "sniper") {
+    /* 6) 狙击手：不参与集群。防线模式下游走找安全射位；护送模式下跟随大部队 */
+    u.state = "snipe";
+    if (W.mode === "escort") {
+      var so = escortObjective();
+      if (so && moveDirTo(u, so.x, so.y, dt, 1600)) { dirX = _mx; dirY = _my; hasDir = true; }
+    } else {
+      /* 长时间捞不到开枪机会就主动出发找丧尸，否则狙击手会一直缩在自己选的射位上发呆。
+         打出一枪立刻解除，回到原来的"游走找射位"机制 */
+      u.idleFireT += dt;
+      if (u.idleFireT >= CFG.sniper.huntAfter) u.hunting = 1;
+      if (u.hunting) {
+        u.state = "hunt";
+        var hz = nearestZombie(u);
+        if (hz && moveDirTo(u, hz.x, hz.y, dt, 2400)) { dirX = _mx; dirY = _my; hasDir = true; }
+        /* 真的一个目标都摸不到（2600px 内没丧尸）就压回一秒后重试，免得每帧空转 */
+        if (!hz) u.idleFireT = CFG.sniper.huntAfter - 1.0;
+      } else {
+        u.sniperT -= dt;
+        if (u.sniperT <= 0) { u.sniperT = 1.1; sniperSpotSearch(u); }
+        if (moveDirTo(u, u.sniperX, u.sniperY, dt, 1600)) { dirX = _mx; dirY = _my; hasDir = true; }
+      }
+    }
+  } else if (u.kind === "shield") {
+    /* 7) 盾兵：没有恐惧半径，永远挡在「武装队友 ← 威胁」这条线上，但绕轴线偏开约 20°，
+       好让队友从侧后方射击聚在自己身上的尸群。距离保持在 [screenMin, screenMax] 带内：
+       贴太近会把围过来的丧尸顺带喂给队友，掉太远又失去掩护作用 */
+    u.state = "screen";
+    var ally = nearestArmedAlly(u);
+    /* 没有可护队友时不能原地等：朝最近威胁推进/保持盾线 */
+    if (!ally && s.nearest) {
+      var sdx = u.x - s.nearest.x, sdy = u.y - s.nearest.y;
+      var sdd = Math.sqrt(sdx * sdx + sdy * sdy) || 1;
+      var swant = CFG.squad.screenMax * 0.82;
+      if (sdd > swant) {
+        u.state = "screenAdvance";
+        if (moveDirTo(u, s.nearest.x, s.nearest.y, dt, 1500)) { dirX = _mx; dirY = _my; hasDir = true; }
+      } else if (sdd < CFG.squad.screenMin * 0.8) {
+        u.state = "screenBack";
+        if (moveDirTo(u, clamp(u.x + sdx / sdd * 180, 24, CFG.world.w - 24), clamp(u.y + sdy / sdd * 180, 24, CFG.world.h - 24), dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+      }
+    }
+    /* 护送模式：身边已经没有可护的队友时，朝目标点撤 */
+    if (!ally && !s.nearest && W.mode === "escort") {
+      var sobx = escortObjective();
+      if (sobx && moveDirTo(u, sobx.x, sobx.y, dt, 1500)) {
+        dirX = _mx; dirY = _my; hasDir = true;
+      }
+    }
+    var shGoalX = 0, shGoalY = 0, shHas = false;
+    if (ally) {
+      var fdx, fdy;
+      if (s.nearest) { fdx = s.nearest.x - ally.x; fdy = s.nearest.y - ally.y; }
+      else if (W.mode === "escort") {
+        var gob = escortObjective();
+        if (gob) { fdx = gob.x - ally.x; fdy = gob.y - ally.y; }
+        else { fdx = u.x - ally.x; fdy = u.y - ally.y; }
+      } else { fdx = u.x - ally.x; fdy = u.y - ally.y; }
+      var fm = Math.sqrt(fdx * fdx + fdy * fdy);
+      if (fm > 1e-6) {
+        fdx /= fm; fdy /= fm;
+        var cb2 = CFG.squad.screenBias, sb2 = Math.sqrt(Math.max(0, 1 - cb2 * cb2)) * u.side;
+        var gdx = fdx * cb2 - fdy * sb2, gdy = fdx * sb2 + fdy * cb2;
+        var stand = (CFG.squad.screenMin + CFG.squad.screenMax) * 0.5;
+        shGoalX = clamp(ally.x + gdx * stand, 24, CFG.world.w - 24);
+        shGoalY = clamp(ally.y + gdy * stand, 24, CFG.world.h - 24);
+        shHas = true;
+        /* 已经在距离带内、朝向也对，就站住不动，否则会绕着理想点来回抖 */
+        var cdx = u.x - ally.x, cdy = u.y - ally.y;
+        var cd = Math.sqrt(cdx * cdx + cdy * cdy);
+        if (cd >= CFG.squad.screenMin && cd <= CFG.squad.screenMax && cd > 1e-6 &&
+            (cdx * gdx + cdy * gdy) / cd > CFG.squad.screenFace) shHas = false;
+      }
+    }
+    if (shHas && moveDirTo(u, shGoalX, shGoalY, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+  } else if (u.defend) {
+    /* 7) 坚守点位：被冲散也要夺回来 */
+    var dd = dist2(u.x, u.y, u.defend.x, u.defend.y);
+    if (u.retaking) {
+      u.state = "retake";
+      /* 回位走直线，不再用 A* 绕路：否则西侧外沿的岗位会被寻路带进屋内 */
+      var rdx = u.defend.x - u.x, rdy = u.defend.y - u.y;
+      var rdm = Math.sqrt(rdx * rdx + rdy * rdy);
+      if (rdm > 1e-6) { dirX = rdx / rdm; dirY = rdy / rdm; hasDir = true; }
+    } else {
+      u.state = "hold";
+      /* 在点位附近维持精确点射的理想距离 */
+      if (armed && s.nearest && nearDist < CFG.fireDistMin) {
+        var bx = u.x - s.nearest.x, by = u.y - s.nearest.y;
+        var bm = Math.sqrt(bx * bx + by * by);
+        if (bm > 1e-9) {
+          var back = CFG.fireDistMin * 0.7;
+          if (moveDirTo(u, clamp(u.defend.x + bx / bm * back, 20, CFG.world.w - 20),
+                          clamp(u.defend.y + by / bm * back, 20, CFG.world.h - 20), dt, 1200)) {
+            dirX = _mx; dirY = _my; hasDir = true;
+          }
+        }
+      }
+    }
+  } else if (armed && s.far > 0 && sightBlocked) {
+    /* 6) 视线被实体墙挡住：不开火，先挪到能直视的位置 */
+    u.state = "reposition";
+    if (moveDirTo(u, s.nearest.x, s.nearest.y, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+  } else if (armed && s.far > 0) {
+    /* 7) 交战：先站到自己的阵位上（拉开横队），站好了再维持交战距离 */
+    u.state = "engage";
+    var fspot = formationSpotFor(u);
+    var onSpot = false;
+    /* 前排交火后，后排如果还够不到目标就主动前压；按自己的阵型槽位往两侧分开，
+       避免所有人沿同一条直线把前排往尸堆里推 */
+    if (armed && s.nearest && targetEffDist(u, s.nearest) > newGunRange(u) * 0.92) {
+      var slotA = laneSlotOf(u);
+      var thx2 = TERRAIN.threatX, thy2 = TERRAIN.threatY;
+      var ppx2 = -thy2, ppy2 = thx2;
+      var axA = s.nearest.x + ppx2 * slotA * CFG.formation.spread * 0.85;
+      var ayA = s.nearest.y + ppy2 * slotA * CFG.formation.spread * 0.85;
+      if (moveDirTo(u, clamp(axA, 24, CFG.world.w - 24), clamp(ayA, 24, CFG.world.h - 24), dt, 1400)) {
+        dirX = _mx; dirY = _my; hasDir = true;
+        u.state = "advance"; u.formT = 0.3; onSpot = true;
+      }
+    }
+    if (fspot) {
+      var df2 = dist2(u.x, u.y, fspot.x, fspot.y);
+      if (df2 > 70 * 70) {
+        if (moveDirTo(u, fspot.x, fspot.y, dt, 1400)) {
+          dirX = _mx; dirY = _my; hasDir = true;
+          u.formT = 0.25;
+          onSpot = true;
+        }
+      }
+    }
+    if (!onSpot && s.nearest && nearDist < CFG.fireDistMin) {
+      var rx = u.x - s.nearest.x, ry = u.y - s.nearest.y;
+      var rm = Math.sqrt(rx * rx + ry * ry);
+      if (rm > 1e-9) {
+        /* 后撤时同样要挑"退得过去的地方"，只用"远离最近丧尸"的直线，
+           丧尸推一步人退一步，在房间里就会一路退到墙角，最后被堵死。
+           这里沿用撤退用的那套评估：既要比现在更远离威胁，也要找离墙远的位置 */
+        var es = pickRetreatSpot(u, rx / rm, ry / rm);
+        if (es) {
+          /* 阵型横移：沿垂直于威胁轴的方向按槽位推开，
+             敌人只从一个方向来时全队自然拉成一道横线，火力铺得开 */
+          var ftx = TERRAIN.threatX, fty = TERRAIN.threatY;
+          if (ftx !== 0 || fty !== 0) {
+            var slot = laneSlotOf(u);
+            var ppx = -fty, ppy = ftx;
+            var offx = ppx * slot * CFG.formation.spread;
+            var offy = ppy * slot * CFG.formation.spread;
+            var nx2 = es.x + offx, ny2 = es.y + offy;
+            var tgx = Math.floor(nx2 / NAV.tile), tgy = Math.floor(ny2 / NAV.tile);
+            /* 别推到墙里或地图外，推不过去就原地用未偏移的点 */
+            if (tgx > 1 && tgy > 1 && tgx < NAV.cols - 1 && tgy < NAV.rows - 1 &&
+                !NAV.b(tgx, tgy) && inMain(tgx, tgy)) {
+              es.x = nx2; es.y = ny2;
+            }
+          }
+        }
+        if (es) u.formT = 0.25;
+        if (es && moveDirTo(u, es.x, es.y, dt, 1400)) {
+          dirX = _mx; dirY = _my; hasDir = true;
+        } else if (moveDirTo(u, clamp(u.x + rx / rm * 240, 24, CFG.world.w - 24),
+                        clamp(u.y + ry / rm * 240, 24, CFG.world.h - 24), dt, 1400)) {
+          dirX = _mx; dirY = _my; hasDir = true;
+        }
+      }
+    }
+    /* 近身红线：任何非盾兵武装都不许继续往丧尸身上贴，先退到射程内沿 */
+    if (s.nearest && nearDist < CFG.fireDistMin * 0.88 && u.kind !== "shield") {
+      var bdx = u.x - s.nearest.x, bdy = u.y - s.nearest.y;
+      var bdm = Math.sqrt(bdx * bdx + bdy * bdy);
+      if (bdm > 1e-6) {
+        var bs = pickRetreatSpot(u, bdx / bdm, bdy / bdm);
+        if (bs && moveDirTo(u, bs.x, bs.y, dt, 1500)) {
+          u.state = "backoff"; dirX = _mx; dirY = _my; hasDir = true;
+        }
+      }
+    }
+  } else if (armed) {
+    /* 8) 射程内没有敌人：主动出击找目标。
+       接近时按槽位横向错开，避免所有人走成一条直线变成串糖葫芦 */
+    var nz = nearestZombie(u);
+    u.state = nz ? "advance" : "idle";
+    if (nz) {
+      var slot2 = laneSlotOf(u);
+      var atx = nz.x, aty = nz.y;
+      var ftx2 = TERRAIN.threatX, fty2 = TERRAIN.threatY;
+      if (ftx2 !== 0 || fty2 !== 0) {
+        var sgx = atx + (-fty2) * slot2 * CFG.formation.spread * 0.55;
+        var sgy = aty + (ftx2) * slot2 * CFG.formation.spread * 0.55;
+        var qgx = Math.floor(sgx / NAV.tile), qgy = Math.floor(sgy / NAV.tile);
+        if (qgx > 1 && qgy > 1 && qgx < NAV.cols - 1 && qgy < NAV.rows - 1 &&
+            !NAV.b(qgx, qgy) && inMain(qgx, qgy)) { atx = sgx; aty = sgy; }
+      }
+      u.formT = 0.25;
+      if (moveDirTo(u, atx, aty, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+    }
+    if (!hasDir && CFG.postDuty && u.post && moveDirTo(u, u.post.x, u.post.y, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+  } else if (!armed && W.clusterOn) {
+    /* 9) 场上一个能打的都没有：剩下的人自己抱成一团。
+       每个人按编号分到一个固定角度，围着群体质心站成一圈，
+       直接用质心会让所有人挤在同一个点上互相推搡，站不开也不像"抱团" */
+    u.state = "cluster";
+    /* 撤离阶段不能被"抱团"拴在原地：那时候该做的是往撤离点走 */
+    if (W.mode === "escort" && W.phase === "retreat") {
+      var cop3 = escortObjective();
+      if (cop3 && moveDirTo(u, cop3.x, cop3.y, dt, 1300)) {
+        u.state = "escortGo"; dirX = _mx; dirY = _my; hasDir = true;
+      }
+    }
+    if (!hasDir) {
+      var cang = (u.id * 2.399963) % TAU;
+      var ctx2 = clamp(W.clusterX + Math.cos(cang) * CFG.cluster.r, 30, CFG.world.w - 30);
+      var cty2 = clamp(W.clusterY + Math.sin(cang) * CFG.cluster.r, 30, CFG.world.h - 30);
+      if (dist2(u.x, u.y, ctx2, cty2) > CFG.cluster.slack * CFG.cluster.slack) {
+        if (moveDirTo(u, ctx2, cty2, dt, CFG.cluster.speed)) { dirX = _mx; dirY = _my; hasDir = true; }
+      }
+    }
+  } else {
+    /* 10) 没有护卫的平民：开岗时回岗位，否则原地待命（由编队聚合决定站位） */
+    u.state = "guard";
+    if (CFG.postDuty && u.post && moveDirTo(u, u.post.x, u.post.y, dt, 1400)) { dirX = _mx; dirY = _my; hasDir = true; }
+  }
+  /* 优先级闸门：硬走位一旦成立，后面的抱团/同步/坚守拉力不得再改方向。
+     这是这次梳理的核心：先保证逃跑、回位、换弹、路线不被软规则稀释。 */
+  var navHard = (u.state === "player" || u.state === "command" || u.state === "cue" ||
+    u.state === "flee" || u.state === "heroPair" || u.state === "reload" ||
+    u.state === "regroup" || u.state === "route" || u.state === "escortMove" ||
+    u.state === "snipe" || u.state === "hunt" || u.state === "screen" ||
+    u.state === "retake" || (u.state === "hold" && !!u.defend) || u.state === "backoff" ||
+    u.state === "reposition");
+  u.navHard = navHard ? 1 : 0;
+  /* 武装单位之间也要抱团：离同伴群质心太远就把方向往同伴那边扳 */
+  /* 正在执行阵型展开时不抱团，抱团会把刚拉开的阵线又拽回一坨 */
+  if (u.formT > 0) u.formT -= dt;
+  if (isLineInfantry(u) && !u.defend && !navHard && !playerDriven && !cueDriven && u.formT <= 0) {
+    u.mateT -= dt;
+    if (u.mateT <= 0) {
+      u.mateT = CFG.squad.cohesionRate;
+      u.mateOk = mateCenter(u, CFG.squad.cohesionR) ? 1 : 0;
+      u.mateX = _mateX; u.mateY = _mateY;
+    }
+    if (u.mateOk) {
+      var mdx = u.mateX - u.x, mdy = u.mateY - u.y;
+      var md = Math.sqrt(mdx * mdx + mdy * mdy);
+      if (md > CFG.squad.cohesionKeep) {
+        var cw2 = clamp((md - CFG.squad.cohesionKeep) / 220, 0, CFG.squad.cohesionMax);
+        var bx2, by2;
+        if (hasDir) { bx2 = dirX; by2 = dirY; }
+        else { bx2 = mdx / md; by2 = mdy / md; }
+        var nx2 = bx2 * (1 - cw2) + (mdx / md) * cw2;
+        var ny2 = by2 * (1 - cw2) + (mdy / md) * cw2;
+        var nm2 = Math.sqrt(nx2 * nx2 + ny2 * ny2);
+        if (nm2 > 1e-9) { dirX = nx2 / nm2; dirY = ny2 / nm2; hasDir = true; }
+      }
+    }
+  }
+  /* 队形同步：和最近 2 个同兵种单位的移动方向加权混合，让整个兵种像一支队伍在走。
+     盾兵站位、狙击手找射位、换弹退守都是精确动作，不参与，否则会被大部队带离岗位 */
+  if (hasDir && !playerDriven && !cueDriven && !navHard && u.formT <= 0 && u.kind !== "shield" && u.kind !== "sniper" && !(armed && u.reloading)) {   /* 队形同步也不该稀释玩家输入或剧本走位 */
+    u.dirT -= dt;
+    if (u.dirT <= 0) {
+      u.dirT = CFG.squad.dirRate;
+      u.dirOk = mateDirSample(u) ? 1 : 0;
+    }
+    if (u.dirOk) {
+      var dw = CFG.squad.dirWeight;
+      var ax2 = dirX * (1 - dw) + _px * dw, ay2 = dirY * (1 - dw) + _py * dw;
+      var am2 = Math.sqrt(ax2 * ax2 + ay2 * ay2);
+      if (am2 > 1e-9) { dirX = ax2 / am2; dirY = ay2 / am2; }
+    }
+  }
+  /* 坚守阵地：把自己钉在一小片区域里。偏出去就按"偏了多少"往回拽，
+     越界就整根拽回来，因为恐惧半径已经被压得很小，撤退只在丧尸贴脸时才触发，
+     其余时间这股回位拉力就是"用火力反推回去"：边打边顶，把口子重新封上。
+     拉力按权重混进现有方向，所以原本的决策方向仍然生效，只是被这股力拉住 */
+  if (u.gar && !playerDriven && !cueDriven && u.state !== "flee" && u.state !== "backoff" && garrisonHasFire(u)) {
+    var ggx = u.x - u.gar.x, ggy = u.y - u.gar.y;
+    var ggd = Math.sqrt(ggx * ggx + ggy * ggy);
+    var gr2 = u.gar.r;
+    if (ggd > gr2 * CFG.garrison.pullStart && ggd > 1e-6) {
+      var gw = (ggd - gr2 * CFG.garrison.pullStart) / (gr2 * (1 - CFG.garrison.pullStart));
+      if (gw > 1) gw = 1;
+      var gbx = -ggx / ggd, gby = -ggy / ggd;
+      if (hasDir) {
+        var gdx = dirX * (1 - gw) + gbx * gw;
+        var gdy = dirY * (1 - gw) + gby * gw;
+        var gdm = Math.sqrt(gdx * gdx + gdy * gdy);
+        if (gdm > 1e-9) { dirX = gdx / gdm; dirY = gdy / gdm; }
+      } else { dirX = gbx; dirY = gby; hasDir = true; }
+    }
+  }
+  /* 没有视线就别对着墙烧/电/照：向侧前方挪一步去找视线。
+     机枪、激光、喷火、磁爆共用这一条；玩家接管与剧本单位不动 */
+  if (!playerDriven && !cueDriven && u.state !== "flee" && u.state !== "backoff" && canFight && armed && s.nearest && sightBlocked &&
+      dist2(u.x, u.y, s.nearest.x, s.nearest.y) <= senseR * senseR) {
+    var tdx = s.nearest.x - u.x, tdy = s.nearest.y - u.y;
+    var tm = Math.sqrt(tdx * tdx + tdy * tdy) || 1;
+    var nxo = -tdy / tm, nyo = tdx / tm;
+    var sgn = (u.side || 1) >= 0 ? 1 : -1;
+    dirX = nxo * sgn * 0.85 + (tdx / tm) * 0.35;
+    dirY = nyo * sgn * 0.85 + (tdy / tm) * 0.35;
+    var nm3 = Math.sqrt(dirX * dirX + dirY * dirY);
+    if (nm3 > 1e-9) { dirX /= nm3; dirY /= nm3; hasDir = true; }
+  }
+  if (hasDir) {
+    /* 想掉头/急停时允许用制动加速度：目标方向与当前速度背道而驰（夹角超过约 100°）就说明
+       这一帧是在"把自己刹住"，而不是"起步"。起步一律还是原来的加速度。 */
+    var brk = u.acc;
+    var spv = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+    if (spv > 40 && CFG.humanBrake > u.acc) {
+      var cosv = (u.vx * dirX + u.vy * dirY) / spv;
+      if (cosv < -0.17) brk = CFG.humanBrake;
+    }
+    u.ax = dirX * brk; u.ay = dirY * brk;
+  } else {
+    /* 没有位移指令时主动刹车：人类要能在移动中迅速停下 */
+    var sp2 = Math.sqrt(u.vx * u.vx + u.vy * u.vy);
+    if (sp2 > 3) { u.ax = -u.vx / sp2 * CFG.humanBrake; u.ay = -u.vy / sp2 * CFG.humanBrake; }
+  }
+  /* 后坐力抵消：连续射击被推走时，用 counterMul 倍的加速度把自己顶住，
+     而不是被枪推着满场滑。唯一的例外是正在逃跑，那时候顺着推力走才是对的 */
+  if (u.recoilT > 0) {
+    u.recoilT -= dt;
+    /* 玩家亲手接管的人不吃这一条：他的位移只该由 WASD 决定，
+       否则一边开枪一边按 W+A 会被枪口方向推着走 */
+    if (u.state !== "flee" && !playerDriven) {
+      /* 分两种情况，因为"单发"和"连射"要的东西根本不一样：
+         · 半自动（间隔 ≥ 0.4s）：一枪的推力足以把人推出去回不来，需要按单位加速度把它顶回原位；
+         · 全自动（间隔更短）：真正的压力是"每秒灌进来的总推力"，抵消只给到它的 counterMul 倍（小于 1），
+           射手勉强站得住，但每打一梭子还是会被推着走一段，绝不会顶着满额后坐力高速前压 */
+      var giv = (gunOf(u) && gunOf(u).interval) ? gunOf(u).interval : 1;
+      if (giv >= 0.4) {
+        if (s.fear === 0) {
+          u.ax += u.recoilX * u.acc * CFG.recoil.undoMul;
+          u.ay += u.recoilY * u.acc * CFG.recoil.undoMul;
+        }
+      } else if (u.recoilRate > 0) {
+        var cmul = CFG.recoil.counterMul * (s.fear === 0 ? 1 : 0.72);
+        u.ax += u.recoilX * u.recoilRate * cmul;
+        u.ay += u.recoilY * u.recoilRate * cmul;
+      }
+    }
+  }
+  /* 开火：步枪兵只在恐惧半径内才允许速射，其余一律精确点射；视线被实体墙挡住一律不开火 */
+  if (canFight && !u.reloading) {
+    u.fireNearT -= dt; u.fireFarT -= dt;
+    var fired = false;
+    if (u.cue && u.cue.act === "safe") {
+      /* 剧本指令"保险打开"：本帧完全不开火，但走位、受伤、感染照旧 */
+    } else if (u.cue && u.cue.act === "fireAt") {
+      /* 剧本指令"射击"：朝指定点或指定单位开火，不需要先发现敌人 */
+      var fxw = null, fyw = null;
+      if (u.cue.unitId !== null) {
+        var ftg = cueUnitById(u.cue.unitId);
+        if (ftg && !ftg.dead) { fxw = ftg.x; fyw = ftg.y; }
+      }
+      if (fxw === null && u.cue.x !== null) { fxw = u.cue.x; fyw = u.cue.y; }
+      if (fxw !== null && u.fireFarT <= 0 && u.mag > 0) {
+        var cpiv = CFG.far.interval, cdmg = CFG.far.dmg, cwm = 1;
+        var csp = CFG.far.spreadDeg, cch = false, csn = false, cau = false;
+        if (u.kind === "mg") { cpiv = CFG.mg.interval; cdmg = CFG.mg.dmg; cwm = CFG.mg.widthMul; csp = CFG.mg.spreadDeg; cch = true; cau = true; }
+        else if (u.kind === "sniper") { cpiv = CFG.sniper.interval; cdmg = CFG.sniper.dmg; cwm = CFG.sniper.widthMul; csp = 0; csn = true; }
+        else if (u.kind === "shield") { cpiv = CFG.pistol.interval; cdmg = CFG.pistol.dmg; csp = CFG.pistol.spreadDeg; }
+        u.fireFarT = cpiv / u.rateMul;
+        _aimTgt.x = fxw; _aimTgt.y = fyw;
+        fireBullet(u, _aimTgt, csp, cdmg, cwm, cch, csn, cau);
+        u.mag--; fired = true;
+        u.faceAng = Math.atan2(fyw - u.y, fxw - u.x);
+        u.aimAng = u.faceAng; u.aimT = 0.4;
+      }
+    } else if (isNewKind(u.kind)) {
+      /* 1.3.3 四个新兵种：走各自的分支（投掷 / 喷火 / 连锁 / 蓄力光柱），
+         不进入通用子弹路径 */
+      newKindCombat(u, dt, playerDriven);
+    } else if (playerDriven) {
+      /* 玩家：朝准星方向开火，不需要先"发现"目标，打空了也随你 */
+      /* 玩家：两种开火模式。
+         全自动，按住就连发，散布较大，适合压制；
+         半自动，点一下打一发，完全不受射速限制（点多快打多快），散布极小，适合点杀 */
+      var pSemi = (PLAYER.fireMode === 1);
+      var wantFire = pSemi ? (PLAYER.semiShot > 0) : PLAYER.firing;
+      if (wantFire && u.mag > 0 && (pSemi || u.fireFarT <= 0)) {
+        var piv = CFG.near.interval, pdmg = CFG.near.dmg, pwm = 1, psp = CFG.playerFire.autoSpread, pch = false, psn = false, pau = false;
+        if (u.kind === "mg") { piv = CFG.mg.interval; pdmg = CFG.mg.dmg; pwm = CFG.mg.widthMul; psp = CFG.mg.spreadDeg; pch = true; pau = true; }
+        else if (u.kind === "sniper") { piv = CFG.sniper.interval; pdmg = CFG.sniper.dmg; pwm = CFG.sniper.widthMul; psp = 0; psn = true; }
+        else if (u.kind === "shield") { piv = CFG.pistol.interval; pdmg = CFG.pistol.dmg; psp = CFG.playerFire.autoSpread; }
+        else if (u.kind === "militia") { var mgun = gunOf(u); piv = mgun.interval; pdmg = mgun.dmg; psp = mgun.spreadDeg || 0; }
+        if (pSemi) {
+          psp = CFG.playerFire.semiSpread;      /* 单发刻意做得极准 */
+          PLAYER.semiShot = 0;
+          u.fireFarT = 0;
+        } else {
+          u.fireFarT = piv / u.rateMul;
+        }
+        /* 枪口收束器 */
+        if (u.gearStats) psp *= u.gearStats.spreadMul;
+        _aimTgt.x = u.x + Math.cos(u.faceAng) * 900;
+        _aimTgt.y = u.y + Math.sin(u.faceAng) * 900;
+        fireBullet(u, _aimTgt, psp, pdmg, pwm, pch, psn, pau);
+        u.mag--; fired = true;
+      } else if (pSemi && PLAYER.semiShot > 0 && u.mag <= 0) {
+        PLAYER.semiShot = 0;      /* 没子弹时别把这一次点击一直挂着 */
+      }
+    } else if (u.kind === "mg") {
+      if (s.far > 0 && u.fireFarT <= 0 && u.mag > 0) {
+        var mt = densestZombie(u);
+        if (mt && !segBlockedByWall(u.x, u.y, mt.x, mt.y)) {
+          u.fireFarT = CFG.mg.interval / u.rateMul;
+          fireBullet(u, mt, CFG.mg.spreadDeg, CFG.mg.dmg, CFG.mg.widthMul, true, false, true);
+          u.mag--; fired = true;
+        }
+      }
+    } else if (u.kind === "sniper") {
+      /* 狙击手：射程无限，可以穿过一堵墙射击 */
+      if (s.far > 0 && s.nearest && u.fireFarT <= 0 && u.mag > 0) {
+        if (countWallsOnSegment(u.x, u.y, s.nearest.x, s.nearest.y) <= CFG.sniper.wallPierce) {
+          u.fireFarT = CFG.sniper.interval / u.rateMul;
+          fireBullet(u, s.nearest, 0, CFG.sniper.dmg, CFG.sniper.widthMul, false, true, false);
+          u.mag--; fired = true;
+          u.idleFireT = 0; u.hunting = 0;        /* 打出一枪，结束主动出击，回到游走找射位 */
+        }
+      }
+    } else if (u.kind === "shield") {
+      /* 盾兵：护盾破裂后用手枪还击（射程同速射、攻速同远射、伤害 1） */
+      if (s.far > 0 && s.nearest && u.fireFarT <= 0 && u.mag > 0 && !sightBlocked) {
+        u.fireFarT = CFG.pistol.interval / u.rateMul;
+        fireBullet(u, s.nearest, CFG.pistol.spreadDeg, CFG.pistol.dmg, 1, false, false, false);
+        u.mag--; fired = true;
+      }
+    } else if (u.kind === "militia") {
+      /* 民兵按自身手枪参数开火，不套用步枪速射档 */
+      var mg3 = gunOf(u);
+      if (s.far > 0 && s.nearest && u.fireFarT <= 0 && u.mag > 0 && !sightBlocked) {
+        u.fireFarT = (mg3.interval || 1) / u.rateMul;
+        fireBullet(u, s.nearest, mg3.spreadDeg || 0, mg3.dmg, mg3.widthMul || 1, false, false, false);
+        u.mag--; fired = true;
+      }
+    } else if (s.fear > 0) {
+      /* 恐惧半径内只允许速射：冷却没到就等，不退回精确点射 */
+      if (s.nearest && u.fireNearT <= 0 && u.mag > 0 && !sightBlocked) {
+        u.fireNearT = CFG.near.interval / u.rateMul;
+        fireBullet(u, s.nearest, CFG.near.spreadDeg, CFG.near.dmg, 1, false, false, true);
+        u.mag--; fired = true;
+      }
+    } else {
+      /* 步枪以及所有自定义兵种都走这条：参数来自 gunOf(u)，
+         所以自定义兵种可以有自己的伤害、射速、弹匣而不牵连别人 */
+      var gg2 = gunOf(u);
+      if (s.far > 0 && s.nearest && u.fireFarT <= 0 && u.mag > 0 && !sightBlocked) {
+        u.fireFarT = (gg2.interval || 1) / u.rateMul;
+        fireBullet(u, s.nearest, gg2.spreadDeg || 0, gg2.dmg,
+          gg2.widthMul || 1, !!gg2.chain, !!gg2.snipe, false);
+        u.mag--; fired = true;
+      }
+      if (s.far === 0) u.fireFarT = Math.min(u.fireFarT, 0);
+    }
+    if (fired) { u.fireHold = CFG.fireSlowHold; u.lastFireT = W.t; }
+    if (u.mag <= 0) {
+      u.mag = 0;
+      u.reloading = true;
+      u.reloadT = reloadTimeOf(u) * (u.gearStats ? u.gearStats.reloadMul : 1);
+    }
+  }
+  /* 武装英雄的两把附加武器：弹药各自记账，自己找目标自己开火，
+     完全不占用主武器，主武器照常由 AI 或玩家操纵 */
+  if (u.hero === "armed" && u.guns) {
+    for (var gi2 = 0; gi2 < u.guns.length; gi2++) {
+      var hg = u.guns[gi2];
+      if (u.aura && !auraNoAmmo(u.kind)) hg.mag = hg.magSize;   /* 光环无限弹药（黑名单除外） */
+      hg.t -= dt;
+      if (hg.t <= 0 && hg.mag > 0) {
+        var hz = nearestZombie(u);
+        if (hz && dist2(u.x, u.y, hz.x, hz.y) <= hg.r * hg.r &&
+            !segBlockedByWall(u.x, u.y, hz.x, hz.y)) {
+          hg.t = hg.interval / u.rateMul;
+          fireBullet(u, hz, hg.spread || 0, hg.dmg, hg.wmul || 1, hg.chain, hg.snipe, hg.chain);
+          hg.mag--;
+        }
+      }
+    }
+  }
+  /* 十秒不开火自动补满弹匣（阈值见 CFG.noFireReload） */
+  /* 射击惩罚：开火期间移速降低。英雄升格后豁免这条 */
+  if (u.fireHold > 0 && !u.hero) u.vmaxCur *= CFG.fireSlowMul;
+  /* 激光持续照射时移速再砍一半：这是"用机动换输出"的代价，玩家也吃 */
+  if (u.kind === "laser" && u.laserPhase === 1) u.vmaxCur *= 0.5;
+  /* 医疗兵：走位照抄平民那一套（跟随、逃跑、岗位），
+     走完之后再单独跑治疗枪的读条与射击 */
+  if (u.kind === "medic") stepMedicCombat(u, dt);
+}
+/* --------------------------- 医疗兵 --------------------------- */
+/* 这两个临时数组专供医疗兵用：_qb 是全场共用的，嵌套查询会互相冲掉 */
+var _medQ1 = [], _medQ2 = [];
+/* 一次能锁几个目标：默认四个，装了瞄准镜五个；医疗兵英雄再乘三倍 */
+function medicLockCap(u) {
+  var M = CFG.medic;
+  var base = (u.gearStats && u.gearStats.sight) ? M.scopeLock : M.maxLock;
+  return u.hero ? base * CFG.hero.medicLockMul : base;
+}
+/* "被感染过"：已经染上但还没走完尸变流程（含无症状期与变色期） */
+function medicIsSick(v) {
+  if (!v || v.dead) return false;
+  return !!(v.infectLocked || v.incubT > 0 || v.fadeT > 0);
+}
+/* 挑这一轮要治的人：优先射程内最近的被感染者，一个都没有才改打丧尸 */
+function pickMedicTargets(u) {
+  var M = CFG.medic, R = M.r, R2 = R * R, i, v, d;
+  var cand = [];
+  _medQ1.length = 0;
+  HUMGRID.query(u.x, u.y, R, _medQ1);
+  for (i = 0; i < _medQ1.length; i++) {
+    v = _medQ1[i];
+    if (v === u || v.dead || !isHuman(v) || isZombieSide(v) || v.penned) continue;
+    if (!medicIsSick(v)) continue;
+    d = dist2(u.x, u.y, v.x, v.y);
+    if (d > R2) continue;
+    if (segBlockedByWall(u.x, u.y, v.x, v.y)) continue;
+    cand.push({ u: v, d: d });
+  }
+  if (!cand.length) {
+    _medQ2.length = 0;
+    ZGRID.query(u.x, u.y, R, _medQ2);
+    for (i = 0; i < _medQ2.length; i++) {
+      v = _medQ2[i];
+      if (v.dead || !isZombieSide(v)) continue;
+      d = dist2(u.x, u.y, v.x, v.y);
+      if (d > R2) continue;
+      if (segBlockedByWall(u.x, u.y, v.x, v.y)) continue;
+      cand.push({ u: v, d: d });
+    }
+  }
+  if (!cand.length) return cand;
+  cand.sort(function (a, b) { return a.d - b.d; });
+  var cap = medicLockCap(u);
+  var out = [];
+  for (i = 0; i < cand.length && i < cap; i++) out.push(cand[i].u);
+  return out;
+}
+/* 治愈成功：头顶飘三个绿色的十字，一个个错开往上走 */
+function addHealPops(u) {
+  if (!W.healPops) W.healPops = [];
+  var M = CFG.medic;
+  for (var i = 0; i < M.popCount; i++) {
+    W.healPops.push({
+      x: u.x + RNG.range(-8, 8),
+      y: u.y - u.r - 4,
+      t: M.popLife,
+      delay: i * 0.13,
+      rise: M.popRise
+    });
+  }
+}
+function stepHealPops(dt) {
+  if (!W.healPops || !W.healPops.length) return;
+  for (var i = W.healPops.length - 1; i >= 0; i--) {
+    var p = W.healPops[i];
+    if (p.delay > 0) { p.delay -= dt; continue; }
+    p.t -= dt;
+    if (p.t <= 0) W.healPops.splice(i, 1);
+  }
+}
+function shootHeal(u, tgt) {
+  if (!W.heals) W.heals = [];
+  var M = CFG.medic;
+  W.heals.push({
+    owner: u, target: tgt, x: u.x, y: u.y,
+    ang: Math.atan2(tgt.y - u.y, tgt.x - u.x),
+    speed: CFG.bullet.speed / M.speedDiv,
+    len: CFG.bullet.len / M.lenDiv,
+    life: M.life, dead: false
+  });
+}
+/* 打中了：己方就把感染清掉，敌方就按普通伤害算 */
+function healHit(h, tg) {
+  if (!tg || tg.dead) return;
+  if (isHuman(tg)) {
+    if (!medicIsSick(tg)) return;
+    tg.infectLocked = false; tg.incubT = 0; tg.fadeT = 0; tg.infectT = 0;
+    if (tg.state === "infected" || tg.state === "infecting" || tg.state === "detonate") tg.state = "idle";
+    addHealPops(tg);
+    addGlow("green", tg.x, tg.y);
+    addShock(tg.x, tg.y, 26, CFG.medic.color, 0.35);
+    if (SFX.ok && SFX.enabled) SFX.band({ freq: 620, peak: 0.18, decay: 0.14, q: 2.2 });
+  } else if (isZombieSide(tg)) {
+    damageZombie(tg, CFG.medic.dmgZombie, h.owner);
+  }
+}
+function stepHeals(dt) {
+  if (!W.heals || !W.heals.length) return;
+  var M = CFG.medic;
+  for (var i = W.heals.length - 1; i >= 0; i--) {
+    var h = W.heals[i];
+    var tg = h.target;
+    if (h.dead || !tg || tg.dead) { W.heals.splice(i, 1); continue; }
+    h.life -= dt;
+    if (h.life <= 0) { W.heals.splice(i, 1); continue; }
+    /* 强追踪：每一步都把弹道拧向目标，跑不掉的 */
+    var want = Math.atan2(tg.y - h.y, tg.x - h.x);
+    var da = want - h.ang;
+    while (da > Math.PI) da -= TAU;
+    while (da < -Math.PI) da += TAU;
+    h.ang += da * M.turn;
+    var hpx = h.x, hpy = h.y;
+    h.x += Math.cos(h.ang) * h.speed * dt;
+    h.y += Math.sin(h.ang) * h.speed * dt;
+    /* 一帧能飞三十多像素，比人还大，只用点对点判命中会直接穿过去。
+       按这一帧走过的线段去和圆求交 */
+    var rr = tg.r + 7;
+    if (segCircleT(hpx, hpy, h.x, h.y, tg.x, tg.y, rr) >= 0 ||
+        dist2(h.x, h.y, tg.x, tg.y) <= rr * rr) {
+      healHit(h, tg);
+      W.heals.splice(i, 1);
+    }
+  }
+}
+/* 把锁定名单打出去。丧尸凑不够数量时把满额的发数摊到现有的目标上：
+   只有一只能锁就四发全砸它，两只就来回分 */
+function fireMedicList(u) {
+  var M = CFG.medic;
+  var cap = medicLockCap(u);
+  var live = [], i, t, n = 0;
+  for (i = 0; i < (u.lockList || []).length; i++) {
+    t = u.lockList[i];
+    if (t && !t.dead) live.push(t);
+  }
+  if (live.length) {
+    var spreadZ = isZombieSide(live[0]);
+    var shots = Math.min(spreadZ ? cap : live.length, u.mag);
+    for (i = 0; i < shots; i++) {
+      shootHeal(u, spreadZ ? live[i % live.length] : live[i]);
+      u.mag--; n++;
+    }
+  }
+  u.lockList = [];
+  u.lockT = 0;
+  if (n > 0) {
+    u.medCd = M.cd;
+    u.lastFireT = W.t;
+    u.fireHold = CFG.fireSlowHold;
+    u.aimT = 0.4;
+  }
+  if (u.mag <= 0) { u.reloading = true; u.reloadT = M.reload; }
+  return n;
+}
+/* 玩家手动操控时的锁定：优先级从"离自己最近"改成"离准星最近" */
+function pickMedicNearCursor(u, room) {
+  var M = CFG.medic, R = M.r, R2 = R * R;
+  var cx = s2wx(UI.pointer.x), cy = s2wy(UI.pointer.y);
+  /* 准星辅助瞄准圈：半径取武装兵种的恐惧半径（130）。
+     一秒读条本来就很赶，不该逼玩家把准星精确压到几像素大的目标身上 */
+  var pickR = Math.min(R, CFG.fearR), pickR2 = pickR * pickR;
+  var out = [], i, v, d;
+  _medQ1.length = 0;
+  HUMGRID.query(cx, cy, pickR, _medQ1);
+  for (i = 0; i < _medQ1.length; i++) {
+    v = _medQ1[i];
+    if (v === u || v.dead || !isHuman(v) || isZombieSide(v) || v.penned) continue;
+    if (!medicIsSick(v)) continue;
+    if (dist2(u.x, u.y, v.x, v.y) > R2) continue;
+    d = dist2(cx, cy, v.x, v.y);
+    if (d > pickR2) continue;
+    out.push({ u: v, d: d });
+  }
+  if (!out.length) {
+    _medQ2.length = 0;
+    ZGRID.query(cx, cy, pickR, _medQ2);
+    for (i = 0; i < _medQ2.length; i++) {
+      v = _medQ2[i];
+      if (v.dead || !isZombieSide(v)) continue;
+      if (dist2(u.x, u.y, v.x, v.y) > R2) continue;
+      d = dist2(cx, cy, v.x, v.y);
+      if (d > pickR2) continue;
+      out.push({ u: v, d: d });
+    }
+  }
+  out.sort(function (a, b) { return a.d - b.d; });
+  var res = [];
+  for (i = 0; i < out.length && i < room; i++) res.push(out[i].u);
+  return res;
+}
+/* 手动操控：长按左键一个个往里加，每加一个"滴"一声；松手立刻全打出去 */
+function stepMedicManual(u, dt) {
+  var M = CFG.medic;
+  if (u.medCd > 0) u.medCd -= dt;
+  if (u.reloading) {
+    u.reloadT -= dt;
+    if (u.reloadT <= 0) { u.reloading = false; u.mag = u.magSize; }
+  }
+  if (!u.lockList) u.lockList = [];
+  if (!PLAYER.firing) {
+    if (u.lockList.length) fireMedicList(u);
+    u.lockT = 0;
+    return;
+  }
+  if (u.mag <= 0 || u.reloading) return;
+  var cap = medicLockCap(u);
+  if (u.lockList.length >= cap) return;
+  if (u.medScanT > 0) { u.medScanT -= dt; return; }
+  u.medScanT = 0.14;
+  var add = pickMedicNearCursor(u, cap - u.lockList.length), i;
+  for (i = 0; i < add.length; i++) {
+    if (u.lockList.indexOf(add[i]) >= 0) continue;
+    u.lockList.push(add[i]);
+    if (SFX.ok && SFX.enabled && SFX.gate("medBlip", 30)) SFX.blip({ freq: 2100, peak: 0.07 });
+  }
+}
+/* 医疗兵的治疗枪：读条一秒 → 把锁定的目标一人一发打出去 */
+function stepMedicCombat(u, dt) {
+  var M = CFG.medic;
+  /* 玩家接管时走手动锁定那一套：长按加点、松手齐射 */
+  if (PLAYER.unit === u && PLAYER.on) { stepMedicManual(u, dt); return; }
+  if (u.medCd > 0) u.medCd -= dt;
+  if (u.reloading) {
+    u.reloadT -= dt;
+    if (u.reloadT <= 0) { u.reloading = false; u.mag = u.magSize; }
+  }
+  var cap = medicLockCap(u);
+  if (u.lockT > 0) {
+    u.lockT += dt;
+    /* 读条期间每 0.2 秒重扫一次，中途走进来的人也能被补进名单 */
+    u.lockScanT -= dt;
+    if (u.lockScanT <= 0) {
+      u.lockScanT = 0.2;
+      var fresh = pickMedicTargets(u);
+      if (fresh.length) u.lockList = fresh;
+    }
+    var list = u.lockList || [], i, t, n = 0;
+    /* 读满一秒就出手，不管凑没凑够 */
+    if (u.lockT >= M.windup) fireMedicList(u);
+    return;
+  }
+  if (u.medCd > 0 || u.reloading || u.mag <= 0) return;
+  var list2 = pickMedicTargets(u);
+  if (!list2.length) return;
+  u.lockList = list2;
+  u.lockScanT = 0.2;
+  u.lockT = 0.0001;
+}
+function nearestZombie(u) {
+  if (u.nzT > 0 && u.nzCache && !u.nzCache.dead) return u.nzCache;
+  u.nzT = CFG.nearZombieCache;
+  ZGRID.query(u.x, u.y, 2600, _qb);
+  var best = null, bd = Infinity;
+  for (var i = 0; i < _qb.length; i++) {
+    var v = _qb[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (v.armT > 0) continue;      /* 蓄爆中的自爆丧尸不值得再打 */
+    var d = dist2(u.x, u.y, v.x, v.y);
+    if (d < bd) { bd = d; best = v; }
+  }
+  u.nzCache = best;
+  return best;
+}
+
+/* ============================================================================
+   1.3.3 新兵种：液氮兵 / 喷火兵 / 磁爆兵 / 激光兵
+   四个兵种都走各自的分支与特效，不占用通用子弹通道：
+   - 液氮兵：把罐子按伪 3D 抛物线扔出去，落地展开寒冷领域
+   - 喷火兵：扇形火束，落点铺火墙，命中挂点燃
+   - 磁爆兵：连锁闪电，按"连锁指标"结算命中目标数
+   - 激光兵：蓄力两秒，然后横扫一条光柱
+   数值全部在 CFG 的 cryo / flame / tesla / laser 四块里；
+   规则说明见根目录《创作准则》§6。
+   ============================================================================ */
+function isNewKind(k) { return k === "cryo" || k === "flame" || k === "tesla" || k === "laser"; }
+/* 平民英雄的光环是"无限弹药"：喷火兵与液氮兵不吃这一套，
+   否则一个 100 发弹匣的喷火器或三瓶液氮永远打不完，直接把平衡打穿 */
+function auraNoAmmo(k) { return k === "flame" || k === "cryo"; }
+function newGunRange(u) {
+  if (u.kind === "flame") return CFG.flame.range;
+  if (u.kind === "laser") return CFG.laser.range;
+  var c = CFG.unit[u.kind];
+  return (c && c.gun && c.gun.r) || CFG.far.r;
+}
+function nearestEnemyInRange(u, r) {
+  var best = null, bd = r * r;
+  ZGRID.query(u.x, u.y, r, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    var d2 = dist2(u.x, u.y, v.x, v.y);
+    if (d2 < bd) { bd = d2; best = v; }
+  }
+  return best;
+}
+/* 玩家手动时的落点：鼠标在画布上就取鼠标下的世界坐标，触屏就取右摇杆方向 */
+function playerGroundAim(u) {
+  /* 手机右摇杆优先：触摸事件也会写 UI.pointer，不能让它把摇杆方向盖掉 */
+  if (PLAYER.stickR && PLAYER.stickR.mag > 0.12) {
+    return { x: u.x + PLAYER.aimX * 620, y: u.y + PLAYER.aimY * 620 };
+  }
+  if (UI.pointer && UI.pointer.in && UI.pointer.x > 0 && UI.pointer.y > 0) {
+    return { x: s2wx(UI.pointer.x), y: s2wy(UI.pointer.y) };
+  }
+  var maxD = (u.kind === "sniper") ? 2000 : (newGunRange(u) || 620);
+  var len = Math.max(0.12, Math.min(1, PLAYER.aimLen || 1));
+  return { x: u.x + PLAYER.aimX * maxD * len, y: u.y + PLAYER.aimY * maxD * len };
+}
+
+/* ---------------------------- 液氮兵 ---------------------------- */
+function cryoBottleCount(u) {
+  var add = 0;
+  if (u.gearStats) {
+    if (u.gearStats.magAdd >= 45) add = 2;
+    else if (u.gearStats.magAdd > 0) add = 1;
+  }
+  return 1 + add;
+}
+/* 伪 3D 投掷：水平方向匀减速其实没必要，真正的"变速"交给竖直方向的重力，
+   水平速度保持不变、垂直方向先快后慢再加快，看起来就是标准抛物线 */
+function cryoThrowAt(u, tx, ty) {
+  var C = CFG.cryo;
+  if (!W.cryoPots) W.cryoPots = [];
+  if (W.cryoPots.length > 80) return;
+  var dx = tx - u.x, dy = ty - u.y;
+  var d = Math.sqrt(dx * dx + dy * dy);
+  if (d < 12) { dx = Math.cos(u.faceAng) * 12; dy = Math.sin(u.faceAng) * 12; d = 12; }
+  var T = clamp(0.35 + d / 2400, 0.35, 1.15);
+  var g = C.arcG;
+  var z0 = u.r * 0.9;
+  W.cryoPots.push({
+    x: u.x + dx / d * (u.r + 4), y: u.y + dy / d * (u.r + 4), z: z0,
+    vx: dx / T, vy: dy / T,
+    vz: (g * T * T / 2 - z0) / T,      /* 飞满 T 秒正好落到 z = 0 */
+    spin: RNG.range(0, TAU), spinV: RNG.range(-11, 11),
+    owner: u, hero: u.hero ? 1 : 0, t: 0, T: T
+  });
+  u.faceAng = Math.atan2(dy, dx);
+  u.aimAng = u.faceAng; u.aimT = 0.3;
+  if (SFX && SFX.shot) SFX.shot("cryo", u.x, u.y, 1.0 + Math.random() * 0.12);
+}
+function cryoPotBlocked(p) {
+  for (var i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    if (p.x + 6 < o.x || p.x - 6 > o.x + o.w || p.y + 6 < o.y || p.y - 6 > o.y + o.h) continue;
+    return true;
+  }
+  return false;
+}
+function cryoPotShatter(p) {
+  var C = CFG.cryo;
+  var R = C.radius * (p.hero ? C.heroRMul : 1);
+  if (!W.cryoFields) W.cryoFields = [];
+  W.cryoFields.push({ x: p.x, y: p.y, r: R, t: 0, life: C.fieldLife,
+    owner: p.owner, hero: p.hero, seed: RNG.range(0, TAU) });
+  addShock(p.x, p.y, R, "rgba(150,225,255,1)", 0.55);
+  if (SFX && SFX.shot) SFX.shot("cryo", p.x, p.y, 0.66);   /* 罐体碎裂：同一音色压低 */
+}
+function stepCryo(dt) {
+  var C = CFG.cryo, i, k, v, p, f;
+  if (!W.cryoPots) W.cryoPots = [];
+  if (!W.cryoFields) W.cryoFields = [];
+  /* 罐子在飞：重力、自转、撞墙 / 撞人 / 落地 */
+  for (i = W.cryoPots.length - 1; i >= 0; i--) {
+    p = W.cryoPots[i];
+    p.t += dt; p.spin += p.spinV * dt;
+    p.vz -= C.arcG * dt;
+    p.x += p.vx * dt; p.y += p.vy * dt; p.z += p.vz * dt;
+    var bang = false;
+    if (p.z <= 0) { p.z = 0; bang = true; }
+    if (!bang && p.z < 70) {
+      ZGRID.query(p.x, p.y, 42, _qc);
+      for (k = 0; k < _qc.length; k++) {
+        v = _qc[k];
+        if (v.dead || !isZombieSide(v)) continue;
+        var rr = v.r + C.potR;
+        if (dist2(p.x, p.y, v.x, v.y) < rr * rr) { bang = true; break; }
+      }
+    }
+    if (!bang && p.z < 160 && cryoPotBlocked(p)) bang = true;
+    if (!bang && p.t > p.T + 1.5) bang = true;
+    if (bang) { cryoPotShatter(p); W.cryoPots.splice(i, 1); }
+  }
+  /* 寒冷圈：进圈累积受冻时间，3 秒冻实；每 1.5 秒掉 1 点血 */
+  for (i = 0; i < W.units.length; i++) W.units[i].inCryo = 0;
+  for (i = W.cryoFields.length - 1; i >= 0; i--) {
+    f = W.cryoFields[i];
+    f.t += dt;
+    if (f.t >= f.life) { W.cryoFields.splice(i, 1); continue; }
+    var inside = [];
+    ZGRID.query(f.x, f.y, f.r + 300, _qc);
+    for (k = 0; k < _qc.length; k++) {
+      v = _qc[k];
+      if (v.dead || !isZombieSide(v)) continue;
+      if (targetEffDist({ x: f.x, y: f.y, r: 0 }, v) > f.r) continue;
+      inside.push(v);
+    }
+    for (k = 0; k < inside.length; k++) {
+      v = inside[k];
+      v.inCryo = 1;
+      v.chillT = controlDurOf(v, C.afterT);
+      v.cryoT = Math.min(C.freezeAt, (v.cryoT || 0) + dt * controlMulOf(v));
+      if (v.cryoT >= C.freezeAt) v.frozen = 1;
+      v.cryoDmgT = (v.cryoDmgT || 0) + dt;
+      if (v.cryoDmgT >= C.dmgEvery) {
+        v.cryoDmgT -= C.dmgEvery;
+        damageZombie(v, C.dmg, (f.owner && !f.owner.dead) ? f.owner : null);
+      }
+    }
+  }
+  /* 离场之后回暖：按 3 秒基准把减速还回去（满冻 → 常速正好 3 秒），冰壳同步淡出 */
+  for (i = 0; i < W.units.length; i++) {
+    v = W.units[i];
+    if (!v.inCryo && v.chillT > 0) {
+      v.chillT -= dt;
+      v.cryoT = Math.max(0, (v.cryoT || 0) - dt * (C.freezeAt / C.warmSec));
+      if (v.chillT <= 0) { v.chillT = 0; v.cryoT = 0; }
+    }
+    if (!v.inCryo && (v.cryoT || 0) <= 0) v.frozen = 0;
+    /* 6 秒才压到底，而且底是 95% 减速（速度只留 5%），不是完全冻死 */
+    var slow = 1 - Math.min(1, C.slowStart + (1 - C.slowStart) * Math.min(1, (v.cryoT || 0) / C.freezeAt));
+    if (slow < C.slowFloor) slow = C.slowFloor;
+    v.cryoSlow = (v.inCryo || (v.chillT || 0) > 0) ? slow : 1;
+    if (v.cryoSlow > 0.999) v.cryoSlow = 1;
+  }
+}
+
+/* ---------------------------- 喷火兵 ---------------------------- */
+/* 扫射：瞄准点在整片尸潮的质心上，但转向有阻尼，所以是"慢慢扫过去"，
+   再叠一点正弦摆动，整道火墙才会铺满战线而不是在一点上烧穿 */
+function flameSweepAim(u, dt) {
+  var F = CFG.flame, R2 = F.range * F.range, i, v;
+  var sx = 0, sy = 0, n = 0;
+  ZGRID.query(u.x, u.y, F.range, _qc);
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (dist2(u.x, u.y, v.x, v.y) > R2) continue;
+    /* 墙后的不算：否则质心会落在墙后，火就一直往墙上喷 */
+    if (segBlockedByWall(u.x, u.y, v.x, v.y)) continue;
+    sx += v.x; sy += v.y; n++;
+  }
+  var want = u.faceAng;
+  if (n > 0) {
+    want = Math.atan2(sy / n - u.y, sx / n - u.x) + Math.sin(W.t * 0.9 + u.id * 0.7) * F.sweepWobble;
+  }
+  var d = angDiff(u.flameAng, want);
+  var step = F.sweepRate * dt;
+  if (Math.abs(d) <= step) u.flameAng = want;
+  else u.flameAng += (d > 0 ? 1 : -1) * step;
+  u.faceAng = u.flameAng; u.aimAng = u.flameAng; u.aimT = 0.2;
+}
+/* 沿一条射线找最近的墙：用矩形求交算精确落点，不是每 14px 采样一次。
+   光柱要"贴着墙面被截断"，采样会把终点算进墙里半格，看起来就是穿进去了 */
+function rayWallDistExact(x, y, ang, maxLen) {
+  var dx = Math.cos(ang), dy = Math.sin(ang);
+  var best = maxLen, i, o;
+  for (i = 0; i < W.obstacles.length; i++) {
+    o = W.obstacles[i];
+    var tmin = 0, tmax = best, t1, t2, tt;
+    if (Math.abs(dx) < 1e-9) {
+      if (x < o.x || x > o.x + o.w) continue;
+    } else {
+      t1 = (o.x - x) / dx; t2 = (o.x + o.w - x) / dx;
+      if (t1 > t2) { tt = t1; t1 = t2; t2 = tt; }
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (Math.abs(dy) < 1e-9) {
+      if (y < o.y || y > o.y + o.h) continue;
+    } else {
+      t1 = (o.y - y) / dy; t2 = (o.y + o.h - y) / dy;
+      if (t1 > t2) { tt = t1; t1 = t2; t2 = tt; }
+      tmin = Math.max(tmin, t1); tmax = Math.min(tmax, t2);
+    }
+    if (tmax >= tmin && tmin > 0 && tmin < best) best = tmin;
+  }
+  return best;
+}
+function rayWallDist(x, y, ang, maxLen) { return rayWallDistExact(x, y, ang, maxLen); }
+function spawnFirePatch(x, y, owner, hero, scale) {
+  if (!W.firePatches) W.firePatches = [];
+  if (W.firePatches.length > 420) W.firePatches.shift();
+  var s = scale || 1;
+  W.firePatches.push({
+    x: x + RNG.range(-7, 7) * s,
+    y: y + RNG.range(-7, 7) * s,
+    r: RNG.range(12, 22) * s,
+    t: 0, life: RNG.range(2.8, 4.2),
+    tickT: RNG.range(0, CFG.flame.wallTick),
+    owner: owner, hero: hero ? 1 : 0,
+    seed: RNG.range(0, TAU), hue: RNG.range(8, 34)
+  });
+}
+/* 火不是凭空烧起来的：先让火焰粒子飞过去，落地之后才铺火。
+   按"落点距离 ÷ 粒子平均速度"排一个延迟队列，火墙就不会抢在火前面出现 */
+function queueFirePatch(x, y, dist, owner, hero, scale) {
+  if (!W.firePending) W.firePending = [];
+  if (W.firePending.length > 260) W.firePending.shift();
+  W.firePending.push({ x: x, y: y, t: clamp(dist / 1600, 0.04, 0.8),
+    owner: owner, hero: hero ? 1 : 0, scale: scale || 1 });
+}
+function stepFirePending(dt) {
+  if (!W.firePending) W.firePending = [];
+  for (var i = W.firePending.length - 1; i >= 0; i--) {
+    var p = W.firePending[i];
+    p.t -= dt;
+    if (p.t <= 0) {
+      spawnFirePatch(p.x, p.y, p.owner, !!p.hero, p.scale);
+      W.firePending.splice(i, 1);
+    }
+  }
+}
+function stepFirePatches(dt) {
+  var F = CFG.flame, i, k, v;
+  if (!W.firePatches) W.firePatches = [];
+  for (i = W.firePatches.length - 1; i >= 0; i--) {
+    var p = W.firePatches[i];
+    p.t += dt;
+    if (p.t >= p.life) { W.firePatches.splice(i, 1); continue; }
+    p.tickT -= dt;
+    if (p.tickT > 0) continue;
+    p.tickT += F.wallTick;
+    var list = [];
+    ZGRID.query(p.x, p.y, p.r + 30, _qc);
+    for (k = 0; k < _qc.length; k++) {
+      v = _qc[k];
+      if (v.dead || !isZombieSide(v)) continue;
+      var rr = p.r + v.r;
+      if (dist2(p.x, p.y, v.x, v.y) > rr * rr) continue;
+      list.push(v);
+    }
+    for (k = 0; k < list.length; k++) {
+      v = list[k];
+      /* 每一片火独立结算：同一处叠了几片，就吃几份伤害 */
+      damageZombie(v, F.wallDmg, (p.owner && !p.owner.dead) ? p.owner : null);
+      v.burnT = Math.max(v.burnT || 0, F.igniteT);
+      v.burnSrc = p.owner;
+    }
+  }
+}
+/* 点燃：每秒 1 点，持续 4 秒；伤害来源记在 burnSrc 上，淘汰播报才不会丢归属 */
+function stepBurning(dt) {
+  var F = CFG.flame;
+  for (var i = 0; i < W.units.length; i++) {
+    var v = W.units[i];
+    if (v.flameHitT > 0) v.flameHitT -= dt;
+    if (v.zapT > 0) v.zapT -= dt;
+    if (!(v.burnT > 0)) continue;
+    v.burnT -= dt;
+    v.burnTickT -= dt;
+    if (v.burnTickT <= 0) {
+      v.burnTickT = F.igniteEvery;
+      damageZombie(v, F.igniteDmg, (v.burnSrc && !v.burnSrc.dead) ? v.burnSrc : null);
+    }
+    if (v.burnT <= 0) { v.burnT = 0; v.burnSrc = null; }
+  }
+}
+/* 连续攻击的形态判定：敌人少/散 → 直射；多/密 → 横扫 */
+function enemySpreadInfo(u, r) {
+  var list = [], i, v, sx = 0, sy = 0;
+  ZGRID.query(u.x, u.y, r + 300, _qc);
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (targetEffDist(u, v) > r) continue;
+    if (!targetBodyVisible(u, v)) continue;
+    list.push(v); sx += v.x; sy += v.y;
+  }
+  var n = list.length;
+  if (!n) return { n: 0, avg: 0, list: list };
+  var cx = sx / n, cy = sy / n, sum = 0;
+  for (i = 0; i < n; i++) sum += Math.sqrt(dist2(cx, cy, list[i].x, list[i].y));
+  return { n: n, avg: sum / n, list: list };
+}
+function shouldDirectFire(u, r) {
+  var info = enemySpreadInfo(u, r);
+  if (info.n === 0) return false;
+  if (info.n <= CFG.fireMode.directMax) return true;
+  return info.avg > CFG.fireMode.scatterDist;
+}
+function flameCombat(u, dt, playerDriven) {
+  var F = CFG.flame, i, v;
+  if (playerDriven) { u.flameAng = u.faceAng; }
+  else {
+    u.fireModeT = (u.fireModeT || 0) - dt;
+    if (u.fireModeT <= 0) {
+      u.fireModeT = CFG.fireMode.recheck;
+      u.fireDirect = shouldDirectFire(u, F.range) ? 1 : 0;
+    }
+    if (u.fireDirect) {
+      var fdt = nearestVisibleEnemy(u, F.range);
+      if (fdt) {
+        var fa = Math.atan2(fdt.y - u.y, fdt.x - u.x);
+        u.flameAng = fa; u.faceAng = fa; u.aimAng = fa; u.aimT = 0.25;
+      }
+    } else flameSweepAim(u, dt);
+  }
+  /* 没有视线就不喷：不能隔墙点火，也不能对着墙空烧 */
+  var want = playerDriven ? PLAYER.firing : !!nearestVisibleEnemy(u, F.range);
+  if (!want) { u.flameTickT = 0; return; }
+  if (u.reloading || u.mag <= 0) return;
+  u.flameTickT -= dt;
+  if (u.flameTickT > 0) return;
+  u.flameTickT += F.tick;
+  var ang = u.flameAng;
+  var cs = Math.cos(ang), sn = Math.sin(ang);
+  var half = F.coneDeg * Math.PI / 180 / 2;
+  var hits = [];
+  ZGRID.query(u.x, u.y, F.range + 300, _qc);
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    var d2 = dist2(u.x, u.y, v.x, v.y);
+    var dm = Math.max(0, Math.sqrt(d2) - (v.r || 0));
+    if (dm > F.range) continue;
+    var va = Math.atan2(v.y - u.y, v.x - u.x);
+    var radPad = (v.r || 0) > 4 ? Math.atan2(v.r, Math.max(1, Math.sqrt(d2))) : 0;
+    if (Math.abs(angDiff(ang, va)) > half + radPad) continue;
+    if (!targetBodyVisible(u, v)) continue;
+    hits.push({ u: v, d: dm });
+  }
+  hits.sort(function (A, B) { return A.d - B.d; });
+  /* 舌头也吃火焰：舌头是细长线段，按采样点判是否落在火焰锥里 */
+  if (W.tongues && W.tongues.length) {
+    for (var qt = 0; qt < W.tongues.length; qt++) {
+      var qq = W.tongues[qt];
+      if (qq.dead || !qq.owner || qq.owner.dead) continue;
+      for (var qs = 0; qs <= 5; qs++) {
+        var qp = tonguePointAt(qq, qs / 5);
+        var qd2 = dist2(u.x, u.y, qp.x, qp.y);
+        if (qd2 > F.range * F.range) continue;
+        var qa = Math.atan2(qp.y - u.y, qp.x - u.x);
+        if (Math.abs(angDiff(ang, qa)) > half) continue;
+        if (segBlockedByWall(u.x, u.y, qp.x, qp.y)) continue;
+        damageTongue(qq, F.directDmg, u);
+        break;
+      }
+    }
+  }
+  /* 没升格英雄：火焰撞到第一个单位就散开，只烧这一个；
+     升格之后才是"无限穿透"，扫到谁谁着，脚下还留火 */
+  var useHits = u.hero ? hits : hits.slice(0, 1);
+  var firstD = hits.length ? hits[0].d : F.range;
+  for (i = 0; i < useHits.length; i++) {
+    v = useHits[i].u;
+    v.burnT = Math.max(v.burnT || 0, F.igniteT);
+    v.burnSrc = u;
+    if (v.burnTickT <= 0) v.burnTickT = F.igniteEvery;
+    if (v.flameHitT <= 0) {
+      v.flameHitT = F.directEvery;
+      damageZombie(v, F.directDmg, u);
+    }
+    if (u.hero && W.t - (v.wallStampT || -9) > 0.35) {
+      v.wallStampT = W.t;
+      queueFirePatch(v.x, v.y, useHits[i].d, u, true, 0.95);
+    }
+  }
+  /* 火焰落地：射程尽头、撞墙处、或第一个被烧到的单位，三者取最近 */
+  var wallD = Math.min(F.range, rayWallDist(u.x, u.y, ang, F.range));
+  if (firstD < wallD) wallD = firstD;
+  u.flameWallT -= dt;
+  if (u.flameWallT <= 0) {
+    u.flameWallT = 0.08;
+    var ex = u.x + cs * wallD, ey = u.y + sn * wallD;
+    var nx = -sn, ny = cs;
+    for (var q = -1; q <= 1; q++) {
+      queueFirePatch(ex + nx * q * 26, ey + ny * q * 26, wallD, u, !!u.hero, 1);
+    }
+  }
+  if (u.hero) {
+    for (i = 0; i < hits.length; i++) {
+      if (RNG.next() < 0.35) queueFirePatch(hits[i].u.x, hits[i].u.y, hits[i].d, u, true, 0.9);
+    }
+  }
+  /* 火束的视觉段：只是喷口的一小段亮火，真正的主角是圆形火焰粒子 */
+  if (!W.flameJets) W.flameJets = [];
+  W.flameJets.push({ x: u.x, y: u.y, ang: ang, len: Math.min(wallD, 92), t: 0, life: 0.14,
+    hero: u.hero ? 1 : 0, seed: RNG.range(0, TAU) });
+  if (W.flameJets.length > 80) W.flameJets.shift();
+  /* 圆形火焰粒子：橙黄、透明度与色相都随机，一半靠数量堆出火柱的体积 */
+  if (!W.flameParts) W.flameParts = [];
+  var puffs = 22 + (u.hero ? 8 : 0);
+  for (var fp = 0; fp < puffs; fp++) {
+    var pOff = RNG.range(-half, half) * RNG.range(0.35, 1.0);
+    var pAng = ang + pOff;
+    var pSpd = RNG.range(F.partSpeedMin, F.partSpeedMax);
+    /* 寿命按"飞到落点需要的时间"给：粒子不能半路蒸发，
+       火坑在 560 处出现，粒子就必须真的能飞到 560 */
+    var pLife = clamp(wallD / pSpd * RNG.range(1.28, 1.45), 0.25, 1.9);
+    W.flameParts.push({
+      x: u.x + cs * (u.r + 5), y: u.y + sn * (u.r + 5),
+      vx: Math.cos(pAng) * pSpd, vy: Math.sin(pAng) * pSpd,
+      r: RNG.range(3.5, 9.5), grow: RNG.range(10, 30),
+      t: 0, life: pLife, drag: 0.25,
+      hue: RNG.range(6, 44), a: RNG.range(0.22, 0.62)
+    });
+  }
+  if (W.flameParts.length > 900) W.flameParts.splice(0, W.flameParts.length - 900);
+  /* 后坐力：每 0.1 秒推一次，和通用后坐力系统共用抵消逻辑 */
+  var rk = F.recoil * ((u.gearStats && u.gearStats.recoilMul) || 1);
+  u.vx -= cs * rk; u.vy -= sn * rk;
+  u.recoilX = cs; u.recoilY = sn; u.recoilT = CFG.recoil.undoTime;
+  u.recoilRate = rk / F.tick;
+  if (rk > u.vmaxBoost) { u.vmaxBoost = rk; u.boostT = CFG.recoil.boostTime; }
+  /* 持续开火震动：每 0.4 秒一次小幅抖动（规则见《创作准则》§7.3） */
+  u.shakeAcc = (u.shakeAcc || 0) - F.tick;
+  if (u.shakeAcc <= 0) { u.shakeAcc = 0.4; addShake(CFG.shake.flame, CFG.shake.flameDur, u.x, u.y); }
+  u.lastFireT = W.t; u.fireHold = CFG.fireSlowHold;
+  u.mag -= F.ammoPerTick;
+  if (u.mag < 0) u.mag = 0;
+  /* 火焰是持续音：每 tick 都有会糊成一片，隔一个 tick 放一次、音量压低 */
+  if (SFX && SFX.shot && Math.random() < 0.55) SFX.shot("flame", u.x, u.y, 0.8 + Math.random() * 0.14);
+}
+
+/* ---------------------------- 磁爆兵 ---------------------------- */
+/* 连锁指标上限：基础 10，英雄 ×5；"减少散布"的配件改成按比例加指标（5% → +2，30% → +5） */
+function teslaCap(u) {
+  var cap = CFG.tesla.chainMax * (u.hero ? 5 : 1);
+  var gs = u.gearStats;
+  if (gs && gs.spreadMul < 1) {
+    var red = 1 - gs.spreadMul;
+    var bonus = 0;
+    if (red >= 0.30) bonus = 5;
+    else if (red >= 0.05) bonus = Math.max(2, Math.round(5 * red / 0.30));
+    cap += bonus;
+  }
+  return Math.round(cap);
+}
+/* 贴得越紧越省指标：20px 内有 2 个以上同类就算"抱团"，计 0.5 */
+function teslaPacked(v) {
+  var n = 0, r2 = CFG.tesla.packedR * CFG.tesla.packedR;
+  ZGRID.query(v.x, v.y, CFG.tesla.packedR, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var o = _qc[i];
+    if (o === v || o.dead || !isZombieSide(o)) continue;
+    if (dist2(v.x, v.y, o.x, o.y) <= r2) n++;
+  }
+  return n >= 2;
+}
+/* 闪电的索敌必须看得见：隔着一堵实体墙的电弧没有任何物理依据 */
+function targetBodyVisible(u, v) {
+  if (!segBlockedByWall(u.x, u.y, v.x, v.y)) return true;
+  if (!v.r || v.r < 10) return false;
+  for (var i = 0; i < 10; i++) {
+    var a = TAU * i / 10;
+    if (!segBlockedByWall(u.x, u.y, v.x + Math.cos(a) * v.r * 0.82, v.y + Math.sin(a) * v.r * 0.82)) return true;
+  }
+  return false;
+}
+function targetEffDist(u, v) {
+  return Math.max(0, Math.sqrt(dist2(u.x, u.y, v.x, v.y)) - (v.r || 0));
+}
+function nearestVisibleEnemy(u, r) {
+  var best = null, bd = Infinity;
+  ZGRID.query(u.x, u.y, r + 300, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    var ed = targetEffDist(u, v);
+    if (ed > r || ed >= bd) continue;
+    if (!targetBodyVisible(u, v)) continue;
+    bd = ed; best = v;
+  }
+  return best;
+}
+/* 同兵种之间避免抢同一个目标：优先挑"还没被同伴点名"的敌人。
+   claims 每 0.3 秒清一次，所以只是避免同一瞬间的齐射重叠，不会长期占坑 */
+function pickClaimedTarget(u, r, claims) {
+  var cands = [], i, v;
+  ZGRID.query(u.x, u.y, r + 300, _qc);
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    var ed = targetEffDist(u, v);
+    if (ed > r) continue;
+    if (!targetBodyVisible(u, v)) continue;
+    cands.push({ u: v, d: ed * ed });
+  }
+  cands.sort(function (A, B) { return A.d - B.d; });
+  for (i = 0; i < cands.length; i++) {
+    if (claims.indexOf(cands[i].u.id) < 0) {
+      claims.push(cands[i].u.id);
+      if (claims.length > 80) claims.shift();
+      return cands[i].u;
+    }
+  }
+  return cands.length ? cands[0].u : null;
+}
+/* 对着一个坐标放电：落点上有敌人就先打它，没有就电地板（连锁指标 +1，链照走） */
+function teslaZapAt(u, tx, ty) {
+  var T = CFG.tesla;
+  if (segBlockedByWall(u.x, u.y, tx, ty)) return false;
+  /* 电流先碰到舌头：沿舌头导向舔舐者本体，本体作为第一次命中点 */
+  var hitTongue = null;
+  if (W.tongues && W.tongues.length) {
+    for (var tqi = 0; tqi < W.tongues.length; tqi++) {
+      var tq0 = W.tongues[tqi];
+      if (tq0.dead || !tq0.owner || tq0.owner.dead) continue;
+      for (var tqs = 0; tqs <= 6; tqs++) {
+        var tqp = tonguePointAt(tq0, tqs / 6);
+        if (dist2(tx, ty, tqp.x, tqp.y) < 26 * 26) { hitTongue = tq0; break; }
+      }
+      if (hitTongue) break;
+    }
+  }
+  var near = [], i, v, d2;
+  ZGRID.query(tx, ty, 96, _qc);
+  for (i = 0; i < _qc.length; i++) {
+    v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (segBlockedByWall(u.x, u.y, v.x, v.y)) continue;
+    near.push({ u: v, d: dist2(tx, ty, v.x, v.y) });
+  }
+  near.sort(function (A, B) { return A.d - B.d; });
+  var first = null;
+  for (i = 0; i < near.length; i++) {
+    if (W.teslaClaims.indexOf(near[i].u.id) < 0) { first = near[i].u; break; }
+  }
+  if (!first && near.length) first = near[0].u;
+  if (hitTongue) {
+    damageTongue(hitTongue, T.dmg, u);
+    first = hitTongue.owner;
+  }
+  if (first) {
+    W.teslaClaims.push(first.id);
+    if (W.teslaClaims.length > 80) W.teslaClaims.shift();
+  }
+  var cap = teslaCap(u);
+  var targets = [], seen = {}, arcs = [], trunk = [];
+  var curX = first ? first.x : tx, curY = first ? first.y : ty, curR = first ? (first.r || 0) : (u.r || 0);
+  function teslaNextUnseen(fromX, fromY, fromR) {
+    var best = null, bd = Infinity;
+    var queryR = T.chainR + (fromR || 0) + 300;
+    ZGRID.query(fromX, fromY, queryR, _qc);
+    for (var qi = 0; qi < _qc.length; qi++) {
+      var qv = _qc[qi];
+      if (qv.dead || !isZombieSide(qv) || seen[qv.id]) continue;
+      /* 连锁距离按两个单位的体表计算，巨型首领不再因为圆心太远而漏链 */
+      var eff = Math.sqrt(dist2(fromX, fromY, qv.x, qv.y)) - (fromR || 0) - (qv.r || 0);
+      if (eff > T.chainR || eff >= bd) continue;
+      if (segBlockedByWall(fromX, fromY, qv.x, qv.y)) continue;
+      bd = eff; best = qv;
+    }
+    return best;
+  }
+  if (first) {
+    seen[first.id] = 1;
+    targets.push(first); trunk.push(first);
+    arcs.push([u.x, u.y, first.x, first.y]);
+    curX = first.x; curY = first.y; curR = first.r || 0;
+  } else {
+    /* 电地板：先画一条到落点的电弧，再从落点开始找主干 */
+    arcs.push([u.x, u.y, tx, ty]);
+  }
+  /* 主干：最多连接 teslaCap 个敌人，每一步接最近且未被连接过的目标 */
+  while (trunk.length < cap) {
+    var nxt = teslaNextUnseen(curX, curY, curR);
+    if (!nxt) break;
+    seen[nxt.id] = 1;
+    targets.push(nxt); trunk.push(nxt);
+    arcs.push([curX, curY, nxt.x, nxt.y]);
+    curX = nxt.x; curY = nxt.y; curR = nxt.r || 0;
+  }
+  /* 每个主干命中点分叉两条；每条分支再分叉两条末枝；末枝不再扩散 */
+  for (var ti = 0; ti < trunk.length; ti++) {
+    var tn = trunk[ti];
+    for (var bi2 = 0; bi2 < 2; bi2++) {
+      var bn = teslaNextUnseen(tn.x, tn.y, tn.r || 0);
+      if (!bn) break;
+      seen[bn.id] = 1;
+      targets.push(bn);
+      arcs.push([tn.x, tn.y, bn.x, bn.y]);
+      for (var li2 = 0; li2 < 2; li2++) {
+        var ln = teslaNextUnseen(bn.x, bn.y, bn.r || 0);
+        if (!ln) break;
+        seen[ln.id] = 1;
+        targets.push(ln);
+        arcs.push([bn.x, bn.y, ln.x, ln.y]);
+      }
+    }
+  }
+  if (!W.teslaArcs) W.teslaArcs = [];
+  for (var ai = 0; ai < arcs.length; ai++) {
+    W.teslaArcs.push({ x1: arcs[ai][0], y1: arcs[ai][1], x2: arcs[ai][2], y2: arcs[ai][3],
+      t: 0, life: T.arcLife, seed: RNG.range(0, 1000) });
+  }
+  if (W.teslaArcs.length > 160) W.teslaArcs.splice(0, W.teslaArcs.length - 160);
+  for (var j = 0; j < targets.length; j++) {
+    var t2 = targets[j];
+    damageZombie(t2, T.dmg, u);
+    if (!isBossUnit(t2)) {
+      t2.zapT = controlDurOf(t2, T.arcLife);
+      t2.paralyzeT = controlDurOf(t2, T.arcLife);
+      t2.vx = 0; t2.vy = 0;
+    }
+  }
+  addShake(CFG.shake.hit * 0.5, 0.06, u.x, u.y);
+  if (SFX && SFX.shot) SFX.shot("tesla", u.x, u.y, 0.92 + Math.random() * 0.16);
+  return true;
+}
+function teslaCombat(u, dt, playerDriven) {
+  var T = CFG.tesla;
+  if (u.teslaCdT > 0) { u.teslaCdT -= dt; return; }
+  if (u.teslaBurst <= 0) {
+    if (u.mag <= 0) return;
+    if (u.teslaT > 0) { u.teslaT -= dt; return; }
+    u.teslaBurst = T.burst;
+  }
+  u.teslaT -= dt;
+  if (u.teslaT > 0) return;
+  var ok;
+  if (playerDriven) {
+    if (!PLAYER.firing) return;
+    var aim = playerGroundAim(u);
+    u.faceAng = Math.atan2(aim.y - u.y, aim.x - u.x);
+    u.aimAng = u.faceAng; u.aimT = 0.4;
+    ok = teslaZapAt(u, aim.x, aim.y);
+  } else {
+    var tgt = pickClaimedTarget(u, newGunRange(u), W.teslaClaims);
+    ok = tgt ? teslaZapAt(u, tgt.x, tgt.y) : false;
+  }
+  if (ok) {
+    u.mag--;
+    u.teslaBurst--;
+    u.teslaT = T.burstGap;
+    u.lastFireT = W.t; u.fireHold = CFG.fireSlowHold;
+    if (u.teslaBurst <= 0) u.teslaCdT = T.cooldown;
+  } else {
+    u.teslaT = 0.1;
+    u.teslaBurst = 0;
+  }
+}
+
+/* ---------------------------- 激光兵 ---------------------------- */
+/* 尸群质心方向：激光兵蓄力时要先把炮口转过去，不然光柱会对着空气扫 */
+function zombieCentroidAngle(u, r) {
+  var sx = 0, sy = 0, n = 0, r2 = r * r;
+  ZGRID.query(u.x, u.y, r, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (dist2(u.x, u.y, v.x, v.y) > r2) continue;
+    /* 隔墙的不算：没有视线就不进入蓄力，先去挪位置 */
+    if (segBlockedByWall(u.x, u.y, v.x, v.y)) continue;
+    sx += v.x; sy += v.y; n++;
+  }
+  if (!n) return null;
+  return Math.atan2(sy / n - u.y, sx / n - u.x);
+}
+function laserBeamSpec(u) {
+  var L = CFG.laser;
+  var len = L.range * (u.hero ? L.heroRangeMul : 1);
+  var w = L.width * (u.hero ? L.heroWidthMul : 1);
+  if (u.gearStats && u.gearStats.spreadMul < 1) w *= (1 + (1 - u.gearStats.spreadMul));
+  return { len: len, w: w };
+}
+/* 光柱的伤害判定就是"光束覆盖的矩形"：越宽打到的越多，这就是配件的实际收益 */
+function laserBeamDamage(u) {
+  var spec = laserBeamSpec(u);
+  var len = (u.laserLen > 0) ? Math.min(u.laserLen, spec.len) : spec.len;
+  var cs = Math.cos(u.laserAng), sn = Math.sin(u.laserAng);
+  var halfW = spec.w / 2;
+  var list = [];
+  /* 查询范围要加上单位半径：巨型首领的圆心可能在光束末端之外，但身体边缘已经在光柱里 */
+  ZGRID.query(u.x, u.y, len + 300, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    var dx = v.x - u.x, dy = v.y - u.y;
+    var along = dx * cs + dy * sn;
+    var vr = v.r || 0;
+    if (along < -vr || along > len + vr) continue;
+    var perp = -dx * sn + dy * cs;
+    /* 受击范围随体型增长，不再只判定圆心那一个点 */
+    if (Math.abs(perp) > halfW + vr) continue;
+    list.push(v);
+  }
+  /* 激光碰到舌头也算命中：舌头本体是细线段，用采样点判是否落在光柱宽度内 */
+  if (W.tongues && W.tongues.length) {
+    for (var lt = 0; lt < W.tongues.length; lt++) {
+      var lq = W.tongues[lt];
+      if (lq.dead || !lq.owner || lq.owner.dead) continue;
+      for (var ls = 0; ls <= 6; ls++) {
+        var lp2 = tonguePointAt(lq, ls / 6);
+        var ldx = lp2.x - u.x, ldy = lp2.y - u.y;
+        var lal = ldx * cs + ldy * sn;
+        if (lal < 0 || lal > len) continue;
+        var lpd = -ldx * sn + ldy * cs;
+        if (Math.abs(lpd) > halfW + 3) continue;
+        damageTongue(lq, CFG.laser.dmg, u);
+        break;
+      }
+    }
+  }
+  var hcHit = laserHeatRGB((u.laserHeat || 0) / CFG.laser.heatMax);
+  if (!W.laserParticles) W.laserParticles = [];
+  for (var k = 0; k < list.length; k++) {
+    var lv = list[k];
+    damageZombie(lv, CFG.laser.dmg, u);
+    if (!isBossUnit(lv)) lv.zapT = controlDurOf(lv, 0.08);
+    lv.laserTrailEnd = W.t + 0.16;
+    lv.laserTrailAng = u.laserAng;
+    lv.laserTrailHalf = halfW;
+    lv.laserTrailR = hcHit.r; lv.laserTrailG = hcHit.g; lv.laserTrailB = hcHit.b;
+    /* 越靠近光束末端的命中，拖尾越接近透明 */
+    var alongHit = (lv.x - u.x) * cs + (lv.y - u.y) * sn;
+    lv.laserTrailAlpha = clamp(0.08 + 0.92 * (1 - alongHit / Math.max(1, len)), 0.08, 1);
+    /* 粒子数量与光束粗细正相关，拖尾直径只与被命中单位大小相关 */
+    var pCount = 2 + Math.min(9, Math.round(halfW / 9));
+    for (var lp = 0; lp < pCount; lp++) {
+      var pa = u.laserAng + RNG.range(-0.6, 0.6);
+      var pv = RNG.range(30, 90);
+      W.laserParticles.push({ x: lv.x, y: lv.y, vx: Math.cos(pa) * pv, vy: Math.sin(pa) * pv,
+        born: W.t, life: RNG.range(0.75, 1.45), r: hcHit.r, g: hcHit.g, b: hcHit.b,
+        a: lv.laserTrailAlpha, size: RNG.range(2.0, 4.2) * (u.hero ? CFG.hero.sizeMul : 1) });
+    }
+    if (W.laserParticles.length > 320) W.laserParticles.splice(0, W.laserParticles.length - 320);
+  }
+  /* 撞墙：亮点落点周围的小圈也吃一份灼伤 */
+  if (len < spec.len - 1) {
+    var ix = u.x + cs * len, iy = u.y + sn * len;
+    var sR = CFG.laser.splashR * (u.hero ? CFG.hero.sizeMul : 1);
+    var R2 = sR * sR;
+    var splash = [];
+    ZGRID.query(ix, iy, sR, _qc);
+    for (var s2 = 0; s2 < _qc.length; s2++) {
+      var sv = _qc[s2];
+      if (sv.dead || !isZombieSide(sv)) continue;
+      if (list.indexOf(sv) >= 0) continue;         /* 光柱已经打过的别重复结算 */
+      if (dist2(ix, iy, sv.x, sv.y) > R2) continue;
+      splash.push(sv);
+    }
+    for (var s3 = 0; s3 < splash.length; s3++) {
+      damageZombie(splash[s3], CFG.laser.splashDmg, u);
+      if (!isBossUnit(splash[s3])) splash[s3].zapT = 0.08;
+    }
+  }
+}
+/* 强制换弹：连续照射到过热，或者玩家主动松手，走同一套流程 */
+function laserForceReload(u) {
+  var L = CFG.laser;
+  u.laserPhase = 0; u.laserT = L.charge;
+  addMagDrop(u);
+  u.mag = 0;
+  u.reloading = true;
+  u.reloadT = reloadTimeOf(u);
+  u.laserHeat = 0;
+}
+/* 按最大角速度转向：直射换目标时有"甩枪"过程，不是瞬移锁定 */
+function turnToward(cur, target, maxStep) {
+  var d = angDiff(cur, target);
+  if (Math.abs(d) <= maxStep) return target;
+  return cur + (d > 0 ? 1 : -1) * maxStep;
+}
+function laserCombat(u, dt, playerDriven) {
+  var L = CFG.laser;
+  if (u.laserCdT > 0) { u.laserCdT = Math.max(0, u.laserCdT - dt); u.laserHeat = 0; return; }
+  /* 蓄热：玩家与 AI 直射都会过热；AI 横扫不过热 */
+  var heating = (u.laserPhase === 1) && (playerDriven || u.fireDirect);
+  if (heating) {
+    u.laserHeat = (u.laserHeat || 0) + dt;
+    if (u.laserHeat >= L.heatMax) { laserForceReload(u); return; }
+  } else {
+    u.laserHeat = Math.max(0, (u.laserHeat || 0) - dt * L.heatCool);
+  }
+  if (u.laserPhase === 0) {
+    if (playerDriven && !PLAYER.firing) { u.laserT = L.charge; return; }
+    if (!playerDriven) {
+      u.fireModeT = (u.fireModeT || 0) - dt;
+      if (u.fireModeT <= 0) {
+        u.fireModeT = CFG.fireMode.recheck;
+        u.fireDirect = shouldDirectFire(u, L.range) ? 1 : 0;
+      }
+      if (u.fireDirect) {
+        /* 人少而散：锁定一个敌人，炮口一直对着他 */
+        var tgt = nearestVisibleEnemy(u, L.range);
+        if (!tgt) { u.laserT = L.charge; return; }
+        var da = Math.atan2(tgt.y - u.y, tgt.x - u.x);
+        u.faceAng = turnToward(u.faceAng, da, L.turnRate * dt);
+        u.aimAng = u.faceAng; u.aimT = 0.5;
+      } else {
+        var aimA = zombieCentroidAngle(u, L.range);
+        if (aimA === null) { u.laserT = L.charge; return; }
+        u.faceAng = aimA; u.aimAng = aimA; u.aimT = 0.5;
+      }
+    }
+    if (u.laserT <= 0) u.laserT = L.charge;
+    u.laserT -= dt;
+    if (u.laserT <= 0) {
+      u.laserPhase = 1;
+      u.laserTickT = 0;
+      u.laserLen = 0;
+      u.laserSweeps++;
+      u.laserT = playerDriven ? 1e9 : (u.fireDirect ? 1e9 : L.beamT);
+      u.laserAng = playerDriven ? u.faceAng :
+        (u.fireDirect ? u.faceAng : (u.faceAng - (L.sweepDeg * Math.PI / 180) / 2));
+      u.aimAng = u.laserAng; u.aimT = 0.5;
+    }
+    return;
+  }
+  if (u.laserPhase === 1) {
+    if (playerDriven) {
+      u.laserAng = u.faceAng;
+      if (!PLAYER.firing) { laserForceReload(u); return; }
+    } else if (u.fireDirect) {
+      /* 直射：持续咬住目标，不横扫；和玩家一样会过热 */
+      var dtg = nearestVisibleEnemy(u, L.range);
+      if (!dtg) {
+        /* 目标躲到墙后：立刻停止照射，不对着墙滋 */
+        u.laserPhase = 2; u.laserT = L.rest;
+        u.laserNoVisT = 0;
+        addMagDrop(u);
+        return;
+      }
+      var dta = Math.atan2(dtg.y - u.y, dtg.x - u.x);
+      u.faceAng = turnToward(u.faceAng, dta, L.turnRate * dt);
+      u.aimAng = u.faceAng; u.aimT = 0.5;
+      u.laserAng = u.faceAng;
+    } else {
+      var sw = L.sweepDeg * Math.PI / 180;
+      u.laserAng += (sw / L.beamT) * dt;
+      u.aimAng = u.laserAng; u.aimT = 0.5;
+      u.laserT -= dt;
+      if (u.laserT <= 0) {
+        u.laserPhase = 2; u.laserT = L.rest;
+        addMagDrop(u);   /* 一轮横扫结束，退下一块聚能电池 */
+        return;
+      }
+    }
+    u.laserTickT -= dt;
+    if (u.laserTickT <= 0) {
+      u.laserTickT += L.tick;
+      /* 光柱被实体墙截断：墙后的敌人照不到，这是"不穿墙"的唯一实现点 */
+      var sNow = laserBeamSpec(u);
+      u.laserLen = Math.min(sNow.len, rayWallDist(u.x, u.y, u.laserAng, sNow.len));
+      laserBeamDamage(u);
+      /* 横扫时如果整片范围里都没有能看见的目标，别继续对着墙烧 */
+      if (!u.fireDirect) {
+        if (nearestVisibleEnemy(u, sNow.len)) u.laserNoVisT = 0;
+        else u.laserNoVisT = (u.laserNoVisT || 0) + L.tick;
+        if (u.laserNoVisT > 0.3) {
+          u.laserPhase = 2; u.laserT = L.rest; u.laserNoVisT = 0;
+          addMagDrop(u);
+          return;
+        }
+      }
+      addShake(CFG.shake.laser, CFG.shake.laserDur, u.x, u.y);   /* 每 0.1 秒抖一次 */
+      if (SFX && SFX.shot && Math.random() < 0.5) SFX.shot("laser", u.x, u.y, 0.95);
+      u.lastFireT = W.t; u.fireHold = CFG.fireSlowHold;
+    }
+    return;
+  }
+  u.laserT -= dt;
+  if (u.laserT <= 0) {
+    u.laserPhase = 0;
+    u.laserT = L.charge;
+    if (u.laserSweeps >= L.sweepsBeforeCd) { u.laserSweeps = 0; u.laserCdT = L.cdAfter; }
+  }
+}
+
+/* ------------------ 四个兵种的总调度（由 aiHuman 调用） ------------------ */
+function newKindCombat(u, dt, playerDriven) {
+  if (u.reloading) return;
+  if (u.kind === "cryo") {
+    if (u.throwT > 0) u.throwT -= dt;
+    if (u.throwT > 0 || u.mag <= 0) return;
+    var tx, ty;
+    if (playerDriven) {
+      if (!PLAYER.firing) return;
+      var aim = playerGroundAim(u);
+      tx = aim.x; ty = aim.y;
+    } else {
+      /* 同兵种之间分散目标：优先打没被同伴点名的敌人，别一串罐子砸同一个点 */
+      var tgt = pickClaimedTarget(u, newGunRange(u), W.cryoClaims);
+      if (!tgt) return;
+      tx = tgt.x; ty = tgt.y;
+    }
+    cryoThrowAt(u, tx, ty);
+    u.mag--;
+    u.throwT = CFG.cryo.throwEvery;
+    u.fireHold = CFG.fireSlowHold; u.lastFireT = W.t;
+    return;
+  }
+  if (u.kind === "flame") { flameCombat(u, dt, playerDriven); return; }
+  if (u.kind === "tesla") { teslaCombat(u, dt, playerDriven); return; }
+  if (u.kind === "laser") { laserCombat(u, dt, playerDriven); return; }
+}
+/* 每帧统一推进：罐子、寒冷圈、火墙、点燃、短命特效 */
+function stepNewUnits(dt) {
+  /* 目标占用每 0.3 秒清一次：只避免同一瞬间的齐射重叠，不做长期占坑 */
+  W.claimT -= dt;
+  if (W.claimT <= 0) {
+    W.claimT = 0.3;
+    if (W.cryoClaims) W.cryoClaims.length = 0;
+    if (W.teslaClaims) W.teslaClaims.length = 0;
+  }
+  stepCryo(dt);
+  stepFirePending(dt);
+  stepFirePatches(dt);
+  stepBurning(dt);
+  var i;
+  if (W.flameJets) {
+    for (i = W.flameJets.length - 1; i >= 0; i--) {
+      var fj = W.flameJets[i];
+      fj.t += dt;
+      if (fj.t >= fj.life) W.flameJets.splice(i, 1);
+    }
+  }
+  /* 圆形火焰粒子：向外飞、膨胀、减速、淡出 */
+  if (W.flameParts) {
+    for (i = W.flameParts.length - 1; i >= 0; i--) {
+      var fp = W.flameParts[i];
+      fp.t += dt;
+      if (fp.t >= fp.life) { W.flameParts.splice(i, 1); continue; }
+      fp.x += fp.vx * dt; fp.y += fp.vy * dt;
+      var drag = 1 - Math.min(0.9, (fp.drag || 4.2) * dt);
+      fp.vx *= drag; fp.vy *= drag;
+      fp.r += fp.grow * dt;
+    }
+  }
+  if (W.teslaArcs) {
+    for (i = W.teslaArcs.length - 1; i >= 0; i--) {
+      var ta = W.teslaArcs[i];
+      ta.t += dt;
+      if (ta.t >= ta.life) W.teslaArcs.splice(i, 1);
+    }
+  }
+}
+
+/* ------------------------------ 9. 战斗 --------------------------------- */
+function segCircle(x0, y0, x1, y1, cx, cy, cr) {
+  var dx = x1 - x0, dy = y1 - y0;
+  var fx = x0 - cx, fy = y0 - cy;
+  var a = dx * dx + dy * dy;
+  if (a < 1e-9) return (fx * fx + fy * fy) <= cr * cr;
+  var b = 2 * (fx * dx + fy * dy);
+  var c = fx * fx + fy * fy - cr * cr;
+  var disc = b * b - 4 * a * c;
+  if (disc < 0) return false;
+  disc = Math.sqrt(disc);
+  var t1 = (-b - disc) / (2 * a), t2 = (-b + disc) / (2 * a);
+  return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1) || (t1 < 0 && t2 > 1);
+}
+function pointBlocked(x, y) {
+  var obs = W.obstacles;
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (x >= o.x && x <= o.x + o.w && y >= o.y && y <= o.y + o.h) return true;
+  }
+  return false;
+}
+/* 开火瞬间的一帧光晕：向前扩散、透明度渐变 */
+function addFlash(u, ang) {
+  var big = u.kind === "mg";
+  var sn = u.kind === "sniper";
+  if (W.flashes.length > 300) return;
+  var lf = sn ? CFG.flash.life * 2.2 : CFG.flash.life;
+  W.flashes.push({
+    x: u.x + Math.cos(ang) * (u.r + 3), y: u.y + Math.sin(ang) * (u.r + 3),
+    ang: ang,
+    len: sn ? CFG.sniper.flashLen : (big ? CFG.flash.wideLen : CFG.flash.len),
+    wid: sn ? CFG.sniper.flashWid : (big ? 30 : 13),
+    life: lf, max: lf, snipe: sn ? 1 : 0
+  });
+}
+/* 抛一枚弹壳：从枪身中段朝侧后方甩出去，带一个向上的初速度做伪 3D 抛物线 */
+function addShell(from, ang, dmg) {
+  if (W.shells.length >= CFG.shell.max) W.shells.shift();
+  var side = RNG.range(0, 1) < 0.5 ? -1 : 1;
+  var ca = Math.cos(ang + Math.PI / 2 * side), sa = Math.sin(ang + Math.PI / 2 * side);
+  W.shells.push({
+    x: from.x + Math.cos(ang) * from.r * 0.35,
+    y: from.y + Math.sin(ang) * from.r * 0.35,
+    z: from.r * 0.55,
+    vx: ca * RNG.range(20, CFG.shell.side),
+    vy: sa * RNG.range(20, CFG.shell.side),
+    vz: CFG.shell.vz * RNG.range(0.75, 1.2),
+    t: CFG.shell.life,
+    /* 弹壳粗细按兵种定：步枪/机枪只比子弹(0.7)宽一点，狙击才用大颗 */
+    size: CFG.shell.sizes[from.kind] || 1.2,
+    rot: RNG.range(0, TAU)
+  });
+}
+function landShell(s) {
+  if (W.casings.length >= CFG.shell.max) W.casings.shift();
+  W.casings.push({ x: s.x, y: s.y, rot: s.rot, size: s.size, color: s.color || null });
+}
+/* 1.3.3：持续开火兵换完弹退下来的大家伙——喷火兵的燃料罐、磁爆兵的电池匣、
+   激光兵的聚能电池。比普通弹壳大一圈，落地上一直留着，给换弹一个"看得见"的交代 */
+function addMagDrop(u) {
+  if (!u || u.dead) return;
+  if (W.shells.length >= CFG.shell.max) W.shells.shift();
+  var ang = u.faceAng;
+  var side = RNG.next() < 0.5 ? -1 : 1;
+  var a = ang + Math.PI / 2 * side;
+  W.shells.push({
+    x: u.x + Math.cos(ang) * u.r * 0.3,
+    y: u.y + Math.sin(ang) * u.r * 0.3,
+    z: u.r * 0.5,
+    vx: Math.cos(a) * RNG.range(26, 62),
+    vy: Math.sin(a) * RNG.range(26, 62),
+    vz: CFG.shell.vz * 0.8,
+    t: CFG.shell.life * 1.6,
+    size: 4.4, rot: RNG.range(0, TAU),
+    color: "#7c828c", big: 1
+  });
+}
+function stepShells(dt) {
+  for (var i = W.shells.length - 1; i >= 0; i--) {
+    var s = W.shells[i];
+    s.t -= dt;
+    s.vz -= CFG.shell.g * dt;
+    s.x += s.vx * dt; s.y += s.vy * dt; s.z += s.vz * dt;
+    s.rot += dt * 16;
+    if (s.z <= 0) {
+      s.z = 0;
+      if (s.vz < -55) {
+        /* 落地弹一下 */
+        s.vz *= -CFG.shell.bounce;
+        s.vx *= 0.45; s.vy *= 0.45;
+      } else {
+        landShell(s);
+        W.shells.splice(i, 1);
+        continue;
+      }
+    }
+    if (s.t <= 0) { landShell(s); W.shells.splice(i, 1); }
+  }
+}
+/* 开火后坐力：兵种倍率换算成 px/s */
+function recoilOf(u) {
+  var k = (CFG.recoilBy && CFG.recoilBy[u.kind] !== undefined) ? CFG.recoilBy[u.kind] : CFG.recoil[u.kind];
+  if (!k) return 0;
+  var v = k * CFG.recoil.unit;
+  /* 英雄的后坐力只剩一成：他那两把自动武器火力太密，
+     全额后坐力会一直把他自己推着走，根本站不住 */
+  if (u.hero) v *= CFG.hero.recoilMul;
+  /* 制退器 */
+  if (u.gearStats) v *= u.gearStats.recoilMul;
+  return v;
+}
+/* 命中抖动：取当前最强的一次，持续时间内整体偏移世界画面 */
+function addShake(mag, dur, x, y) {
+  if (!CFG.shake.enabled) return;
+  if (CFG.shake.distance !== false && x !== undefined && y !== undefined) {
+    var d = Math.sqrt(dist2(x, y, CAM.x, CAM.y));
+    var viewR = Math.max(VW, VH) / Math.max(0.18, CAM.zoom || 1);
+    mag *= clamp(1 - d / (viewR * 0.85), 0.06, 1);
+  }
+  if (mag > W.shakeMag) W.shakeMag = mag;
+  var dd = Math.min(dur, CFG.shake.maxDur || 0.7);
+  if (dd > W.shakeT) { W.shakeT = dd; W.shakeDur = dd; }
+}
+/* 屏幕边缘闪光：只在镜头看得见的地方触发，否则远处的击杀会让屏幕闪个不停 */
+function addGlow(kind, x, y) {
+  var sx = w2sx(x), sy = w2sy(y), pad = CFG.glow.sightPad;
+  if (!(sx > -pad && sx < VW + pad && sy > -pad && sy < VH + pad)) return;
+  if (kind === "green") W.glowG = CFG.glow.greenLife;
+  else W.glowP = CFG.glow.purpleLife;
+}
+/* 边缘光带：贴着边框处透明度低，往里一点点迅速拉高，再向内衰减到 0，只在最外圈很窄的一段里闪 */
+var _glowGrads = {};
+function drawEdgeGlow(rgb, a) {
+  if (a <= 0.003) return;
+  var d = CFG.glow.depth;
+  var key = rgb + "|" + VW + "|" + VH;
+  var g = _glowGrads[key];
+  if (!g) {
+    function mk(x0, y0, x1, y1) {
+      var lg = CTX.createLinearGradient(x0, y0, x1, y1);
+      lg.addColorStop(0, "rgba(" + rgb + ",0.15)");
+      lg.addColorStop(0.28, "rgba(" + rgb + ",1)");
+      lg.addColorStop(1, "rgba(" + rgb + ",0)");
+      return lg;
+    }
+    g = { t: mk(0, 0, 0, d), b: mk(0, VH, 0, VH - d), l: mk(0, 0, d, 0), r: mk(VW, 0, VW - d, 0) };
+    _glowGrads[key] = g;
+  }
+  CTX.globalAlpha = a;
+  CTX.fillStyle = g.t; CTX.fillRect(0, 0, VW, d);
+  CTX.fillStyle = g.b; CTX.fillRect(0, VH - d, VW, d);
+  CTX.fillStyle = g.l; CTX.fillRect(0, 0, d, VH);
+  CTX.fillStyle = g.r; CTX.fillRect(VW - d, 0, d, VH);
+  CTX.globalAlpha = 1;
+}
+function fireBullet(from, target, spreadDeg, dmg, widthMul, chain, sniper, auto) {
+  if (W.bullets.length >= CFG.bulletCap) return;
+  /* 配件在这里统一结算：枪口收束器压散布、瞄具再压一点、延展器抬激发威力。
+     AI 和玩家共用这条路径，所以装了配件全队都受益 */
+  var gs = from.gearStats;
+  if (gs) {
+    spreadDeg *= gs.spreadMul;
+    dmg *= gs.dmgMul;
+  }
+  var ang = Math.atan2(target.y - from.y, target.x - from.x);
+  if (spreadDeg > 0) ang += RNG.range(-1, 1) * spreadDeg * Math.PI / 180;
+  var cs = Math.cos(ang), sn = Math.sin(ang);
+  var ox = from.x + cs * (from.r + 3), oy = from.y + sn * (from.r + 3);
+  W.bullets.push({
+    x: ox, y: oy, px: ox, py: oy,
+    ox: ox, oy: oy,                     /* 记录枪口位置，用于限制曳光长度 */
+    vx: cs * CFG.bullet.speed * (sniper ? CFG.sniper.speedMul : 1),
+    vy: sn * CFG.bullet.speed * (sniper ? CFG.sniper.speedMul : 1),
+    life: CFG.bullet.life, dmg: dmg, ang: ang, wmul: widthMul || 1, chain: chain ? 1 : 0,
+    owner: from,
+    snipe: sniper ? 1 : 0,
+    wallPierce: sniper ? CFG.sniper.wallPierce : 0,
+    bid: W.bulletSeq++
+  });
+  addFlash(from, ang);
+  /* casing: full-auto weapons eject one every other round, single shots always eject */
+  if (auto) {
+    from.shellN = (from.shellN || 0) + 1;
+    if (from.shellN % 2 === 0) addShell(from, ang, dmg);
+  } else {
+    from.shellN = 0;
+    addShell(from, ang, dmg);
+  }
+  from.aimAng = ang; from.aimT = 0.4; from.faceAng = ang;   /* 转身面向目标 */
+  /* 后坐力：沿射击反方向推射手一把，同时临时放宽它的速度上限，
+     否则那一把推力会被最高速直接截掉，听得出后坐力却看不出位移 */
+  var rk = recoilOf(from);
+  if (rk > 0) {
+    from.vx -= cs * rk; from.vy -= sn * rk;
+    from.recoilX = cs; from.recoilY = sn;
+    from.recoilT = CFG.recoil.undoTime;
+    /* 这把枪每秒往射手身上灌多少平均推力（px/s²），抵消加速度就按这个量级来配：
+       只和"这一枪推了多少、多久打一发"有关，跟单位的加速度无关 */
+    var gInt = (gunOf(from) && gunOf(from).interval) ? gunOf(from).interval : 1;
+    from.recoilRate = rk / Math.max(0.015, gInt);
+    if (rk > from.vmaxBoost) { from.vmaxBoost = rk; from.boostT = CFG.recoil.boostTime; }
+  }
+  /* 枪声：按武器种类取音色，机枪连射时音调随射击节奏轻微上漂 */
+  var sk = (from.kind === "shield") ? "pistol" : from.kind;
+  SFX.shot(sk, from.x, from.y, shotPitch(from));
+}
+/* 同一把枪连续射击时的音调漂移 */
+function shotPitch(u) {
+  var now = W.t;
+  if (u.kind === "mg") {
+    if (u.mgLastT === undefined || now - u.mgLastT > 0.5) u.mgStreak = 0;
+    u.mgLastT = now;
+    u.mgStreak = (u.mgStreak || 0) + 1;
+    return 1 + Math.min(0.22, u.mgStreak * 0.013);
+  }
+  if (u.kind === "sniper") return 0.98 + Math.random() * 0.045;
+  if (u.kind === "shield") return 0.96 + Math.random() * 0.07;
+  return 0.97 + Math.random() * 0.06;
+}
+/* 在阵亡处留下一摊血迹：几段随机弧度拼成不规则曲线，明度在很小的范围里浮动 */
+function addBloodStain(x, y) {
+  if (W.bloodstains.length >= CFG.blood.max) W.bloodstains.shift();
+  /* 一圈不规则顶点围成的闭合面，之前画的是几根散开的弧线，摊在地上像虫子 */
+  var n = 8 + RNG.int(0, 4);
+  var baseR = RNG.range(9, 16);
+  var pts = [], i;
+  for (i = 0; i < n; i++) {
+    var a = Math.PI * 2 * i / n + RNG.range(-0.16, 0.16);
+    var r = baseR * RNG.range(0.58, 1.28);
+    pts.push({ x: Math.cos(a) * r, y: Math.sin(a) * r * RNG.range(0.72, 1.0) });
+  }
+  W.bloodstains.push({
+    x: x, y: y,
+    lit: RNG.range(CFG.blood.litLo, CFG.blood.litHi),
+    pts: pts
+  });
+}
+function killZombie(v) {
+  if (v.dead) return;
+  if (v.armT > 0) return;      /* 已经在蓄爆了，别再判一次死 */
+  /* 自爆丧尸打光血不会立刻倒下：先站在原地把光闪成一片白、涨到两倍再炸。
+     真正的死亡记账放到爆炸那一刻 */
+  if (v.kind === "plagueNest") bossDeath(v);
+  if (v.kind === "tyrant") tyrantDeath(v);
+  if (v.kind === "bomber" && !(v.armT > 0)) {
+    v.hp = 0;
+    v.armT = CFG.bomber.armT;
+    v.vx = 0; v.vy = 0; v.ax = 0; v.ay = 0;
+    v.state = "arming";
+    if (SFX.ok && SFX.enabled) SFX.band({ freq: 300, peak: 0.22, decay: 0.5, q: 1.1, wet: 0.2 });
+    return;
+  }
+  v.dead = true;
+  W.kills++;
+  addGlow("green", v.x, v.y);
+  addBloodStain(v.x, v.y);
+  var bounty = v.kind === "plagueNest" ? (CFG.plagueNest.reward || 10000)
+    : (v.kind === "mother" ? CFG.econ.killMother
+    : (v.kind === "licker" ? CFG.econ.killLicker : CFG.econ.killZombie));
+  W.resources = Math.min(CFG.econ.cap, W.resources + bounty);
+}
+/* 母体产仔的落点：母体贴着墙时，围绕它的一圈候选点可能全落在墙体里。
+   先按原角度朝母体方向逐步收缩，再绕母体边缘换方向；全都合法不了才退回
+   母体自身位置（宁可和母体重叠，也不让新生丧尸嵌进墙内） */
+function broodSpot(m, a, rr) {
+  var pad = 10, r = rr, i, k, x, y, aa;
+  for (i = 0; i < 8; i++) {
+    x = clamp(m.x + Math.cos(a) * r, 12, CFG.world.w - 12);
+    y = clamp(m.y + Math.sin(a) * r, 12, CFG.world.h - 12);
+    if (!blockedForPlacement(x, y, pad)) return { x: x, y: y };
+    r -= 6;
+    if (r <= m.r) break;
+  }
+  for (k = 0; k < 8; k++) {
+    aa = a + TAU * k / 8;
+    x = clamp(m.x + Math.cos(aa) * (m.r + 5), 12, CFG.world.w - 12);
+    y = clamp(m.y + Math.sin(aa) * (m.r + 5), 12, CFG.world.h - 12);
+    if (!blockedForPlacement(x, y, pad)) return { x: x, y: y };
+  }
+  return { x: m.x, y: m.y };
+}
+/* 母体：血量每下降总血量的 10%，就在紧贴自身的周围生成 7 只普通丧尸 */
+function spawnBrood(m, count) {
+  var room = CFG.caps.zombies - countUnits().z;
+  if (room <= 0) return;
+  var n = Math.min(count || CFG.brood.count, room);
+  for (var i = 0; i < n; i++) {
+    var a = RNG.range(0, TAU), rr = m.r + 5 + RNG.range(0, 28);
+    var p = broodSpot(m, a, rr);
+    var z = addUnit("zombie", p.x, p.y);
+    /* 兜底：万一落点仍与障碍物相交（比如母体自己被挤进墙边），
+       立刻按障碍物法线弹出来，保证新单位一出生就在墙外 */
+    collideObstacles(z);
+    z.pounceCd = RNG.range(0, 1.0);
+  }
+}
+function addCombatStat(kind, damage, kill) {
+  if (!kind || !W.stats) return;
+  var b = W.stats.byKind[kind];
+  if (!b) b = W.stats.byKind[kind] = { kills: 0, damage: 0 };
+  if (damage > 0) b.damage += damage;
+  if (kill) b.kills += 1;
+}
+function damageZombie(v, dmg, attacker) {
+  if (v.dead) return;
+  /* 蓄爆的这一秒是无敌的：这时候再吃一发会把它直接判成"死亡"，
+     那一秒的闪光和最后那一下爆炸就全被吞掉了 */
+  if (v.armT > 0) return;
+  /* 杀戮血珠未吸收完时，毁灭暴君处于无敌且定身状态 */
+  if (v.kind === "tyrant" && v.tyrantInvuln) return;
+  var incoming = dmg;
+  if (v.tyrantShieldHp > 0) {
+    var tyAbs = Math.min(v.tyrantShieldHp, incoming);
+    v.tyrantShieldHp -= tyAbs; incoming -= tyAbs;
+    if (v.tyrantShieldHp <= 0) { v.tyrantShieldHp = 0; v.tyrantShieldMax = 0; }
+    if (incoming <= 0) { v.hitFlash = 0.12; SFX.hit(v.x, v.y); return; }
+  }
+  if (v.energyShieldHp > 0) {
+    var absorbed = Math.min(v.energyShieldHp, incoming);
+    v.energyShieldHp -= absorbed; incoming -= absorbed;
+    if (v.energyShieldHp <= 0) { v.energyShieldHp = 0; v.energyShieldMax = 0; }
+    if (incoming <= 0) { v.hitFlash = 0.12; SFX.hit(v.x, v.y); return; }
+  }
+  if (v.kind === "tyrant" && v.tyState === "dash") incoming *= 0.3;
+  var statActual = Math.max(0, Math.min(incoming, v.hp));
+  if (attacker && isHuman(attacker) && statActual > 0) addCombatStat(attacker.kind, statActual, 0);
+  v.hp -= incoming;
+  if (v.kind === "plagueNest") bossCheckSegments(v);
+  else if (v.kind === "tyrant") tyrantCheckSegments(v);
+  v.hitFlash = 0.12;
+  SFX.hit(v.x, v.y);
+  /* 中弹踉跄：沿子弹来向被推一下，同时短时间跑不动。
+     同一只丧尸有冷却，不然机枪一秒钟就能把它永久钉死 */
+  if (attacker && isHuman(attacker) && W.t - v.kbT > CFG.hitStagger.cd) {
+    v.kbT = W.t;
+    var ka = Math.atan2(v.y - attacker.y, v.x - attacker.x);
+    /* 自爆丧尸个头沉，打上去只是微微挪几像素、原地顿一下，然后继续走 */
+    var heavy = (v.kind === "bomber");
+    var kn = CFG.hitStagger.knock * CFG.game.knockMul * (heavy ? CFG.bomber.kbMul : 1) * controlMulOf(v);
+    v.vx += Math.cos(ka) * kn;
+    v.vy += Math.sin(ka) * kn;
+    if (kn > v.vmaxBoost) { v.vmaxBoost = kn; v.boostT = controlDurOf(v, CFG.hitStagger.boostTime); }
+    if (heavy) { v.slowT = controlDurOf(v, CFG.bomber.stopT); v.slowMul = 0.12; }
+    else { v.slowT = controlDurOf(v, CFG.hitStagger.slowTime); v.slowMul = CFG.hitStagger.slowMul; }
+    if (CFG.game.recoverT > 0) v.recoverT = controlDurOf(v, CFG.game.recoverT);
+  }
+  /* 我方士兵打中丧尸：屏幕极轻微地抖一下 */
+  if (attacker && isHuman(attacker)) addShake(CFG.shake.hit, CFG.shake.hitDur, v.x, v.y);
+  /* 护送模式：被打到的休眠丧尸会立刻锁定开枪的人 */
+  if (attacker && W.mode === "escort" && !v.locked && !v.dead) v.attacker = attacker;
+  if (v.kind === "mother" && v.hp > 0) {
+    var guard = 0;
+    while (v.hp <= v.nextSpawnHp && v.nextSpawnHp > 0 && guard++ < 20) {
+      v.nextSpawnHp -= v.maxHp * CFG.brood.step;
+      spawnBrood(v, CFG.brood.count);
+    }
+  }
+  if (v.hp <= 0) {
+    if (attacker && isHuman(attacker)) addCombatStat(attacker.kind, 0, 1);
+    /* 淘汰播报是全局战况：谁打死的都记，不限于玩家操控 */
+    if (attacker && isHuman(attacker)) addKillFeed(attacker, v);
+    /* 命中标记 / 得分 / 音效只属于玩家自己的手感 */
+    if (attacker && PLAYER.unit === attacker) {
+      PLAYER.hitT = CFG.killfeed.hitT;
+      PLAYER.killT = CFG.killfeed.killT;
+      if (CFG.feedback.hitmark) {
+        var isMom = (v.kind === "mother");
+        var pop = isMom ? CFG.econ.killMother
+          : (v.kind === "licker" ? CFG.econ.killLicker : CFG.econ.killZombie);
+        addScorePop(pop, isMom);
+      }
+      if (CFG.feedback.killSfx) { try { SFX.kill(); } catch (e) {} }
+    }
+    killZombie(v);
+  } else if (attacker && PLAYER.unit === attacker) {
+    PLAYER.hitT = CFG.killfeed.hitT;   /* 打中但没死：白色命中标记 */
+  }
+}
+/* 玩家操控时的三种反馈开关（菜单里可切，只存本地） */
+var FB = { feed: true, hitmark: true, killSfx: true };
+function loadFB() {
+  try {
+    var raw = localStorage.getItem("zombieSandbox.fb.v1");
+    if (raw) {
+      var o = JSON.parse(raw) || {};
+      FB.feed = o.feed !== false;
+      FB.hitmark = o.hitmark !== false;
+      FB.killSfx = o.killSfx !== false;
+    }
+  } catch (e) {}
+  CFG.feedback.feed = FB.feed;
+  CFG.feedback.hitmark = FB.hitmark;
+  CFG.feedback.killSfx = FB.killSfx;
+}
+function saveFB() {
+  try { localStorage.setItem("zombieSandbox.fb.v1", JSON.stringify(FB)); } catch (e) {}
+}
+function toggleFB(k) {
+  FB[k] = !FB[k];
+  CFG.feedback[k] = FB[k];
+  saveFB();
+  syncFB();
+}
+function syncFB() {
+  var ids = { feed: "fbFeed", hitmark: "fbHit", killSfx: "fbSfx" };
+  for (var k in ids) {
+    var b = document.getElementById(ids[k]);
+    if (!b) continue;
+    var lab = b.getAttribute("data-label") || "";
+    b.textContent = (FB[k] ? "✓ " : "✗ ") + lab;
+    b.className = FB[k] ? "on" : "";
+  }
+}
+/* 击杀得分（战地式，左下角一整套）：
+   ① 一条条往上飘的 "KILL +10"
+   ② 下面一个固定的累积总分，数字不是瞬间跳到位，而是快速滚动着追上去，
+      连杀时能看到它一路狂飙，这才是"爽"的来源，一下跳到 100 反而没感觉
+   一段时间不击杀，整套一起淡出 */
+function addScorePop(n, big) {
+  if (!W.pops) W.pops = [];
+  if (W.pops.length > 6) W.pops.shift();
+  W.pops.push({ n: n, big: !!big, t: 1.5, life: 1.5 });
+  if (!W.score) W.score = { total: 0, shown: 0, t: 0, pulse: 0 };
+  var before200 = Math.floor(W.score.total / 200);
+  W.score.total += n;
+  W.score.t = 2.6;
+  /* 每跨过 200 的整数倍，总分弹一下（放大缩小）并就此转成金色 */
+  if (Math.floor(W.score.total / 200) > before200) W.score.pulse = 1;
+}
+function stepPops(dt) {
+  var i;
+  if (W.pops) {
+    for (i = W.pops.length - 1; i >= 0; i--) {
+      W.pops[i].t -= dt;
+      if (W.pops[i].t <= 0) W.pops.splice(i, 1);
+    }
+  }
+  var sc = W.score;
+  if (!sc) return;
+  /* 数字滚动：每秒只追掉 55%，所以一次 +10 也要滚上大半秒 */
+  var gapv = sc.total - sc.shown;
+  if (Math.abs(gapv) > 0.01) {
+    sc.shown += gapv * Math.min(1, 3.2 * dt);
+    if (Math.abs(sc.total - sc.shown) < 0.4) sc.shown = sc.total;
+  }
+  if (sc.t > 0) {
+    sc.t -= dt;
+  } else if (sc.t > -0.6) {
+    sc.t -= dt;                  /* 进入淡出计时（用负数表示） */
+  } else if (sc.total > 0 || sc.shown > 0) {
+    /* 完全淡出后归零：下一次击杀重新从 0 开始累计 */
+    sc.total = 0; sc.shown = 0; sc.pulse = 0; sc.t = 0;
+  }
+  if (sc.pulse > 0) {
+    sc.pulse -= dt * 3.4;
+    if (sc.pulse < 0) sc.pulse = 0;
+  }
+}
+function drawPops() {
+  if (HIDE_UI) return;
+  var sc = W.score;
+  var pops = W.pops || [];
+  if (!sc && !pops.length) return;
+  var scVis = sc && (sc.t > -0.6) && (sc.total > 0 || Math.abs(sc.total - sc.shown) > 0.01);
+  if (!scVis && !pops.length) return;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.textBaseline = "alphabetic";
+  var szS = Math.round(Math.max(14, Math.min(20, VW * 0.017)));   /* 飘字 */
+  var szB = Math.round(Math.max(26, Math.min(40, VW * 0.032)));   /* 总分 */
+  var rh = szS + 14;
+  var lx = 26;
+  /* 整套贴着左下角摆，但要让开底部工具栏 */
+  var baseY = VH - (BOTBAR_H || 0) - 34;
+  /* ② 累积总分：默认白色，跨过 200 之后固定为金色，里程碑那一下放大再弹回 */
+  if (scVis) {
+    var sa = sc.t > 0 ? 1 : Math.max(0, 1 + sc.t / 0.6);   /* t 走到 -0.6 时完全消失 */
+    var gold = sc.total >= 200;
+    var sc2 = 1 + 0.5 * (sc.pulse || 0) * (sc.pulse || 0);
+    CTX.save();
+    CTX.translate(lx, baseY);
+    CTX.scale(sc2, sc2);
+    CTX.textAlign = "left";
+    CTX.font = "700 " + szB + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.shadowColor = "rgba(0,0,0,0.85)";
+    CTX.shadowBlur = 8;
+    CTX.fillStyle = gold ? "rgba(255,214,90," + sa + ")" : "rgba(255,255,255," + sa + ")";
+    CTX.fillText("+" + Math.floor(sc.shown), 0, 0);
+    CTX.restore();
+    CTX.font = Math.round(szS * 0.86) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.textAlign = "left";
+    CTX.fillStyle = gold ? "rgba(255,214,90," + (0.8 * sa) + ")" : "rgba(200,212,235," + (0.78 * sa) + ")";
+    CTX.fillText("击杀得分", lx + 4, baseY - szB - 4);
+  }
+  /* ① "KILL +10"：弹射到总分上方 → 停留 → 再上浮淡出 */
+  var A = 0.16, B = 0.85;
+  for (var i = 0; i < pops.length; i++) {
+    var p = pops[i];
+    var idx = pops.length - 1 - i;
+    var age = p.life - p.t;
+    var targetY = baseY - szB - 20 - szS - idx * rh;
+    var y, a;
+    if (age < A) {
+      /* 冲上去：缓出（先快后慢），所以看着是有劲儿的弹射而不是匀速飘 */
+      var k = age / A;
+      var e = 1 - Math.pow(1 - k, 2.6);
+      y = baseY + (targetY - baseY) * e;
+      a = 1;
+    } else if (age < B) {
+      y = targetY;
+      a = 1;
+    } else {
+      var k2 = Math.min(1, (age - B) / Math.max(0.01, p.life - B));
+      y = targetY - 46 * k2;
+      a = 1 - k2;
+    }
+    CTX.textAlign = "left";
+    CTX.font = "700 " + szS + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.shadowColor = "rgba(0,0,0,0.85)";
+    CTX.shadowBlur = 6;
+    CTX.fillStyle = "rgba(255,255,255," + a + ")";
+    CTX.fillText("KILL", lx, y);
+    /* 母体的 +100 单独用金色 */
+    CTX.fillStyle = p.big ? "rgba(255,214,90," + a + ")" : "rgba(255,255,255," + a + ")";
+    CTX.fillText("+" + p.n, lx + feedTextW("KILL  ", szS), y);
+  }
+  CTX.shadowBlur = 0;
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+/* 淘汰播报：一条一条往上叠，最新的一条在最下面。
+   killer 传 null 表示这一条是丧尸阵营干的（感染），tag 用来顶替武器名 */
+function addKillFeed(killer, victim, tag) {
+  if (!CFG.feedback.feed) return;
+  if (!W.feed) W.feed = [];
+  var kc = killer ? CFG.unit[killer.kind] : null;
+  var vc = victim ? CFG.unit[victim.kind] : null;
+  W.feed.push({
+    k: kc ? kc.name : "丧尸",
+    gun: tag || (killer ? gunNameOf(killer) : "撕咬"),
+    v: vc ? vc.name : "人类",
+    big: !!victim && victim.kind === "mother",
+    z: !killer || !isHuman(killer),   /* 丧尸方造成的减员，播报用红色区分 */
+    t: CFG.killfeed.life
+  });
+  while (W.feed.length > CFG.killfeed.max) W.feed.shift();
+}
+function stepKillFeed(dt) {
+  if (!W.feed) return;
+  for (var i = W.feed.length - 1; i >= 0; i--) {
+    W.feed[i].t -= dt;
+    if (W.feed[i].t <= 0) W.feed.splice(i, 1);
+  }
+}
+/* ============================================================================
+   光环 / 护盾的并集渲染
+   一堆半透明的金色圆叠在一起时，重叠区会越叠越亮，边界线也糊成一团。
+   这里把所有圆先画到一张离屏画布上（不透明、source-over，重叠不加深），
+   于是得到"所有圆的并集"；再叠一次 alpha 画到主画布，重叠区颜色不叠加。
+   轮廓则用「并集 减去 内缩一圈的并集」，剩下的正好是所有圆的最外轮廓，
+   圆与圆之间的交线被自动抹掉。
+   ============================================================================ */
+var AURA_CIRCLES = [], MOTHER_SHIELDS = [];
+var AURA_CV = null, AURA_CV_CTX = null;
+function auraCanvas(w, h) {
+  if (!AURA_CV) {
+    try {
+      AURA_CV = document.createElement("canvas");
+      AURA_CV_CTX = AURA_CV.getContext("2d");
+    } catch (e) { AURA_CV = null; AURA_CV_CTX = null; }
+  }
+  if (!AURA_CV || !AURA_CV_CTX) return null;
+  if (AURA_CV.width !== w || AURA_CV.height !== h) {
+    AURA_CV.width = w;
+    AURA_CV.height = h;
+  }
+  return { cv: AURA_CV, g: AURA_CV_CTX };
+}
+/* ============================================================================
+   战争迷雾
+   做法：在一张半分辨率的离屏画布上先铺满阴影，再用 destination-out 把每个人类的
+   "朝向扇形 ∩ 恐惧范围"挖掉。半分辨率 + 放大绘制这两个动作本身就带来柔和的边缘，
+   不需要额外的高斯模糊，代价也小得多。
+   纯视觉层：AI 完全不受影响。
+   ============================================================================ */
+var FOG_CV = null, FOG_CTX = null;
+function fogCanvas(w, h) {
+  if (!FOG_CV) {
+    try {
+      FOG_CV = document.createElement("canvas");
+      FOG_CTX = FOG_CV.getContext("2d");
+    } catch (e) { FOG_CV = null; FOG_CTX = null; }
+  }
+  if (!FOG_CV || !FOG_CTX) return null;
+  if (FOG_CV.width !== w || FOG_CV.height !== h) { FOG_CV.width = w; FOG_CV.height = h; }
+  return { cv: FOG_CV, g: FOG_CTX };
+}
+/* 逐帧更新每只丧尸的可见性：落在任何人类视野锥内、且中间没被实心墙挡住才算"看得见"。
+   每 3 帧算一次就够了，丧尸一秒最多走两百多像素，肉眼看不出差别，省下的开销很值 */
+var _fogOut = [], _fogTick = 0;
+function fogVisUpdate() {
+  var i, j, z, u;
+  var half = CFG.fog.coneDeg * Math.PI / 360;
+  var R = CFG.fog.range;
+  for (i = 0; i < W.units.length; i++) {
+    z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    if (!CFG.fog.on) { z.fogVis = 1; z.fogFade = 1; continue; }
+    z.fogVis = 0;
+    z.fogFade = 1;
+    HUMGRID.query(z.x, z.y, R, _fogOut);
+    for (j = 0; j < _fogOut.length; j++) {
+      u = _fogOut[j];
+      if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+      var dx = z.x - u.x, dy = z.y - u.y;
+      var d = Math.sqrt(dx * dx + dy * dy);
+      if (d > R || d < 1e-3) continue;
+      var nearR = Math.max(120, fearRadiusOf(u) * CFG.fog.nearMul);
+      if (d <= nearR) { z.fogVis = 1; z.fogFade = 1; break; }
+      var ang = Math.atan2(dy, dx);
+      var diff = ang - (u.fogAng === undefined ? u.faceAng : u.fogAng);
+      while (diff > Math.PI) diff -= TAU;
+      while (diff < -Math.PI) diff += TAU;
+      var af = Math.abs(diff);
+      if (af > half) continue;
+      /* 中间挡着实心墙就看不见（矮墙、门不挡，fogRay 用的是 visBlock） */
+      if (fogRay(u.x, u.y, ang, d) < d - 26) continue;
+      z.fogVis = 1;
+      /* 视线正中的渐变长、越靠侧边越硬，正前方柔和地"渐入"，两侧干脆利落地出现 */
+      var center = 1 - af / half;
+      var fd = CFG.fog.fadeSide + (CFG.fog.fadeCenter - CFG.fog.fadeSide) * center;
+      z.fogFade = Math.min(1, Math.max(0.15, (R - d) / fd));
+      break;
+    }
+  }
+}
+/* 从 (x,y) 朝 ang 打一条视线，返回"看得到多远"（撞到实心墙为止） */
+function fogRay(x, y, ang, maxD) {
+  var t = NAV.tile, step = t * 0.55;
+  var dx = Math.cos(ang), dy = Math.sin(ang);
+  var vb = NAV.visBlock;
+  if (!vb) return maxD;
+  var d = step;
+  while (d < maxD) {
+    var gx = (x + dx * d) / t | 0, gy = (y + dy * d) / t | 0;
+    if (gx < 0 || gy < 0 || gx >= NAV.cols || gy >= NAV.rows) return d;
+    if (vb[gy * NAV.cols + gx]) return d;
+    d += step;
+  }
+  return maxD;
+}
+/* 更新并返回这个人类画视野锥用的角度（已量化）。
+   抽成独立函数是为了能单独验证"它到底稳不稳"，从 drawFog 里调不到就只能靠肉眼猜。
+
+   视野朝向：先锁住 0.5 秒，再用很慢的系数跟上。AI 会因为索敌、开火、被击退反复转头，
+   直接跟就会一直闪，这里要表现的是"人的注意力"，不是"枪口" */
+function fogAimAngle(u) {
+  var isPlayer = (PLAYER.on && PLAYER.unit === u && !u.dead);
+  if (isPlayer) {
+    /* 玩家自己操控的人：视野必须实时跟手，一点滞后都会让瞄准变得难受 */
+    u.fogAng = u.faceAng;
+    u.fogLock = u.faceAng;
+    u.fogHold = 0;
+  } else {
+    if (u.fogAng === undefined) { u.fogAng = u.faceAng; u.fogLock = u.faceAng; u.fogHold = 0; }
+    u.fogHold = (u.fogHold || 0) + 1;
+    if (u.fogHold * (1 / 60) >= CFG.fog.turnLock) {
+      u.fogHold = 0;
+      /* 死区：偏得不够多就当没转。没有这一段，AI 在索敌和开火之间来回摆头时，
+         视野锥会被一起拽着摆，屏幕上就是一片闪 */
+      var dz = u.faceAng - u.fogLock;
+      while (dz > Math.PI) dz -= TAU;
+      while (dz < -Math.PI) dz += TAU;
+      if (Math.abs(dz) >= CFG.fog.deadZone) u.fogLock = u.faceAng;
+    }
+    var fd0 = u.fogLock - u.fogAng;
+    while (fd0 > Math.PI) fd0 -= TAU;
+    while (fd0 < -Math.PI) fd0 += TAU;
+    u.fogAng += fd0 * CFG.fog.turnSmooth;
+  }
+  /* 量化到 1° 的格子上：视野锥只在这些离散角度之间跳，
+     不会因为亚像素级的转向抖动让边缘一直颤 */
+  return Math.round(u.fogAng / 0.01745) * 0.01745;
+}
+function drawFog(z) {
+  if (!CFG.fog.on || HIDE_UI) return;
+  var fw = Math.max(2, Math.ceil(VW / 2)), fh = Math.max(2, Math.ceil(VH / 2));
+  var res = fogCanvas(fw, fh);
+  if (!res) return;
+  var g = res.g, cv = res.cv;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  g.globalAlpha = 1;
+  g.clearRect(0, 0, fw, fh);
+  g.fillStyle = "#04060b";
+  g.fillRect(0, 0, fw, fh);
+  g.globalCompositeOperation = "destination-out";
+  var half = (CFG.fog.coneDeg * Math.PI / 180) * 0.5;
+  var i, u, sx, sy, R, grad;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    sx = w2sx(u.x) / 2;
+    sy = w2sy(u.y) / 2;
+    if (sx < -60 || sy < -60 || sx > fw + 60 || sy > fh + 60) continue;
+    /* 视野距离：射程的七八倍，但按屏幕对角线裁剪，屏幕外的部分算了也看不见 */
+    var worldR = Math.min(CFG.fog.range, CFG.far.r * CFG.fog.rangeMul);
+    var screenDiag = Math.sqrt(VW * VW + VH * VH) / Math.max(0.05, z) * 0.62 + 260;
+    if (worldR > screenDiag) worldR = screenDiag;
+    R = worldR * z / 2;
+    if (R < 3) continue;
+
+    var fa = fogAimAngle(u);
+
+    /* 用纯色挖洞，不用径向渐变，
+       渐变一圈一圈叠上去时，重叠区的软边会互相干扰，看起来就是"视野里冒出一块阴影"。
+       纯色挖洞重复多少次都只挖一次，边缘的柔和交给"半分辨率 + 放大"来做 */
+    g.fillStyle = "#000000";
+    var RAYS = 22;
+    g.beginPath();
+    g.moveTo(sx, sy);
+    for (var ri = 0; ri <= RAYS; ri++) {
+      var ra = fa - half + (half * 2) * (ri / RAYS);
+      var hit = fogRay(u.x, u.y, ra, worldR);
+      var px = w2sx(u.x + Math.cos(ra) * hit) / 2;
+      var py = w2sy(u.y + Math.sin(ra) * hit) / 2;
+      g.lineTo(px, py);
+    }
+    g.closePath();
+    g.fill();
+
+    /* 恐惧半径之内是全向感知：不用"看"也知道附近有东西。
+       半径直接取该单位自己的恐惧半径，所以不同兵种感知范围不一样 */
+    var nearW = Math.max(120, fearRadiusOf(u) * CFG.fog.nearMul);
+    var nr = nearW * z / 2;
+    if (nr > 2) {
+      g.beginPath();
+      g.arc(sx, sy, nr, 0, TAU);
+      g.fill();
+    }
+  }
+  g.globalCompositeOperation = "source-over";
+  /* 贴回主画布：固定屏幕坐标，不跟抖动，避免边缘露出亮缝 */
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = CFG.fog.alpha;
+  CTX.imageSmoothingEnabled = true;
+  CTX.drawImage(cv, 0, 0, VW, VH);
+  CTX.globalAlpha = 1;
+}
+function drawMotherShields() {
+  var L = MOTHER_SHIELDS, n = L.length, i;
+  if (!n) return;
+  if (n === 1) {
+    var c = L[0];
+    CTX.globalAlpha = 0.12 + 0.10 * c.k;
+    CTX.fillStyle = "#a8e87a";
+    CTX.beginPath(); CTX.arc(c.x, c.y, c.r, 0, TAU); CTX.fill();
+    CTX.globalAlpha = 1;
+    CTX.strokeStyle = "rgba(168,232,122,.85)";
+    CTX.lineWidth = 2.5;
+    CTX.beginPath(); CTX.arc(c.x, c.y, c.r, 0, TAU); CTX.stroke();
+    CTX.strokeStyle = "rgba(210,255,175,.45)"; CTX.lineWidth = 1;
+    CTX.beginPath(); CTX.arc(c.x, c.y, Math.max(1, c.r - 5), 0, TAU); CTX.stroke();
+    return;
+  }
+  var res = auraCanvas(Math.ceil(VW), Math.ceil(VH));
+  if (!res) {
+    for (i = 0; i < n; i++) {
+      CTX.globalAlpha = 0.08; CTX.fillStyle = "#a8e87a";
+      CTX.beginPath(); CTX.arc(L[i].x, L[i].y, L[i].r, 0, TAU); CTX.fill();
+    }
+    CTX.globalAlpha = 1; return;
+  }
+  var g = res.g, cv = res.cv;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#a8e87a";
+  for (i = 0; i < n; i++) {
+    g.beginPath(); g.arc(L[i].x, L[i].y, L[i].r, 0, TAU); g.fill();
+  }
+  CTX.globalAlpha = 0.09;
+  CTX.drawImage(cv, 0, 0);
+  CTX.globalAlpha = 1;
+  g.globalCompositeOperation = "destination-out";
+  for (i = 0; i < n; i++) {
+    g.beginPath(); g.arc(L[i].x, L[i].y, Math.max(1, L[i].r - 2.6), 0, TAU); g.fill();
+  }
+  g.globalCompositeOperation = "source-over";
+  CTX.globalAlpha = 0.72;
+  CTX.drawImage(cv, 0, 0);
+  CTX.globalAlpha = 1;
+}
+function drawAuraCircles() {
+  var L = AURA_CIRCLES, n = L.length, i;
+  if (!n) return;
+  /* 只有一个圆：直接画，效果最完整 */
+  if (n === 1) {
+    var c0 = L[0];
+    if (c0.dome) {
+      CTX.globalAlpha = 0.10 + 0.14 * c0.k;
+      CTX.fillStyle = "hsl(45,100%,64%)";
+      CTX.beginPath(); CTX.arc(c0.x, c0.y, c0.r, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+      CTX.strokeStyle = "hsla(45,100%," + Math.round(60 + 22 * c0.k) + "%," + (0.45 + 0.45 * c0.k) + ")";
+      CTX.lineWidth = 2.5;
+      CTX.beginPath(); CTX.arc(c0.x, c0.y, c0.r, 0, TAU); CTX.stroke();
+      CTX.strokeStyle = "rgba(255,235,150," + (0.20 + 0.30 * c0.k) + ")";
+      CTX.lineWidth = 1;
+      CTX.beginPath(); CTX.arc(c0.x, c0.y, Math.max(1, c0.r - 4), 0, TAU); CTX.stroke();
+    } else {
+      var k0 = Math.min(1, 1 / Math.sqrt(W.auraCount || 1));
+      CTX.globalAlpha = 0.09 * Math.max(0.3, k0);
+      CTX.fillStyle = "hsl(45,100%,60%)";
+      CTX.beginPath(); CTX.arc(c0.x, c0.y, c0.r, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+      CTX.strokeStyle = "rgba(255,215,90,0.55)";
+      CTX.lineWidth = 2;
+      CTX.beginPath(); CTX.arc(c0.x, c0.y, c0.r, 0, TAU); CTX.stroke();
+    }
+    return;
+  }
+  /* 多个圆：走离屏并集 */
+  var res = auraCanvas(Math.ceil(VW), Math.ceil(VH));
+  if (!res) {   /* 拿不到离屏画布就退回逐个画（至少还能看） */
+    for (i = 0; i < n; i++) {
+      CTX.globalAlpha = 0.08;
+      CTX.fillStyle = "hsl(45,100%,60%)";
+      CTX.beginPath(); CTX.arc(L[i].x, L[i].y, L[i].r, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+    }
+    return;
+  }
+  var g = res.g, cv = res.cv;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  g.clearRect(0, 0, cv.width, cv.height);
+  g.fillStyle = "#ffd75a";
+  for (i = 0; i < n; i++) {
+    g.beginPath();
+    g.arc(L[i].x, L[i].y, L[i].r, 0, TAU);
+    g.fill();
+  }
+  /* ① 填充层：并集实心，一次低 alpha 画上去，重叠区不会加深 */
+  CTX.globalAlpha = 0.06;
+  CTX.drawImage(cv, 0, 0);
+  CTX.globalAlpha = 1;
+  /* ② 轮廓层：并集减去内缩一圈的并集 = 只剩最外轮廓 */
+  g.globalCompositeOperation = "destination-out";
+  for (i = 0; i < n; i++) {
+    g.beginPath();
+    g.arc(L[i].x, L[i].y, Math.max(1, L[i].r - 2.2), 0, TAU);
+    g.fill();
+  }
+  g.globalCompositeOperation = "source-over";
+  CTX.globalAlpha = 0.62;
+  CTX.drawImage(cv, 0, 0);
+  CTX.globalAlpha = 1;
+}
+/* 量文本宽度：拿不到测量结果（某些环境没有 measureText）就按字数估，别让渲染直接崩 */
+var _feedFont = "";
+function feedTextW(s, fs, bold) {
+  var m = null;
+  var font = (bold ? "700 " : "") + fs + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  try {
+    /* 关键：measureText 量的是"当前字体"的宽度。不先把字体设成本行要用的那个，
+       量出来的宽度就是上一次绘制留下的字体，长文本会被算得离谱，导致整行被挤歪 */
+    if (_feedFont !== font) { CTX.font = font; _feedFont = font; }
+    m = CTX.measureText(s);
+  } catch (e) { m = null; }
+  if (m && typeof m.width === "number" && m.width > 0) return m.width;
+  return s.length * fs * 0.62;
+}
+/* CS:GO 风的淘汰播报：右上角一行一条，"谁 [武器] 干掉了谁"，淡出收尾 */
+function drawKillFeed() {
+  if (!W.feed || !W.feed.length || HIDE_UI) return;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  CTX.textAlign = "right";
+  CTX.textBaseline = "middle";
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  var ms = touch ? hudUiScale() : 1;
+  var fs = Math.max(11, Math.round(Math.max(13, Math.min(19, VW * 0.017)) * ms));
+  var rh = fs + (touch ? 10 : 16);
+  var x = VW - (touch ? 10 : 18);
+  /* 右上角上面是增援倒计时（有的话），播报得往下让出它的高度 */
+  var hasTimer = !!(W.reinf && W.reinf.phase >= 1 && W.reinf.phase <= 3);
+  var y0 = (TOPBAR_H || 0) + (hasTimer ? (touch ? 62 : 196) : (touch ? 8 : 64));
+  for (var i = 0; i < W.feed.length; i++) {
+    var f = W.feed[i];
+    var a = Math.min(1, f.t / 0.9);
+    var y = y0 + i * rh;
+    var wK = feedTextW(f.k, fs * 1.06);
+    var wG = feedTextW(" ▸ " + f.gun + " ▸ ", fs);
+    var wV = feedTextW(f.v, fs);
+    var total = wK + wG + wV;
+    var startX = x - total;                   /* 这一行的左端 */
+    var bx = startX - 12;
+    CTX.fillStyle = "rgba(8,10,16," + (0.55 * a) + ")";
+    CTX.fillRect(bx, y - rh / 2 + 2, total + 18, rh - 4);
+    CTX.fillStyle = f.z ? "rgba(230,110,110," + a + ")" : "rgba(120,210,255," + a + ")";
+    CTX.fillRect(bx, y - rh / 2 + 2, 3, rh - 4);
+    /* 从左往右：击杀者 ▸ 武器 ▸ 被击杀者（之前右对齐画反了，读起来像丧尸在开枪） */
+    CTX.textAlign = "left";
+    CTX.fillStyle = f.z ? "rgba(255,150,150," + a + ")" : "rgba(150,225,255," + a + ")";
+    CTX.font = "700 " + fs + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillText(f.k, startX, y);
+    CTX.fillStyle = "rgba(190,205,230," + (0.8 * a) + ")";
+    CTX.font = fs + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillText(" ▸ " + f.gun + " ▸ ", startX + wK, y);
+    CTX.fillStyle = f.big ? "rgba(255,190,120," + a + ")"
+      : (f.z ? "rgba(255,215,190," + a + ")" : "rgba(205,150,255," + a + ")");
+    CTX.font = (f.big ? "700 " : "") + fs + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillText(f.v, startX + wK + wG, y);
+  }
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+
+/* 返回线段与圆的最近交点参数 t∈[0,1]，无交返回 -1 */
+function segCircleT(x0, y0, x1, y1, cx, cy, cr) {
+  var dx = x1 - x0, dy = y1 - y0;
+  var fx = x0 - cx, fy = y0 - cy;
+  var a = dx * dx + dy * dy;
+  if (a < 1e-9) return (fx * fx + fy * fy) <= cr * cr ? 0 : -1;
+  var bq = 2 * (fx * dx + fy * dy);
+  var c = fx * fx + fy * fy - cr * cr;
+  var disc = bq * bq - 4 * a * c;
+  if (disc < 0) return -1;
+  disc = Math.sqrt(disc);
+  var t1 = (-bq - disc) / (2 * a), t2 = (-bq + disc) / (2 * a);
+  if (t1 >= 0 && t1 <= 1) return t1;
+  if (t2 >= 0 && t2 <= 1) return t2;
+  if (t1 < 0 && t2 > 1) return 0;
+  return -1;
+}
+/* 线段上最近的一只丧尸（高速子弹必须按最近命中点结算，否则会穿过前排打到后排） */
+/* 取线段上最近的一只丧尸；bid 用于排除本发子弹已经打过的目标（穿透时避免反复打同一个） */
+/* 母体能量盾：普通子弹先撞盾，狙击/连锁/激光/喷火按各自机制绕过 */
+function firstMotherShieldOnSegment(x0, y0, x1, y1) {
+  var best = null, bt = Infinity;
+  for (var i = 0; i < W.units.length; i++) {
+    var m = W.units[i];
+    if (m.dead || m.kind !== "mother" || !(m.energyShieldHp > 0)) continue;
+    var t = segCircleT(x0, y0, x1, y1, m.x, m.y, m.r * 4);
+    if (t >= 0 && t < bt) { bt = t; best = m; }
+  }
+  return best;
+}
+function firstZombieOnSegment(x0, y0, x1, y1, bid, pad) {
+  ALLGRID.queryBox(x0, y0, x1, y1, _qb);
+  var best = null, bestT = Infinity, i, v, t;
+  var extra = pad || 0;
+  for (i = 0; i < _qb.length; i++) {
+    v = _qb[i];
+    if (v.dead || !isZombieSide(v)) continue;
+    if (bid && v.hitBy === bid) continue;
+    t = segCircleT(x0, y0, x1, y1, v.x, v.y, v.r + extra);
+    if (t >= 0 && t < bestT) { bestT = t; best = v; }
+  }
+  return best;
+}
+/* 线段是否被实心墙挡住（矮墙不挡子弹） */
+function segBlockedByWall(x0, y0, x1, y1) {
+  var obs = W.obstacles;
+  var minx = Math.min(x0, x1), maxx = Math.max(x0, x1);
+  var miny = Math.min(y0, y1), maxy = Math.max(y0, y1);
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (o.kind === "low") continue;
+    /* 枪口本身就贴在这堵墙里（贴着掩体射击）时忽略它，否则整条弹道会被自己的掩体吃掉 */
+    if (x0 >= o.x && x0 <= o.x + o.w && y0 >= o.y && y0 <= o.y + o.h) continue;
+    if (o.x > maxx || o.x + o.w < minx || o.y > maxy || o.y + o.h < miny) continue;
+    var dx = x1 - x0, dy = y1 - y0, t0 = 0, t1 = 1;
+    if (Math.abs(dx) < 1e-9) {
+      if (x0 < o.x || x0 > o.x + o.w) continue;
+    } else {
+      var tx0 = (o.x - x0) / dx, tx1 = (o.x + o.w - x0) / dx, tmp;
+      if (tx0 > tx1) { tmp = tx0; tx0 = tx1; tx1 = tmp; }
+      if (tx0 > t0) t0 = tx0;
+      if (tx1 < t1) t1 = tx1;
+    }
+    if (Math.abs(dy) < 1e-9) {
+      if (y0 < o.y || y0 > o.y + o.h) continue;
+    } else {
+      var ty0 = (o.y - y0) / dy, ty1 = (o.y + o.h - y0) / dy, tmp2;
+      if (ty0 > ty1) { tmp2 = ty0; ty0 = ty1; ty1 = tmp2; }
+      if (ty0 > t0) t0 = ty0;
+      if (ty1 < t1) t1 = ty1;
+    }
+    if (t0 <= t1) return true;
+  }
+  return false;
+}
+/* 统计线段穿过的实体墙数量（矮墙不算），狙击弹据此判断能否穿墙命中 */
+function hitWallsOnSegment(x0, y0, x1, y1, dmg) {
+  var obs = W.obstacles, cnt = 0, destroyed = false, hitGroups = {};
+  var minx = Math.min(x0, x1), maxx = Math.max(x0, x1);
+  var miny = Math.min(y0, y1), maxy = Math.max(y0, y1);
+  for (var i = obs.length - 1; i >= 0; i--) {
+    var o = obs[i];
+    if (!o) continue;
+    if (o.kind === "low") continue;
+    if (o.x > maxx || o.x + o.w < minx || o.y > maxy || o.y + o.h < miny) continue;
+    if (x0 >= o.x && x0 <= o.x + o.w && y0 >= o.y && y0 <= o.y + o.h) continue;
+    var dx = x1 - x0, dy = y1 - y0, t0 = 0, t1 = 1, tx0, tx1, ty0, ty1, tmp;
+    if (Math.abs(dx) < 1e-9) { if (x0 < o.x || x0 > o.x + o.w) continue; }
+    else {
+      tx0 = (o.x - x0) / dx; tx1 = (o.x + o.w - x0) / dx;
+      if (tx0 > tx1) { tmp = tx0; tx0 = tx1; tx1 = tmp; }
+      if (tx0 > t0) t0 = tx0; if (tx1 < t1) t1 = tx1;
+    }
+    if (Math.abs(dy) < 1e-9) { if (y0 < o.y || y0 > o.y + o.h) continue; }
+    else {
+      ty0 = (o.y - y0) / dy; ty1 = (o.y + o.h - y0) / dy;
+      if (ty0 > ty1) { tmp = ty0; ty0 = ty1; ty1 = tmp; }
+      if (ty0 > t0) t0 = ty0; if (ty1 < t1) t1 = ty1;
+    }
+    if (t0 > t1) continue;
+    if (o.destructible) {
+      /* 相连同类地块共用血量：一次命中只结算一次，整组一起扣 */
+      if (o.tile && o.group) {
+        if (hitGroups[o.group]) { if (o.hp > 0) cnt++; continue; }
+        hitGroups[o.group] = 1;
+        var nh = o.hp - (dmg || 0);
+        if (nh < 0) nh = 0;
+        if (W.tiles) {
+          for (var tg = W.tiles.length - 1; tg >= 0; tg--) {
+            if (W.tiles[tg].group === o.group) {
+              W.tiles[tg].hp = nh;
+              if (nh <= 0) W.tiles.splice(tg, 1);
+            }
+          }
+        }
+        for (var og = obs.length - 1; og >= 0; og--) {
+          if (obs[og].group === o.group) {
+            obs[og].hp = nh;
+            if (nh <= 0) { obs.splice(og, 1); destroyed = true; }
+          }
+        }
+        if (nh > 0) cnt++;
+        continue;
+      }
+      o.hp -= (dmg || 0);
+      if (o.tile && W.tiles) {
+        for (var ti2 = 0; ti2 < W.tiles.length; ti2++) {
+          var tl2 = W.tiles[ti2];
+          if (tl2.x === o.x && tl2.y === o.y && tl2.w === o.w && tl2.h === o.h) {
+            tl2.hp = Math.max(0, o.hp);
+            if (o.hp <= 0) { W.tiles.splice(ti2, 1); }
+            break;
+          }
+        }
+      }
+      if (o.hp <= 0) { obs.splice(i, 1); destroyed = true; continue; }
+    }
+    cnt++;
+  }
+  if (destroyed) { NAV.build(CFG.world, W.obstacles, 9); if (typeof rebuildGrids === "function") rebuildGrids(); }
+  return cnt;
+}
+function countWallsOnSegment(x0, y0, x1, y1) {
+  var obs = W.obstacles, cnt = 0;
+  var minx = Math.min(x0, x1), maxx = Math.max(x0, x1);
+  var miny = Math.min(y0, y1), maxy = Math.max(y0, y1);
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (o.kind === "low") continue;
+    if (o.x > maxx || o.x + o.w < minx || o.y > maxy || o.y + o.h < miny) continue;
+    if (x0 >= o.x && x0 <= o.x + o.w && y0 >= o.y && y0 <= o.y + o.h) continue;
+    var dx = x1 - x0, dy = y1 - y0, t0 = 0, t1 = 1;
+    if (Math.abs(dx) < 1e-9) {
+      if (x0 < o.x || x0 > o.x + o.w) continue;
+    } else {
+      var tx0 = (o.x - x0) / dx, tx1 = (o.x + o.w - x0) / dx, tmp;
+      if (tx0 > tx1) { tmp = tx0; tx0 = tx1; tx1 = tmp; }
+      if (tx0 > t0) t0 = tx0;
+      if (tx1 < t1) t1 = tx1;
+    }
+    if (Math.abs(dy) < 1e-9) {
+      if (y0 < o.y || y0 > o.y + o.h) continue;
+    } else {
+      var ty0 = (o.y - y0) / dy, ty1 = (o.y + o.h - y0) / dy, tmp2;
+      if (ty0 > ty1) { tmp2 = ty0; ty0 = ty1; ty1 = tmp2; }
+      if (ty0 > t0) t0 = ty0;
+      if (ty1 < t1) t1 = ty1;
+    }
+    if (t0 <= t1) cnt++;
+  }
+  return cnt;
+}
+function stepHolds(dt) {
+  if (!W.holds || !W.holds.length) return;
+  for (var i = 0; i < W.holds.length; i++) {
+    var h = W.holds[i];
+    var hx = h.x + h.w / 2, hy = h.y + h.h / 2, r = h.r || 80;
+    var humans = 0, zombs = 0;
+    for (var j = 0; j < W.units.length; j++) {
+      var u = W.units[j];
+      if (u.dead) continue;
+      if (dist2(hx, hy, u.x, u.y) > r * r) continue;
+      if (isZombieSide(u)) zombs++; else humans++;
+    }
+    if (humans > 0 && zombs === 0) {
+      h.prog = Math.min(3, (h.prog || 0) + dt);
+      if (h.prog >= 3) h.owner = "human";
+    } else if (zombs > 0 && humans === 0) {
+      h.prog = Math.max(-3, (h.prog || 0) - dt);
+      if (h.prog <= -3) h.owner = "zombie";
+    } else if (humans > 0 && zombs > 0) {
+      /* 争夺中：进度缓慢回零 */
+      if (h.prog > 0) h.prog = Math.max(0, h.prog - dt * 0.5);
+      else if (h.prog < 0) h.prog = Math.min(0, h.prog + dt * 0.5);
+    }
+    if (h.owner === "human") W.resources = Math.min(CFG.econ.cap, W.resources + 2 * dt);
+  }
+}
+function stepSpawners(dt) {
+  if (!W.spawners || !W.spawners.length || W.over) return;
+  for (var i = 0; i < W.spawners.length; i++) {
+    var s = W.spawners[i];
+    if (s.limit > 0 && s.count >= s.limit) continue;
+    s.t = (s.t || 0) + dt;
+    while (s.t >= s.interval && (s.limit <= 0 || s.count < s.limit)) {
+      s.t -= s.interval;
+      var x = s.x + RNG.range(4, Math.max(5, s.w - 4));
+      var y = s.y + RNG.range(4, Math.max(5, s.h - 4));
+      var z = addUnit(s.kind || "zombie", x, y);
+      if (z) s.count = (s.count || 0) + 1;
+    }
+  }
+}
+function stepZones(dt) {
+  if ((!W.zones || !W.zones.length) && (!W.tiles || !W.tiles.length)) return;
+  W.zoneT = (W.zoneT || 0) + dt;
+  var applyDmg = false;
+  if (W.zoneT >= 0.5) { W.zoneT = 0; applyDmg = true; }
+  for (var i = 0; i < W.zones.length; i++) {
+    var z = W.zones[i];
+    if (z.type === "slow") {
+      for (var j = 0; j < W.units.length; j++) {
+        var u = W.units[j];
+        if (u.dead) continue;
+        if (u.x < z.x || u.x > z.x + z.w || u.y < z.y || u.y > z.y + z.h) continue;
+        var k = Math.max(0, 1 - (z.slow || 0.35) * dt * 2.2);
+        u.vx *= k; u.vy *= k;
+      }
+    } else if (z.type === "burn" && applyDmg) {
+      for (var m = 0; m < W.units.length; m++) {
+        var v = W.units[m];
+        if (v.dead || !isZombieSide(v)) continue;
+        if (v.x < z.x || v.x > z.x + z.w || v.y < z.y || v.y > z.y + z.h) continue;
+        damageZombie(v, (z.dps || 4) * 0.5, null);
+      }
+    }
+  }
+  if (W.tiles) {
+    for (var ti = 0; ti < W.tiles.length; ti++) {
+      var tl = W.tiles[ti];
+      if (!tl.slow && !tl.dps) continue;
+      for (var tj = 0; tj < W.units.length; tj++) {
+        var tu = W.units[tj];
+        if (tu.dead) continue;
+        if (tu.x < tl.x || tu.x > tl.x + tl.w || tu.y < tl.y || tu.y > tl.y + tl.h) continue;
+        if (tl.slow) { var tk = Math.max(0, 1 - tl.slow * dt * 2.2); tu.vx *= tk; tu.vy *= tk; }
+        if (tl.dps && applyDmg && isZombieSide(tu)) damageZombie(tu, tl.dps * 0.5, null);
+      }
+    }
+  }
+}
+function stepBullets(dt) {
+  var arr = W.bullets;
+  if (!W.bulletDrop) W.bulletDrop = {};
+  for (var i = arr.length - 1; i >= 0; i--) {
+    var b = arr[i];
+    b.px = b.x; b.py = b.y;
+    b.x += b.vx * dt; b.y += b.vy * dt;
+    b.life -= dt;
+    var kill = false, drop = "";
+    if (b.life <= 0 || b.x < -300 || b.y < -300 || b.x > CFG.world.w + 300 || b.y > CFG.world.h + 300) {
+      kill = true; drop = b.life <= 0 ? "life" : "off";
+    } else {
+      /* 狙击弹留下会在一秒内消散的尾迹 */
+      if (b.snipe && W.trails.length < 420) {
+        W.trails.push({ x0: b.px, y0: b.py, x1: b.x, y1: b.y,
+          life: CFG.sniper.trailLife, max: CFG.sniper.trailLife, wmul: b.wmul || 1 });
+      }
+      /* 舌头也能被打掉：把它当成一条细线段来判命中 */
+      if (!kill && W.tongues && W.tongues.length) {
+        for (var ti = 0; ti < W.tongues.length; ti++) {
+          var tq2 = W.tongues[ti];
+          if (tq2.dead) continue;
+          var tEndX = tq2.owner.x + Math.cos(tq2.ang) * tq2.len;
+          var tEndY = tq2.owner.y + Math.sin(tq2.ang) * tq2.len;
+          var tt = segCircleT(b.px, b.py, b.x, b.y, (tq2.owner.x + tEndX) / 2, (tq2.owner.y + tEndY) / 2,
+            tq2.len / 2 + 6);
+          if (tt >= 0) {
+            tq2.hp -= b.dmg;
+            kill = true;
+            if (tq2.hp <= 0) breakTongue(tq2);
+            drop = "tongue";
+            break;
+          }
+        }
+      }
+      /* 墙体：普通弹撞墙即停；狙击弹可以穿过有限堵墙 */
+      var walls = hitWallsOnSegment(b.px, b.py, b.x, b.y, b.dmg);
+      if (walls > 0) {
+        b.wallPierce = (b.wallPierce || 0) - walls;
+        if (b.wallPierce < 0) { kill = true; drop = "wall"; addShock(b.x, b.y, 9, "rgba(255,205,135,.9)", 0.12); }
+      }
+      if (!kill) {
+        var mShield = (!b.snipe) ? firstMotherShieldOnSegment(b.px, b.py, b.x, b.y) : null;
+        if (mShield) {
+          mShield.energyShieldHp = Math.max(0, mShield.energyShieldHp - b.dmg);
+          if (mShield.energyShieldHp <= 0) mShield.energyShieldMax = 0;
+          kill = true; drop = "shield"; addShock(b.x, b.y, 11, "rgba(130,215,255,.9)", 0.14);
+        }
+        if (!mShield) {
+        var hits = 0, cap, budget;
+        var hitPad = b.snipe ? (CFG.bullet.width * CFG.sniper.widthMul * CFG.sniper.hitRMul) : 0;
+        if (b.snipe) { cap = 100000; budget = 100000; }          /* 狙击弹：对丧尸无限穿透 */
+        else if (b.chain) { cap = CFG.mg.maxHits; budget = CFG.mg.hits; }
+        else { cap = 1 + CFG.bullet.pierce; budget = cap; }
+        while (budget > 0 && hits < cap) {
+          var v = firstZombieOnSegment(b.px, b.py, b.x, b.y, b.bid, hitPad);
+          if (!v) break;
+          var lethal = v.hp - b.dmg <= 0;
+          v.hitBy = b.bid;             /* 本发子弹不再重复打它 */
+          damageZombie(v, b.dmg, b.owner);
+          hits++; budget--;
+          if (!b.snipe) { kill = true; drop = "zombie"; }   /* 狙击弹命中后继续飞，其余子弹命中即止 */
+          /* 机枪弹：不要求致死即可穿透；穿掉的单位里出现击杀就再追加一次穿透 */
+          if (b.chain) { if (lethal) budget++; }
+          else if (!b.snipe && !lethal) break;
+        }
+        }
+      }
+    }
+    if (kill) {
+      W.bulletDrop[drop || "other"] = (W.bulletDrop[drop || "other"] || 0) + 1;
+      arr[i] = arr[arr.length - 1]; arr.pop();
+    }
+  }
+  /* 冲击波寿命 */
+  var sks = W.shocks;
+  for (var sq = sks.length - 1; sq >= 0; sq--) {
+    sks[sq].life -= dt;
+    if (sks[sq].life <= 0) { sks[sq] = sks[sks.length - 1]; sks.pop(); }
+  }
+  /* 尾迹寿命：一秒内渐变消散 */
+  var trs = W.trails;
+  for (var tq = trs.length - 1; tq >= 0; tq--) {
+    trs[tq].life -= dt;
+    if (trs[tq].life <= 0) { trs[tq] = trs[trs.length - 1]; trs.pop(); }
+  }
+  /* 开火特效寿命 */
+  var fl = W.flashes;
+  for (var f = fl.length - 1; f >= 0; f--) {
+    fl[f].life -= dt;
+    if (fl[f].life <= 0) { fl[f] = fl[fl.length - 1]; fl.pop(); }
+  }
+}
+/* --------------------------- 10. 感染与转化 ------------------------------ */
+/* 把一次冲击位移拆成小步推进，每一步都做一次碰撞解析。
+   直接改 x/y 一次性推过去是不行的：一百多像素的位移会跨过二十像素厚的墙，
+   落点已经在墙的另一侧，collideObstacles 的 AABB 快速排除直接跳过它，这就是穿墙的来源 */
+function pushUnit(v, dx, dy) {
+  var total = Math.sqrt(dx * dx + dy * dy);
+  if (total < 1e-9) return;
+  var n = Math.max(1, Math.ceil(total / (CFG.shield.blastStep || 6)));
+  var sx = dx / n, sy = dy / n;
+  for (var i = 0; i < n; i++) {
+    v.prevX = v.x; v.prevY = v.y;   /* 分段推进时"上一步位置"就是判断该往哪边弹的依据 */
+    v.x += sx; v.y += sy;
+    collideObstacles(v);
+  }
+}
+/* 冲击波除了把单位推走，还给一个朝外的初速度并让它短暂失控，
+   被炸飞的东西不会当场钉在原地。初速度被速度余量卡着上限，
+   "失控"也只是自己使不上劲，所以滑得动但飞不远 */
+function blastInertia(v, nx, ny) {
+  if (v.kind === "nestEgg") return;
+  var spd = CFG.shield.blastVel * controlMulOf(v);
+  v.vx = nx * spd; v.vy = ny * spd;
+  v.stunT = controlDurOf(v, CFG.shield.stunT);
+  var extra = Math.max(0, spd - v.vmaxCur);
+  if (extra > v.vmaxBoost) v.vmaxBoost = extra;
+  v.boostT = Math.max(v.boostT, controlDurOf(v, CFG.shield.stunT));
+}
+/* 金光冲击波：英雄升格那一下，把恐惧范围内的丧尸震开并打伤 */
+function heroShockwave(u) {
+  /* 半径按该单位自己的恐惧半径放大，平民的恐惧半径本来就比武装大，放大后更夸张 */
+  var R = Math.max(CFG.fearR, fearRadiusOf(u) || 0) * CFG.hero.shockR;
+  ZGRID.query(u.x, u.y, R + 20, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombie(v)) continue;
+    var dx = v.x - u.x, dy = v.y - u.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var dd0 = Math.max(0, d - (v.r || 0));
+    if (dd0 > R || d < 1e-6) continue;
+    var k = 1 - dd0 / R;
+    var push = CFG.hero.shockPush * (0.35 + 0.65 * k);
+    blastKnock(v, dx / d * push, dy / d * push, push, CFG.hero.shockDmg);
+    if (v.dead) continue;
+    blastInertia(v, dx / d, dy / d);
+    if (v.pounceT > 0) v.pounceT = 0;
+    if (v.hot !== 1) { v.locked = 0; v.attacker = null; v.target = null; }
+  }
+  addShock(u.x, u.y, R, "rgba(255,215,90,1)");
+  SFX.blast(u.x, u.y);
+}
+/* 从地图一角洪泛，把所有"可通行却走不到"的格子找出来，
+   再把落在这些格子上的障碍物整块删掉，直到全图连通 */
+function punchOutPockets() {
+  var cols = NAV.cols, rows = NAV.rows, n = cols * rows, i;
+  if (!n) return 0;
+  var seen = new Uint8Array(n), stack = [];
+  var start = -1;
+  for (i = 0; i < n; i++) if (!NAV.blocked[i]) { start = i; break; }
+  if (start < 0) return 0;
+  seen[start] = 1; stack.push(start);
+  while (stack.length) {
+    var cur = stack.pop();
+    var cx = cur % cols, cy = (cur - cx) / cols;
+    var l, r, up, dn;
+    if (cx > 0) { l = cur - 1; if (!NAV.blocked[l] && !seen[l]) { seen[l] = 1; stack.push(l); } }
+    if (cx < cols - 1) { r = cur + 1; if (!NAV.blocked[r] && !seen[r]) { seen[r] = 1; stack.push(r); } }
+    if (cy > 0) { up = cur - cols; if (!NAV.blocked[up] && !seen[up]) { seen[up] = 1; stack.push(up); } }
+    if (cy < rows - 1) { dn = cur + cols; if (!NAV.blocked[dn] && !seen[dn]) { seen[dn] = 1; stack.push(dn); } }
+  }
+  var pocket = [];
+  for (i = 0; i < n; i++) if (!NAV.blocked[i] && !seen[i]) pocket.push(i);
+  if (!pocket.length) return 0;
+  /* 被困格子本身是可通行的，上面当然没有障碍，
+     真正堵路的是围在它们外圈的那些墙，所以要连邻域一起看 */
+  var tile = NAV.tile, keep = [], ring = [];
+  for (i = 0; i < pocket.length; i++) {
+    var pp = pocket[i];
+    var ppx = pp % cols, ppy = (pp - ppx) / cols;
+    for (var oy = -1; oy <= 1; oy++) {
+      for (var ox = -1; ox <= 1; ox++) {
+        var qx = ppx + ox, qy = ppy + oy;
+        if (qx < 0 || qy < 0 || qx >= cols || qy >= rows) continue;
+        ring.push(qy * cols + qx);
+      }
+    }
+  }
+  for (i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    var x0 = Math.floor(o.x / tile), x1 = Math.floor((o.x + o.w) / tile);
+    var y0 = Math.floor(o.y / tile), y1 = Math.floor((o.y + o.h) / tile);
+    var hit = false;
+    for (var j = 0; j < ring.length; j++) {
+      var rg = ring[j];
+      var rx = rg % cols, ry = (rg - rx) / cols;
+      if (rx >= x0 && rx <= x1 && ry >= y0 && ry <= y1) { hit = true; break; }
+    }
+    if (!hit) keep.push(o);
+  }
+  W.obstacles = keep;
+  NAV.build(CFG.world, W.obstacles, 9);
+  return pocket.length;
+}
+/* 某兵种主武器在远射模式下的规格，供英雄的附加武器复制 */
+function baseGunOf(kind) {
+  var cu = CFG.unit[kind];
+  if (cu && cu.gun) {
+    var cg = cu.gun;
+    return { interval: cg.interval, dmg: cg.dmg, mag: cg.mag, r: cg.r,
+             wmul: cg.widthMul || 1, spread: cg.spreadDeg || 0,
+             chain: !!cg.chain, snipe: !!cg.snipe };
+  }
+  if (kind === "mg") {
+    return { interval: CFG.mg.interval, dmg: CFG.mg.dmg, mag: CFG.mg.mag,
+             r: CFG.mg.r, wmul: CFG.mg.widthMul, spread: CFG.mg.spreadDeg, chain: true };
+  }
+  if (kind === "sniper") {
+    return { interval: CFG.sniper.interval, dmg: CFG.sniper.dmg, mag: CFG.sniper.mag,
+             r: CFG.sniper.r, wmul: CFG.sniper.widthMul, spread: 0, snipe: true };
+  }
+  if (kind === "shield") {
+    return { interval: CFG.pistol.interval, dmg: CFG.pistol.dmg, mag: 12,
+             r: CFG.pistol.r, wmul: 1, spread: CFG.pistol.spreadDeg };
+  }
+  return { interval: CFG.far.interval, dmg: CFG.far.dmg, mag: CFG.far.mag,
+           r: CFG.far.r, wmul: 1, spread: 0 };
+}
+/* 盾兵英雄的能量防护罩：贴身的丧尸会磨损它，脱离接触十秒后按比例慢慢回满 */
+function stepDome(u, dt) {
+  /* 破裂之后不看有没有接触，固定等够时间就重新撑起来 */
+  if (!u.domeOn) {
+    if (u.domeDownT > 0) {
+      u.domeDownT -= dt;
+      if (u.domeDownT <= 0) {
+        u.domeDownT = 0;
+        u.domeHp = CFG.shield.domeHp;
+        u.domeNext = u.domeHp * (1 - CFG.shield.pulseStep);
+        u.domeIdle = 0;
+        u.domeOn = true;
+        addShock(u.x, u.y, CFG.fearRCivilian, "rgba(255,215,90,1)");
+      }
+    }
+    return;
+  }
+  var R = CFG.fearRCivilian;
+  var touched = false, k, v;
+  ZGRID.query(u.x, u.y, R + 30, _qb);
+  for (k = 0; k < _qb.length; k++) {
+    v = _qb[k];
+    if (v.dead || !isZombie(v)) continue;
+    if (dist2(u.x, u.y, v.x, v.y) <= (R + v.r) * (R + v.r)) { touched = true; break; }
+  }
+  if (touched) {
+    u.domeIdle = 0;
+    u.domeHp -= dt;
+    if (u.domeHp <= u.domeNext) {
+      u.domeNext -= CFG.shield.domeHp * CFG.shield.pulseStep;
+      /* 每掉一档就震一次：伤害 4，范围是平民恐惧半径的 200% */
+      shieldPulse(u, CFG.fearRCivilian * CFG.hero.shockR, CFG.shield.domeDmg, CFG.shield.blastPush);
+    }
+    if (u.domeHp <= 0) {
+      u.domeHp = 0; u.domeOn = false;
+      u.domeDownT = CFG.shield.domeRestore;   /* 破裂后固定等这么久重新撑起 */
+      addShock(u.x, u.y, R, "rgba(255,215,90,1)");
+    }
+  } else {
+    u.domeIdle += dt;
+    if (u.domeIdle >= CFG.shield.domeRegen && u.domeHp < CFG.shield.domeHp) {
+      /* 等比恢复：大约六秒补满 */
+      u.domeHp = Math.min(CFG.shield.domeHp, u.domeHp + CFG.shield.domeHp * dt / 6);
+      if (u.domeHp >= CFG.shield.domeHp) u.domeNext = u.domeHp * (1 - CFG.shield.pulseStep);
+    }
+  }
+}
+/* 两名英雄是否已经凑进彼此的恐惧半径，到了就该各干各的活了 */
+function heroPairSettled(u) {
+  if (!W.heroDuo) return false;
+  var mate = (u === W.heroDuo.a) ? W.heroDuo.b : W.heroDuo.a;
+  if (!mate || mate.dead) return false;
+  var rr = Math.max(CFG.fearR, fearRadiusOf(u) || 0);
+  return dist2(u.x, u.y, mate.x, mate.y) <= rr * rr;
+}
+function pickHeroLine() {
+  var L = CFG.hero.lines;
+  return L[RNG.int(0, L.length - 1)];
+}
+/* 升格：体积变大、罩上金光、发一圈冲击波、披上防护服、头顶弹出金字 */
+function promoteHero(u, kind, quiet) {
+  if (u.hero) return;
+  var militiaHero = (u.kind === "militia");
+  u.hero = militiaHero ? "militia" : kind;
+  u.r = CFG.unit[u.kind].r * CFG.hero.sizeMul;
+  u.suitHp = CFG.hero.suitTime * (militiaHero ? 2 : 1);
+  u.suitBroken = false;
+  if (militiaHero) {
+    u.vmax *= CFG.hero.civSpeedMul;
+    u.vmaxCur = u.vmax;
+    u.magSize = magOf("militia") * 3;
+    u.mag = u.magSize;
+    u.reloading = false; u.reloadT = 0;
+  } else if (kind === "armed" && u.kind === "shield") {
+    /* 盾兵英雄不拿枪，改撑一面只挡丧尸的能量防护罩 */
+    u.domeHp = CFG.shield.domeHp;
+    u.domeNext = u.domeHp * (1 - CFG.shield.pulseStep);
+    u.domeIdle = 0;
+    u.domeOn = true;            /* 升格那一刻护罩就直接撑起来 */
+    u.domeDownT = 0;
+  } else if (u.kind === "medic") {
+    /* 医疗兵升格不挂额外的枪，他本来就只有一把治疗枪。
+       改成把弹匣扩到三倍、一次能锁的目标数也扩到三倍，
+       一发齐射就能照顾到整片战场，而不是多出一把谁也看不见的枪 */
+    u.magSize = CFG.medic.mag * CFG.hero.medicMagMul;
+    u.mag = u.magSize;
+    u.reloading = false;
+    u.reloadT = 0;
+  } else if (kind === "armed" && !isNewKind(u.kind)) {
+    /* 附加武器就是他自己那把枪的复制品，只把攻速拨快/拨慢一点。
+       1.3.3 的四个新兵种不走这条：它们升格后改的是各自武器的形状/范围，
+       额外再发两把枪既没意义也会把数值搅乱 */
+    var base = baseGunOf(u.kind);
+    u.guns = [];
+    for (var gi = 0; gi < CFG.hero.guns.length; gi++) {
+      u.guns.push({
+        mag: base.mag, magSize: base.mag,
+        interval: base.interval * CFG.hero.guns[gi],
+        dmg: base.dmg, r: base.r, wmul: base.wmul,
+        spread: base.spread, chain: base.chain, snipe: base.snipe,
+        t: 0
+      });
+    }
+  } else {
+    /* 平民英雄跑得更快 */
+    u.vmax *= CFG.hero.civSpeedMul;
+    u.vmaxCur = u.vmax;
+  }
+  /* quiet：批量升格（比如帝皇特使降临）时不逐个放特效，
+     几十个人同时各炸一圈光波、各顶一行金字，屏幕就彻底糊了。
+     调用方负责统一放一次大特效 */
+  if (quiet) return;
+  heroShockwave(u);
+  W.heroTexts.push({ u: u, text: pickHeroLine(), t: CFG.hero.textLife, max: CFG.hero.textLife });
+  toast((kind === "armed" ? "最后一名武装单位" : "最后一名平民") + "升格为英雄！");
+}
+/* ============================================================================
+   波次来袭（防线模式）：开局不再一次性铺满丧尸，
+   而是按玩家设定的首波延迟、间隔、每波数量与波次总数分批从出生区涌入。
+   每一波的兵种混编直接沿用底栏「投放」那一套规则。
+   ============================================================================ */
+function startWaves() {
+  if (START.bossWave && (START.waveCount | 0) < (START.bossEvery | 0 || 10)) START.waveCount = START.bossEvery | 0 || 10;
+  W.waves = {
+    left: START.waveCount | 0 || 5,
+    gap: START.waveGap || 45,
+    size: START.waveSize || 40,
+    scale: !!START.waveScale,
+    doubleBoss: !!START.doubleBoss,
+    t: START.waveFirst || 30,
+    idx: 0,
+    bossWave: !!START.bossWave,
+    bossEvery: START.bossEvery | 0 || 10,
+    /* 本波放出去的单位。全死光就不再干等间隔，立刻召唤下一波 */
+    batch: [],
+    chk: 0.25
+  };
+  if (CFG.mapPreset === "port") {
+    var pw = CFG.portWave || {};
+    W.waves.gap = Math.max(20, Math.round(W.waves.gap * (pw.gapMul || 0.72)));
+    W.waves.size = Math.max(1, Math.round(W.waves.size * (pw.sizeMul || 1.12)));
+    W.waves.t = Math.min(W.waves.t, pw.firstMax || 22);
+  }
+}
+/* 一波的生成规则与「投放」按钮完全一致：
+   普通丧尸 : 奔跑者 = 20 : 1，另外每 81 只额外掺一只母体 */
+function spawnWaveBatch(zone, want, w) {
+  var room = CFG.caps.zombies - countUnits().z;
+  if (room <= 0) return 0;
+  var n = Math.min(want, room);
+  if (n <= 0) return 0;
+  var i, nu;
+  var bag = (w && w.batch) ? w.batch : null;
+  for (i = 0; i < n; i++) {
+    var zk = pickZombieKind();
+    nu = addUnit(zk, RNG.range(zone.x, zone.x + zone.w), RNG.range(zone.y, zone.y + zone.h));
+    if (bag) bag.push(nu);
+  }
+  var momN = Math.floor(n / 81);
+  for (i = 0; i < momN; i++) {
+    nu = addUnit("mother", RNG.range(zone.x, zone.x + zone.w), RNG.range(zone.y, zone.y + zone.h));
+    if (bag) bag.push(nu);
+  }
+  return n;
+}
+function recordBossPick(k) {
+  if (!W.bossStats) return;
+  if (!W.bossStats.bossPickHistory) W.bossStats.bossPickHistory = [];
+  W.bossStats.bossPickHistory.push(k);
+  if (W.bossStats.bossPickHistory.length > 12) W.bossStats.bossPickHistory.shift();
+}
+function pickBossKindExcept(exclude) {
+  var pool = (CFG.bossPool || []).filter(function (k) { return k !== exclude; });
+  if (!pool.length) return exclude || "plagueNest";
+  var k2 = pool[Math.floor(RNG.next() * pool.length)];
+  recordBossPick(k2);
+  return k2;
+}
+function pickBossKind() {
+  var pool = CFG.bossPool || [];
+  if (!pool.length) return "plagueNest";
+  var hist = (W.bossStats && W.bossStats.bossPickHistory) || [];
+  var last = hist[hist.length - 1], prev = hist[hist.length - 2];
+  var choices = pool;
+  if (last && prev && last === prev) {
+    choices = pool.filter(function (k) { return k !== last; });
+    if (!choices.length) choices = pool;
+  }
+  var k = choices[Math.floor(RNG.next() * choices.length)];
+  recordBossPick(k);
+  return k;
+}
+function spawnEventWave(zone, w, kind, count) {
+  var prof = (CFG.waveEvent.profiles && CFG.waveEvent.profiles[kind]) || { share: 0.2, countMul: 1 };
+  var room = Math.max(0, CFG.caps.zombies - countUnits().z);
+  var total = Math.min(room, Math.round(count * (prof.countMul || 1)));
+  var adv = Math.round(total * (prof.share || 0.2));
+  if (kind === "licker") adv = Math.min(prof.max || 5, adv);
+  var n = 0;
+  for (var i = 0; i < total; i++) {
+    var zk = i < adv ? kind : (RNG.next() < 0.22 ? "runner" : "zombie");
+    var u = addUnit(zk, RNG.range(zone.x, zone.x + zone.w), RNG.range(zone.y, zone.y + zone.h));
+    if (u) { w.batch.push(u); n++; }
+  }
+  return n;
+}
+function stepWaves(dt) {
+  var w = W.waves;
+  if (!w || w.left <= 0) return;
+  /* 本波放出去的丧尸已经全部被清掉，不干等间隔，直接召唤下一波。
+     0.25 秒查一次就够，不必每帧把整波扫一遍 */
+  if (w.batch && w.batch.length) {
+    w.chk = (w.chk || 0) - dt;
+    if (w.chk <= 0) {
+      w.chk = 0.25;
+      var anyAlive = 0, bi;
+      for (bi = 0; bi < w.batch.length; bi++) {
+        if (!w.batch[bi].dead) { anyAlive = 1; break; }
+      }
+      if (!anyAlive) w.t = 0;
+    }
+  }
+  w.t -= dt;
+  if (w.t > 0) return;
+  w.idx++;
+  w.left--;
+  w.t = w.gap;
+  var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+  w.batch = [];
+  w.chk = 0.25;
+  var waveWant = w.size;
+  if (w.scale) waveWant = Math.max(w.size, Math.round(w.size * (1 + (w.idx - 1) * 0.10)));
+  var evKinds = ["runner", "bomber", "runner", "bomber", "runner", "licker"];
+  var eventKind = (w.idx % (CFG.waveEvent.every || 2) === 0) ? evKinds[(Math.floor(w.idx / (CFG.waveEvent.every || 2)) - 1) % evKinds.length] : null;
+  var n;
+  if (eventKind) {
+    n = spawnEventWave(zs, w, eventKind, waveWant);
+    w.lastEvent = eventKind;
+  } else {
+    n = spawnWaveBatch(zs, waveWant, w);
+    if (w.scale) {
+      var extraKinds = [];
+      if (w.idx >= 2) extraKinds.push(["runner", Math.min(8, 1 + Math.floor((w.idx - 2) / 2))]);
+      if (w.idx >= 4) extraKinds.push(["licker", Math.min(4, 1 + Math.floor((w.idx - 4) / 3))]);
+      if (w.idx >= 6) extraKinds.push(["bomber", Math.min(3, 1 + Math.floor((w.idx - 6) / 4))]);
+      for (var ek = 0; ek < extraKinds.length; ek++) {
+        for (var ei = 0; ei < extraKinds[ek][1]; ei++) {
+          if (countUnits().z >= CFG.caps.zombies) break;
+          var eu = addUnit(extraKinds[ek][0], RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+          if (eu) { w.batch.push(eu); n++; }
+        }
+      }
+    }
+  }
+  if (w.bossWave && w.idx % w.bossEvery === 0) {
+    var bp = freeSpotNear((zs.x + zs.w / 2), (zs.y + zs.h / 2), 90);
+    var bk = pickBossKind();
+    var boss = addUnit(bk, bp.x, bp.y);
+    if (boss) {
+      w.batch.push(boss);
+      var secondName = "";
+      if (w.doubleBoss) {
+        var bk2 = pickBossKindExcept(bk);
+        var bp2 = freeSpotNear(bp.x + 180, bp.y + 120, 90);
+        var boss2 = addUnit(bk2, bp2.x, bp2.y);
+        if (boss2) {
+          w.batch.push(boss2);
+          secondName = (CFG.unit[bk2] && CFG.unit[bk2].name) || "首领";
+        }
+      }
+      var bname = (CFG.unit[bk] && CFG.unit[bk].name) || "首领";
+      storyLine("第 " + w.idx + " 波：" + bname + (secondName ? " 与 " + secondName + " 进入战场" : "进入战场"), { col: "190,245,110", life: 5 });
+    }
+  }
+  if (CFG.mapPreset === "port" && w.idx % (CFG.portWave.scoutEvery || 3) === 0) {
+    var pwv = CFG.portWave || {};
+    var sn = Math.min(pwv.scoutRunners || 8, Math.max(0, CFG.caps.zombies - countUnits().z));
+    for (var si = 0; si < sn; si++) {
+      var su = addUnit("runner", RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+      if (su) w.batch.push(su);
+    }
+    for (var li = 0; li < (pwv.scoutLickers || 1); li++) {
+      var lu = addUnit("licker", RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+      if (lu) w.batch.push(lu);
+    }
+    storyLine("港口警报：快速尸群自码头方向接近", { col: "255,190,90", life: 4 });
+  }
+  if (CFG.mapPreset === "port" && w.idx % (CFG.portEvent.bomberEvery || 2) === 0) {
+    var pe = CFG.portEvent || {};
+    for (var pi = 0; pi < (pe.bombers || 2); pi++) {
+      var bp2 = freeSpotNear(CFG.world.w * 0.52 + pi * 90, CFG.world.h * 0.5 + (pi % 2 ? 80 : -80), 70);
+      var bu = addUnit("bomber", bp2.x, bp2.y);
+      if (bu) w.batch.push(bu);
+    }
+    storyLine("港口警报：爆裂体自堆场方向逼近", { col: "255,120,80", life: 4 });
+  }
+  if (eventKind && n > 0) {
+    var evName = eventKind === "runner" ? "高速尸群接近" : (eventKind === "licker" ? "舔舐者集群出现" : "爆裂体编队接近");
+    storyLine("第 " + w.idx + " 波：" + evName, { col: "255,196,110", life: 4 });
+  }
+  if (n > 0) {
+    storyLine("第 " + w.idx + " 波：" + n + " 个目标进入防区" + (w.left > 0 ? "（还剩 " + w.left + " 波）" : "（最后一波）"),
+      { col: "255,146,146", life: 4 });
+  } else {
+    /* 已经顶到丧尸上限，后面的波次没有意义，直接收工 */
+    w.left = 0;
+    storyLine("尸群密度超出上限，后续波次取消；清空当前目标即可结束战斗", { col: "255,214,120", life: 4 });
+  }
+}
+
+/* ============================================================================
+   支援部队：三轮免费增援 + 帝皇特使降临
+   第一轮 90 秒 → 免费投入小型混编小队
+   第二轮 30 秒 → 免费投入中型混编小队
+   第三轮 90 秒 → 帝皇特使降临：冲天光柱、粒子爆发、强震屏、全场金光冲击波，
+                  冲击波扫过的人类阵营单位全部当场升格为英雄
+   ============================================================================ */
+
+/* ===== 新支援体系：支援小队 / 特化部队 / 军团主力 / 帝皇特使 ===== */
+function supportKindOf(kind) {
+  if (kind === "supportSquad") return "squad";
+  if (kind === "supportSpecial") return "special";
+  if (kind === "supportLegion") return "legion";
+  if (kind === "supportEmperor") return "emperor";
+  return null;
+}
+function effectiveSupportKey(kind) {
+  var k = supportKindOf(kind);
+  if (k === "legion" && START.emperor) return "emperor";
+  return k;
+}
+function supportDefOf(key) {
+  return (CFG.reinforce.support && CFG.reinforce.support[key]) || null;
+}
+function supportUnitList(key) {
+  var def = supportDefOf(key), list = [], k, i;
+  if (!def) return list;
+  for (k in def.units) {
+    if (!Object.prototype.hasOwnProperty.call(def.units, k)) continue;
+    for (i = 0; i < (def.units[k] | 0); i++) list.push(k);
+  }
+  return list;
+}
+function supportCostOf(key) {
+  var def = supportDefOf(key);
+  if (!def) return 0;
+  if (def.price) return def.price;
+  var sum = 0, k;
+  for (k in def.units) sum += (def.units[k] | 0) * (CFG.econ.cost[k] || 0);
+  return Math.round(sum * (def.discount || 1));
+}
+function supportLabel(key, withPrice) {
+  var def = supportDefOf(key);
+  if (!def) return "";
+  return def.name + (withPrice === false ? "" : "（" + supportCostOf(key) + "）");
+}
+function spawnSupportUnits(key, x, y) {
+  var list = supportUnitList(key), spots = findSpots(x, y, list.length), out = [], i;
+  for (i = 0; i < list.length; i++) {
+    var sp = spots[i] || { x: x + RNG.range(-40, 40), y: y + RNG.range(-40, 40) };
+    var u = addUnit(list[i], sp.x, sp.y);
+    if (u) { u.supportLanded = 1; out.push(u); }
+  }
+  return out;
+}
+
+/* 索降兵：真实单位挂在绳上，先悬停开火，再落到地面 */
+function rappelScreenToWorld(x, y) { return { x: s2wx(x), y: s2wy(y) }; }
+function rappelAreaClear(op) {
+  var r = (supportDefOf("squad").clearR || 260), rr = r * r;
+  var cx = (op.shadowX !== undefined) ? s2wx(op.shadowX) : op.x;
+  var cy = (op.shadowY !== undefined) ? s2wy(op.shadowY) : op.y;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    if (dist2(z.x, z.y, cx, cy) <= rr) return false;
+  }
+  return true;
+}
+function spawnRappelSquad(op) {
+  var kinds = ["rifle", "rifle", "rifle", "mg"], list = [];
+  var def = supportDefOf("squad");
+  var sx = w2sx(op.x), sy = w2sy(op.y);
+  op.state = "IncomingHelicopter";
+  op.stateT = 0;
+  op.shadowX = sx + VW * 0.55;
+  op.shadowY = sy;
+  op.ropeSway = [0, 0, 0, 0];
+  op.ropeSwayV = [0, 0, 0, 0];
+  op.topWorldX = [0, 0, 0, 0];
+  op.topWorldY = s2wy(-18);
+  op.shadowWorldX = s2wx(op.shadowX);
+  op.shadowWorldY = op.y;
+  op.clearR = def.clearR || 260;
+  var gap = def.ropeGap || 38;
+  for (var i = 0; i < kinds.length; i++) {
+    var off = (i - 1.5) * gap;
+    var p = { x: s2wx(op.shadowX) + off, y: op.y - (def.ropeH || 72) };
+    op.topWorldX[i] = p.x;
+    var u = addUnit(kinds[i], p.x, p.y);
+    if (!u) continue;
+    u.rappeli = { op: op, side: i };
+    u.supportLanded = 0;
+    u.airborne = 1;
+    u.rappelImmune = 1;
+    u.vx = u.vy = u.ax = u.ay = 0;
+    list.push(u);
+  }
+  op.units = list;
+  return list;
+}
+function stepRappelUnit(u, dt) {
+  if (!u.rappeli) return;
+  u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+}
+function startRappelGrenades(op) {
+  var def = supportDefOf("squad");
+  var cx = s2wx(op.shadowX), cy = s2wy(op.shadowY);
+  op.grenades = [];
+  var kinds = ["rifle", "rifle", "rifle", "mg"];
+  for (var i = 0; i < op.units.length; i++) {
+    var u = op.units[i];
+    if (!u || u.dead) continue;
+    var ang = RNG.range(0, TAU), rad = RNG.range(10, def.clearR * 0.55);
+    var tx = cx + Math.cos(ang) * rad, ty = cy + Math.sin(ang) * rad;
+    var dx = tx - u.x, dy = ty - u.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 12) { d = 12; dx = Math.cos(ang) * 12; dy = Math.sin(ang) * 12; }
+    var T = clamp(0.42 + d / 2400, 0.42, 0.9);
+    var g0 = CFG.cryo.arcG, z0 = u.r * 0.9;
+    op.grenades.push({
+      x: u.x, y: u.y, z: z0,
+      vx: dx / T, vy: dy / T,
+      vz: (g0 * T * T / 2 - z0) / T,
+      spin: RNG.range(0, TAU), spinV: RNG.range(-9, 9),
+      t: 0, T: T, delay: i * 0.18, exploded: false
+    });
+  }
+  op.state = "GrenadeToss"; op.stateT = 0;
+  storyLine("落点仍有敌情 · 支援分队实施压制", { col: "255,196,120", life: 3.5 });
+}
+function stepRappelGrenades(op, dt) {
+  if (!op.grenades) return true;
+  var def = supportDefOf("squad"), g0 = CFG.cryo.arcG;
+  for (var i = op.grenades.length - 1; i >= 0; i--) {
+    var g = op.grenades[i];
+    if (g.delay > 0) { g.delay -= dt; continue; }
+    g.t += dt; g.spin += g.spinV * dt;
+    g.vz -= g0 * dt;
+    g.x += g.vx * dt; g.y += g.vy * dt; g.z += g.vz * dt;
+    if (!g.exploded && (g.z <= 0 || g.t > g.T + 0.2)) {
+      g.z = 0; g.exploded = true;
+      var R = def.grenadeR || CFG.fearR;
+      var dmg = def.grenadeDmg || 120, pushBase = CFG.shield.blastPushDet;
+      ZGRID.query(g.x, g.y, R + 280, _qc);
+      for (var k = 0; k < _qc.length; k++) {
+        var zu = _qc[k];
+        if (zu.dead || !isZombie(zu)) continue;
+        var dx = zu.x - g.x, dy = zu.y - g.y;
+        var d = Math.sqrt(dx * dx + dy * dy);
+        var ddr = Math.max(0, d - (zu.r || 0));
+        if (ddr > R || d < 1e-6) continue;
+        var f = 1 - ddr / R;
+        damageZombie(zu, dmg, null);
+        if (zu.dead) continue;
+        var push = pushBase * (0.35 + 0.65 * f);
+        blastKnock(zu, dx / d * push, dy / d * push, push, 0);
+        blastInertia(zu, dx / d, dy / d);
+        if (zu.pounceT > 0) zu.pounceT = 0;
+      }
+      addShock(g.x, g.y, R, "rgba(255,170,80,1)", 0.5);
+      W.shakeT = 0.04; W.shakeDur = 0.04; W.shakeMag = 4;
+      if (SFX && SFX.detonate) SFX.detonate(g.x, g.y);
+    }
+    if (g.exploded && g.t > g.T + 0.35) op.grenades.splice(i, 1);
+  }
+  return op.grenades.length === 0;
+}
+function stepRappelOp(op, dt) {
+  var def = supportDefOf("squad");
+  var sx = w2sx(op.x), sy = w2sy(op.y);
+  op.stateT += dt;
+  var st = op.state;
+  if (st === "IncomingHelicopter") {
+    var k = Math.min(1, op.stateT / def.shadowDur);
+    var ease = 1 - Math.pow(1 - k, def.shadowDecel || 2.2);
+    op.shadowX = sx + (1 - ease) * VW * 0.55;
+    op.shadowY = sy - Math.sin(k * Math.PI) * def.arcH;
+    op.shadowVX = -(VW * 0.55) * (1 - k) * 0.02;
+    if (k >= 1) { op.state = "RopeDeploying"; op.stateT = 0; op.shadowX = sx; op.shadowY = sy; }
+  } else if (st === "RopeDeploying") {
+    op.shadowX = sx; op.shadowY = sy; op.shadowVX = 0;
+    if (op.stateT > 0.22) { op.state = "HangingCombat"; op.stateT = 0; }
+  } else if (st === "HangingCombat") {
+    op.shadowX = sx; op.shadowY = sy; op.shadowVX = 0;
+    op.hangT = (op.hangT || 0) + dt;
+    if (op.stateT > def.clearGrace && rappelAreaClear(op) && op.stateT > 0.7) {
+      op.state = "AreaCleared"; op.stateT = 0.15;
+    } else if (op.hangT >= def.hangMax) {
+      if (rappelAreaClear(op)) {
+        op.state = "AreaCleared"; op.stateT = 0.15;
+      } else {
+        startRappelGrenades(op);
+      }
+    }
+  } else if (st === "AreaCleared") {
+    op.shadowX = sx; op.shadowY = sy;
+    /* 清空后到落地前再复核一次：有丧尸重新进入阴影就取消下降，继续挂绳压制 */
+    if (!rappelAreaClear(op)) { op.state = "HangingCombat"; op.stateT = 0; }
+    else if (op.stateT > 0.28) { op.state = "Descending"; op.stateT = 0; }
+  } else if (st === "GrenadeToss") {
+    op.shadowX = sx; op.shadowY = sy;
+    var gDone = stepRappelGrenades(op, dt);
+    if (gDone && op.stateT > 1.45) {
+      op.state = "HelicopterDeparting"; op.stateT = 0; op.unsafe = true;
+      storyLine("落点无法保障 · 支援分队脱离接触", { col: "255,180,120", life: 4 });
+    }
+  } else if (st === "Descending") {
+    op.shadowX = sx; op.shadowY = sy;
+    /* 下降途中重新检查阴影区：有丧尸重新进入就拉回去继续压制，不能带着敌人落地 */
+    if (!op.unsafe && op.stateT < def.descendDur * 0.75 && !rappelAreaClear(op)) {
+      op.state = "HangingCombat"; op.stateT = 0;
+      return;
+    }
+    var dk = Math.min(1, op.stateT / def.descendDur);
+    var de = dk < 0.5 ? 2 * dk * dk : 1 - Math.pow(-2 * dk + 2, 2) / 2;
+    var yWorld = (op.y - (def.ropeH || 72)) + (def.ropeH || 72) * de;
+    for (var di = 0; di < op.units.length; di++) {
+      var du = op.units[di];
+      if (!du || du.dead) continue;
+      du.x = op.x + (di - 1.5) * (def.ropeGap || 38);
+      du.y = yWorld;
+    }
+    if (dk >= 1) {
+      for (var li = 0; li < op.units.length; li++) {
+        var lu = op.units[li];
+        if (!lu || lu.dead) continue;
+        lu.rappeli = null; lu.airborne = 0; lu.supportLanded = 1;
+        lu.x = op.x + (li - 1.5) * (def.ropeGap || 38); lu.y = op.y;
+      }
+      op.spawned = true;
+      op.state = "Landed"; op.stateT = 0;
+      storyLine(supportDefOf("squad").name + " · " + op.units.length + " 人已落地", { col: "235,242,255", life: 4 });
+    }
+  } else if (st === "Landed") {
+    op.shadowX = sx; op.shadowY = sy;
+    if (op.stateT > 0.1) { op.state = "RopeRetracting"; op.stateT = 0; }
+  } else if (st === "RopeRetracting") {
+    op.shadowX = sx; op.shadowY = sy;
+    if (op.stateT > def.retractDur) { op.state = "HelicopterDeparting"; op.stateT = 0; }
+  } else if (st === "HelicopterDeparting") {
+    op.shadowX = sx - 0.5 * def.departAccel * op.stateT * op.stateT;
+    op.shadowY = sy - Math.min(40, op.stateT * 80);
+    op.shadowVX = -def.departAccel * op.stateT;
+    if (op.stateT > def.departDur || op.shadowX < -VW * 0.5) {
+      if (op.unsafe) {
+        for (var ri3 = 0; ri3 < op.units.length; ri3++) {
+          var ru3 = op.units[ri3];
+          if (ru3 && !ru3.dead) ru3.dead = true;
+        }
+      }
+      op.finished = true;
+    }
+  }
+
+  op.shadowWorldX = s2wx(op.shadowX);
+  op.shadowWorldY = s2wy(op.shadowY);
+  /* 绳索阻尼摆动：由直升机水平速度驱动，弹簧回正 */
+  var kv = def.swayK || 16, cv = def.swayC || 4.2;
+  for (var ri = 0; ri < 4; ri++) {
+    /* 绳索横向滞后量：速度越快，绳子被甩得越开；阻尼弹簧负责回正 */
+    var targetLag = clamp(-(op.shadowVX || 0) * 1.8, -70, 70);
+    var sv = op.ropeSwayV[ri];
+    sv += (-kv * (op.ropeSway[ri] - targetLag) - cv * sv) * dt;
+    op.ropeSwayV[ri] = sv;
+    op.ropeSway[ri] += sv * dt;
+  }
+
+  /* 悬挂/下降期间：真实单位位置同步到屏幕锚点 */
+  if (st === "IncomingHelicopter" || st === "RopeDeploying" || st === "HangingCombat" || st === "AreaCleared" || st === "GrenadeToss" || (st === "HelicopterDeparting" && op.unsafe)) {
+    for (var ui = 0; ui < op.units.length; ui++) {
+      var u = op.units[ui];
+      if (!u || u.dead) continue;
+      var gap2 = def.ropeGap || 38;
+      var baseWX = ((st === "IncomingHelicopter" || st === "HelicopterDeparting") ? s2wx(op.shadowX) : op.x);
+      var uxWorld = baseWX + (ui - 1.5) * gap2 + op.ropeSway[ui] / (CAM.zoom || 1);
+      var uyWorld = op.y - (def.ropeH || 72);
+      u.x = uxWorld; u.y = uyWorld;
+      op.topWorldX[ui] = baseWX + (ui - 1.5) * gap2;
+      u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+      /* 朝降临区域内的丧尸开火，不用自身范围索敌 */
+      if (st === "HangingCombat" || st === "AreaCleared") {
+        var scx = s2wx(op.shadowX), scy = s2wy(op.shadowY);
+        var best = null, bd = op.clearR * op.clearR;
+        for (var zi = 0; zi < W.units.length; zi++) {
+          var z = W.units[zi];
+          if (z.dead || !isZombieSide(z)) continue;
+          var zd2 = dist2(z.x, z.y, scx, scy);
+          if (zd2 <= bd) { bd = zd2; best = z; }
+        }
+        if (best) {
+          u.aimAng = Math.atan2(best.y - u.y, best.x - u.x);
+          u.faceAng = u.aimAng; u.aimT = 0.2;
+          u.fireT = (u.fireT || 0) - dt;
+          if (u.fireT <= 0) {
+            var g = gunOf(u), spec = g || CFG.far;
+            fireBullet(u, best, spec.spreadDeg || 0, spec.dmg || 8, spec.widthMul || 1, false, false, true);
+            u.fireT = def.rappelFireInterval || 0.085;
+          }
+        }
+      }
+    }
+  }
+}
+function startSpecialDrop(op) {
+  op.state = "FighterPassAndBombDrop";
+  op.stateT = 0;
+  op.bomb = { x: op.x, y: op.y, exploded: false, visible: false, visibleT: 0 };
+  op.paras = [];
+  op.paraPops = [];
+  op.paraLanded = 0;
+  op.transportOn = false;
+  op.fighterSeed = RNG.range(0, TAU);
+  W.shakeT = 0.05; W.shakeDur = 0.05; W.shakeMag = 3;
+}
+function specialBombImpactDust(op) {
+  var def = supportDefOf("special");
+  var R = def.bombImpactR || CFG.fearR, rr = R * R;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    if (dist2(z.x, z.y, op.x, op.y) > rr) continue;
+    damageZombie(z, def.bombImpactDmg || 0.1, null);
+    if (!z.dead) {
+      z.flyT = 0.55; z.flyDur = 0.55; z.flyPeak = CFG.air.peak * 1.8;
+    }
+  }
+  op.bombImpactT = 0;
+  addShock(op.x, op.y, R, "rgba(220,200,160,.85)", 0.28);
+  W.shakeT = 0.03; W.shakeDur = 0.03; W.shakeMag = 3;
+}
+function specialBombExplode(op) {
+  var def = supportDefOf("special");
+  var R = def.bombR || 1200, rr = R * R;
+  var centerDmg = def.bombDmg || 6, stepR = def.bombDmgStep || CFG.fearR;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    var dx = z.x - op.x, dy = z.y - op.y;
+    var d2 = dx * dx + dy * dy;
+    if (d2 > rr) continue;
+    var d = Math.sqrt(d2);
+    var surf = Math.max(0, d - (z.r || 0));
+    /* 爆心 6 点，每偏移一个机枪兵恐惧半径降 1 点 */
+    var dmg = Math.max(0, centerDmg - Math.floor(surf / stepR));
+    if (dmg > 0) damageZombie(z, dmg, null);
+    if (z.dead) continue;
+    /* 中心强击退：平民恐惧半径 1.2 倍，向外递减 */
+    var push = CFG.fearRCivilian * (def.bombKnockMul || 1.2) * Math.max(0, 1 - surf / R);
+    if (push > 1) {
+      var nx = d > 1e-6 ? dx / d : 1, ny = d > 1e-6 ? dy / d : 0;
+      blastKnock(z, nx * push, ny * push, push, 0);
+      blastInertia(z, nx, ny);
+      z.stunT = Math.max(z.stunT || 0, controlDurOf(z, 0.55));
+    }
+  }
+  addShock(op.x, op.y, R, "rgba(255,190,110,1)", 0.65);
+  if (!W.craters) W.craters = [];
+  W.craters.push({ x: op.x, y: op.y, r: 74, seed: RNG.range(0, TAU), age: 0 });
+  if (W.craters.length > 16) W.craters.shift();
+  op.bomb.exploded = true;
+  op.explosionT = 0;
+  W.shakeT = 0.06; W.shakeDur = 0.06; W.shakeMag = 5;
+  if (SFX && SFX.blast) SFX.blast(op.x, op.y);
+}
+function spawnSpecialPara(op, slot) {
+  var def = supportDefOf("special");
+  var offX = ((slot.i % 3) - 1) * 80;
+  var offY = (Math.floor(slot.i / 3) - 0.5) * 54;
+  var targetWX = op.x + offX, targetWY = op.y + offY;
+  var startWX = s2wx(VW * 0.06 + RNG.range(0, VW * 0.18));
+  var startWY = s2wy(-50 - RNG.range(0, 80));
+  var kinds = supportUnitList("special");
+  var u = addUnit(kinds[slot.i % kinds.length], startWX, startWY);
+  if (!u) return;
+  u.rappeli = { op: op, para: true, slot: slot.i };
+  u.airborne = 1;
+  u.rappelImmune = 1;
+  u.supportLanded = 0;
+  u.vx = u.vy = u.ax = u.ay = 0;
+  u.para = {
+    x: startWX, y: startWY, targetX: targetWX, targetY: targetWY,
+    t: 0, fall: def.paraFall + slot.i * 0.12,
+    phase: RNG.range(0, TAU), amp: RNG.range(22, 38), landed: false
+  };
+  slot.u = u;
+  op.units.push(u);
+}
+function stepSpecialParas(op, dt) {
+  var def = supportDefOf("special"), i;
+  var sx = w2sx(op.x), sy = w2sy(op.y);
+  if (!op.paraSlots) {
+    var n = supportUnitList("special").length;
+    op.paraSlots = [];
+    for (i = 0; i < n; i++) {
+      op.paraSlots.push({ i: i, spawnAt: def.bombDelay + (def.transportDur * 0.2) + i * def.paraStagger, u: null });
+    }
+  }
+  var allSpawned = true, allLanded = true;
+  for (i = 0; i < op.paraSlots.length; i++) {
+    var slot = op.paraSlots[i];
+    if (!slot.u) {
+      if (op.t >= slot.spawnAt) spawnSpecialPara(op, slot);
+      allSpawned = false;
+    }
+    var u = slot.u;
+    if (!u || u.dead) { allLanded = false; continue; }
+    var pa = u.para;
+    if (!pa) { allLanded = false; continue; }
+    if (!pa.landed) {
+      pa.t += dt;
+      var k = Math.min(1, pa.t / pa.fall);
+      var sway = Math.sin(pa.t * 2.4 + pa.phase) * pa.amp * (1 - k * 0.25);
+      u.x = pa.x + (pa.targetX - pa.x) * k + sway;
+      u.y = pa.y + (pa.targetY - pa.y) * k;
+      u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+      /* 朝落点区域内的丧尸开火，不用自身范围 */
+      var best = null, bd = (def.clearR || 260) * (def.clearR || 260);
+      for (var zi = 0; zi < W.units.length; zi++) {
+        var z = W.units[zi];
+        if (z.dead || !isZombieSide(z)) continue;
+        var zd = dist2(z.x, z.y, op.x, op.y);
+        if (zd <= bd) { bd = zd; best = z; }
+      }
+      if (best) {
+        u.aimAng = Math.atan2(best.y - u.y, best.x - u.x);
+        u.faceAng = u.aimAng; u.aimT = 0.2;
+        u.fireT = (u.fireT || 0) - dt;
+        if (u.fireT <= 0) {
+          var spec;
+          if (u.kind === "sniper") spec = CFG.sniper;
+          else if (u.kind === "mg") spec = CFG.mg;
+          else if (u.kind === "flame") spec = CFG.flame;
+          else if (u.kind === "shield") spec = CFG.pistol;
+          else spec = CFG.far;
+          var dmg2 = (u.kind === "flame") ? (spec.directDmg || spec.dmg || 1) : (spec.dmg || 8);
+          var interval2 = (u.kind === "flame") ? (spec.tick || 0.1) : (spec.interval || 0.3);
+          fireBullet(u, best, spec.spreadDeg || 0, dmg2, spec.widthMul || 1,
+            u.kind === "mg", u.kind === "sniper", true);
+          u.fireT = interval2;
+        }
+      }
+      if (k >= 1) {
+        pa.landed = true;
+        u.x = pa.targetX; u.y = pa.targetY;
+        u.rappeli = null; u.airborne = 0; u.supportLanded = 1;
+        op.paraLanded++;
+        op.paraPops.push({ x: u.x, y: u.y, t: 0 });
+      }
+    }
+    if (!u.rappeli) allLanded = allLanded && true;
+    else allLanded = false;
+  }
+  if (allSpawned && allLanded && op.state !== "Landed" && op.state !== "EventEnd" && op.state !== "LandingSequence") {
+    op.state = "LandingSequence"; op.stateT = 0;
+  }
+}
+function stepSpecialOp(op, dt) {
+  var def = supportDefOf("special");
+  var fighterDur = def.fighterDur || 0.3;
+  /* 战斗机到达落点上方的帧，才让航弹从不可见切换为斜插状态 */
+  if (!op.bomb.visible) {
+    var fk = Math.min(1, op.t / fighterDur);
+    var fx = VW + 180 + (-VW - 360) * fk;
+    var fy = -100 + (VH + 200) * fk;
+    var tx = w2sx(op.x), ty = w2sy(op.y);
+    if ((Math.abs(fx - tx) < 110 && fy > ty - 220) || op.t >= fighterDur * 0.72) {
+      op.bomb.visible = true;
+      op.bomb.visibleT = op.t;
+      specialBombImpactDust(op);
+    }
+  }
+  if (op.t < fighterDur) op.state = "FighterPassAndBombDrop";
+  else if (!op.bomb.visible || !op.bomb.exploded) {
+    if (!op.bomb.exploded && op.bomb.visible && op.t >= op.bomb.visibleT + (def.bombFuse || 0.5)) {
+      op.state = "BombExplode";
+      specialBombExplode(op);
+    } else {
+      op.state = op.bomb.visible ? "BombEmbedded" : "FighterPassAndBombDrop";
+    }
+  } else if (op.t < def.bombDelay) {
+    op.state = "BombExplode";
+  } else {
+    if (!op.transportOn) { op.transportOn = true; op.state = "TransportPassAndParatrooperDrop"; W.shakeT = 0.03; W.shakeDur = 0.03; W.shakeMag = 2; }
+    if (op.t > def.bombDelay + def.transportDur && op.state !== "LandingSequence" && op.state !== "Landed" && op.state !== "EventEnd" && op.state !== "ParachuteHangingCombat") op.state = "ParachuteHangingCombat";
+  }
+  op.paraPops = op.paraPops || [];
+  for (var pi = op.paraPops.length - 1; pi >= 0; pi--) {
+    op.paraPops[pi].t += dt;
+    if (op.paraPops[pi].t > def.paraLandPop) op.paraPops.splice(pi, 1);
+  }
+  if (op.bomb.exploded) op.explosionT = (op.explosionT || 0) + dt;
+  if (op.bombImpactT !== undefined) op.bombImpactT += dt;
+  if (op.transportOn) stepSpecialParas(op, dt);
+  if (op.state === "LandingSequence") {
+    op.stateT += dt;
+    if (op.stateT > 0.2) op.state = "Landed", op.stateT = 0;
+  } else if (op.state === "Landed" || op.state === "EventEnd") {
+    op.stateT += dt;
+    if (op.state === "Landed" && op.stateT > 0.35) op.state = "EventEnd", op.stateT = 0;
+    if (op.state === "EventEnd" && op.stateT > 0.15) op.finished = true;
+  }
+  if (!op.finished && op.t > (def.bombDelay || 1.0) + 9.0) op.finished = true;
+}
+
+function startLegionDrop(op) {
+  var def = supportDefOf("legion");
+  op.state = "BeaconDeployed";
+  op.stateT = 0;
+  op.shockDone = false;
+  op.spawnIndex = 0;
+  op.dome = { x: op.x, y: op.y, on: false, hp: 0, max: def.domeHp, next: 0, R: def.domeR, broken: false, deployT: 0, pending: true };
+  op.podLandedT = 0;
+  op.podY = -1;
+  op.exploded = false;
+  op.units = [];
+  op.fighterSeed = RNG.range(0, TAU);
+  W.shakeT = 0.05; W.shakeDur = 0.05; W.shakeMag = 3;
+  if (SFX && SFX.blast) SFX.blast(op.x, op.y);
+}
+function legionPodImpact(op) {
+  var def = supportDefOf("legion");
+  var R = def.shockR || CFG.fearRCivilian * 1.5;
+  var pushBase = def.shockPush || R;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    var dx = z.x - op.x, dy = z.y - op.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var ddr = Math.max(0, d - ((typeof v !== "undefined" && v.r) ? v.r : ((typeof z !== "undefined" && z.r) ? z.r : ((typeof zu !== "undefined" && zu.r) ? zu.r : 0))));
+    if (ddr > R || d < 1e-6) continue;
+    var nx = dx / d, ny = dy / d;
+    if (d > 1e-6) {
+      damageZombie(z, def.shockDmg || 0.1, null);
+      if (!z.dead) {
+        var push = pushBase * (0.45 + 0.55 * (1 - ddr / R));
+        blastKnock(z, nx * push, ny * push, push, 0);
+        blastInertia(z, nx, ny);
+        z.stunT = Math.max(z.stunT || 0, controlDurOf(z, 0.6));
+      }
+    }
+  }
+  op.dome.on = false;
+  op.dome.pending = true;
+  op.dome.hp = op.dome.max;
+  op.dome.next = op.dome.max * (1 - CFG.shield.pulseStep);
+  op.dome.broken = false;
+  op.podLandedT = 0;
+  addShock(op.x, op.y, R, "rgba(255,180,90,1)", 0.5);
+  W.shakeT = 0.06; W.shakeDur = 0.06; W.shakeMag = 8;
+  op.shockDone = true;
+  if (SFX && SFX.detonate) SFX.detonate(op.x, op.y);
+}
+function stepLegionDome(op, dt) {
+  var def = supportDefOf("legion"), d = op.dome;
+  if (!d || !d.on) return false;
+  /* 护盾从原点长大，但屏障从第一帧就生效：半径当前多大，就挡多大 */
+  d.deployT = (d.deployT || 0) + dt;
+  var expandK = Math.min(1, d.deployT / (def.shieldExpand || 0.45));
+  var curR = Math.max(4, d.R * expandK);
+  var moved = false;
+  ZGRID.query(d.x, d.y, curR + 40, _qb);
+  for (var i = 0; i < _qb.length; i++) {
+    var z = _qb[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    var dx = z.x - d.x, dy = z.y - d.y;
+    var dd = Math.sqrt(dx * dx + dy * dy);
+    if (dd < curR + z.r && dd > 1e-6) {
+      moved = true;
+      z.airT = 0; z.airH = 0;
+      z.x = d.x + dx / dd * (curR + z.r + 2);
+      z.y = d.y + dy / dd * (curR + z.r + 2);
+      z.stunT = Math.max(z.stunT || 0, controlDurOf(z, 0.08));
+    }
+  }
+  if (moved) {
+    d.hp -= dt;
+    if (d.hp <= d.next) {
+      d.next -= d.max * CFG.shield.pulseStep;
+      shieldPulse(d, curR, CFG.shield.domeDmg, CFG.shield.blastPush);
+    }
+    if (d.hp <= 0) {
+      d.hp = 0; d.on = false; d.broken = true;
+      addShock(d.x, d.y, d.R, "rgba(120,200,255,.9)", 0.55);
+      return true;
+    }
+  }
+  return false;
+}
+function legionExplode(op) {
+  if (op.exploded) return;
+  op.exploded = true;
+  var dummy = { x: op.x, y: op.y, bomb: {}, def: supportDefOf("legion") };
+  /* 最终爆炸沿用航弹伤害准则：爆心 6、每偏移一个恐惧半径降一级 */
+  specialBombExplode(dummy);
+  op.explosionT = 0;
+  op.state = "PodExplosion";
+  op.stateT = 0;
+  W.shakeT = 0.08; W.shakeDur = 0.08; W.shakeMag = 7;
+}
+function stepLegionOp(op, dt) {
+  var def = supportDefOf("legion");
+  op.stateT += dt;
+  if (op.t < def.beaconDur) {
+    op.state = op.t < 0.22 ? "LaunchThud" : "IncomingWhistle";
+    return;
+  }
+  if (!op.shockDone) {
+    op.state = "PodImpact";
+    legionPodImpact(op);
+    op.state = "ShieldActiveAndDeploying";
+    op.stateT = 0;
+    return;
+  }
+  op.podLandedT = (op.podLandedT || 0) + dt;
+  if (op.dome && op.dome.pending && !op.dome.on && op.podLandedT >= (def.shieldDelay || 1.0)) {
+    op.dome.pending = false;
+    op.dome.on = true;
+    op.dome.deployT = 0;
+    addShock(op.x, op.y, 90, "rgba(110,210,255,.8)", 0.3);
+    W.shakeT = 0.03; W.shakeDur = 0.03; W.shakeMag = 2;
+  }
+  if (op.state === "PodExplosion") {
+    op.explosionT += dt;
+    if (op.stateT > def.explodeDur) op.finished = true;
+    return;
+  }
+  var broken = stepLegionDome(op, dt);
+  if (broken) {
+    legionExplode(op);
+    return;
+  }
+  if (op.spawnIndex < supportUnitList("legion").length) {
+    op.state = "ShieldActiveAndDeploying";
+    op.releaseT = (op.releaseT || 0) - dt;
+    if (op.releaseT <= 0) {
+      var kinds = supportUnitList("legion");
+      var ang = (op.spawnIndex * 2.399963) % TAU;
+      var rr = 70 + (op.spawnIndex % 3) * 26;
+      var u = addUnit(kinds[op.spawnIndex], op.x + Math.cos(ang) * rr, op.y + Math.sin(ang) * rr);
+      if (u) {
+        u.legionGuard = 1;
+        u.defend = { x: op.x + Math.cos(ang) * (rr + 30), y: op.y + Math.sin(ang) * (rr + 30) };
+        op.units.push(u);
+      }
+      op.spawnIndex++;
+      op.releaseT = def.release || 0.3;
+    }
+  } else {
+    if (op.state !== "AllDeployedDefending") {
+      op.state = "AllDeployedDefending";
+      for (var i = 0; i < op.units.length; i++) if (op.units[i]) {
+        op.units[i].legionGuard = 0;
+        op.units[i].defend = null;
+      }
+    }
+  }
+}
+
+function beginSupportDrop(key, x, y, source) {
+  var def = supportDefOf(key);
+  if (!def) return;
+  if (key === "emperor") {
+    beginApotheosis(x, y);
+    return;
+  }
+  var pos = (key === "legion") ? { x: x, y: y } : freeSpotNear(x, y, 72);
+  var op = {
+    key: key, x: pos.x, y: pos.y, t: 0, dur: def.dur,
+    spawnT: def.spawnT, spawned: false, impacted: false,
+    source: source || "auto", units: [], seed: RNG.range(0, 100)
+  };
+  if (!W.supportOps) W.supportOps = [];
+  W.supportOps.push(op);
+  if (key === "squad") spawnRappelSquad(op);
+  if (key === "special") startSpecialDrop(op);
+  if (key === "legion") startLegionDrop(op);
+  if (W.supportOps.length > 5) W.supportOps.shift();
+  var col = key === "squad" ? "235,242,255" : key === "special" ? "126,196,255" : "255,196,92";
+  storyLine(def.name + " · " + (source === "paid" ? "已投放" : "正在抵达"), { col: col, glow: key === "legion", life: 4.5 });
+}
+function stepSupportOps(dt) {
+  var ops = W.supportOps || [];
+  for (var i = ops.length - 1; i >= 0; i--) {
+    var op = ops[i];
+    op.t += dt;
+    if (op.key === "special") {
+      stepSpecialOp(op, dt);
+      if (op.finished) { ops.splice(i, 1); continue; }
+      continue;
+    }
+    if (op.key === "legion") {
+      stepLegionOp(op, dt);
+      if (op.finished) { ops.splice(i, 1); continue; }
+      continue;
+    } else if (op.key === "squad") {
+      stepRappelOp(op, dt);
+      if (op.finished) { ops.splice(i, 1); continue; }
+    } else if (!op.spawned && op.t >= op.spawnT) {
+      op.spawned = true;
+      op.units = spawnSupportUnits(op.key, op.x, op.y);
+      storyLine(supportDefOf(op.key).name + " · " + op.units.length + " 人已入场", { col: "235,242,255", life: 4 });
+    }
+    if (op.key !== "squad" && op.t >= op.dur) ops.splice(i, 1);
+  }
+}
+function impactSupportBomb(op) {
+  var r = 260, rr = r * r;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    var dx = z.x - op.x, dy = z.y - op.y, d = dx * dx + dy * dy;
+    if (d > rr) continue;
+    damageZombie(z, 99999, null);
+  }
+  addShock(op.x, op.y, r, "rgba(255,180,90,1)", 0.55);
+  W.shakeT = 0.05; W.shakeDur = 0.05; W.shakeMag = 6;
+}
+function impactSupportPod(op) {
+  var r = CFG.fearRCivilian * 1.5, rr = r * r;
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z.dead || !isZombieSide(z)) continue;
+    var dx = z.x - op.x, dy = z.y - op.y, d = dx * dx + dy * dy;
+    if (d > rr || d < 1) continue;
+    var m = Math.sqrt(d), nx = dx / m, ny = dy / m;
+    blastKnock(z, nx * 140, ny * 140, 0, 0.1);
+    z.stunT = Math.max(z.stunT || 0, controlDurOf(z, 0.55));
+  }
+  addShock(op.x, op.y, r, "rgba(255,220,140,1)", 0.7);
+  W.shakeT = 0.05; W.shakeDur = 0.05; W.shakeMag = 5;
+}
+
+function startReinforce() {
+  W.reinf = {
+    phase: 1, t: CFG.reinforce.wave1,
+    cx: CFG.world.w * 0.5, cy: CFG.world.h * 0.5,
+    pillT: 0, pillMax: CFG.reinforce.pillarDur,
+    waveT: -1, waveR: 0, waveDur: CFG.reinforce.waveDur, parts: []
+  };
+}
+/* 人类阵型的质心：增援就往他们身边投 */
+function humanCentroid() {
+  var sx = 0, sy = 0, n = 0, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    sx += u.x; sy += u.y; n++;
+  }
+  if (!n) return { x: CFG.world.w * 0.5, y: CFG.world.h * 0.5 };
+  return { x: sx / n, y: sy / n };
+}
+/* 在给定点附近找一个不卡墙、身边也没人的落点 */
+function freeSpotNear(cx, cy, spread) {
+  var fallback = null, i, u, k, a, x, y, tx, ty;
+  for (var ring = 0; ring < 6; ring++) {
+    var rad = spread + ring * 44;
+    var steps = 12 + ring * 4;
+    for (k = 0; k < steps; k++) {
+      a = TAU * k / steps + ring * 0.37;
+      x = cx + Math.cos(a) * rad;
+      y = cy + Math.sin(a) * rad;
+      if (x < 70 || y < 70 || x > CFG.world.w - 70 || y > CFG.world.h - 70) continue;
+      tx = Math.floor(x / CFG.world.tile);
+      ty = Math.floor(y / CFG.world.tile);
+      if (NAV.b(tx, ty)) continue;
+      var ok = true;
+      for (i = 0; i < W.units.length; i++) {
+        u = W.units[i];
+        if (u.dead) continue;
+        var dx = u.x - x, dy = u.y - y;
+        if (dx * dx + dy * dy < 676) { ok = false; break; }
+      }
+      if (ok) return { x: x, y: y };
+      if (!fallback) fallback = { x: x, y: y };
+    }
+  }
+  return fallback || { x: cx, y: cy };
+}
+/* 按预设把一支混编小队投下去 */
+function spawnSquadAt(preset, ox, oy) {
+  var kinds = [], k, i;
+  for (k in preset) {
+    if (!Object.prototype.hasOwnProperty.call(preset, k)) continue;
+    for (i = 0; i < preset[k]; i++) kinds.push(k);
+  }
+  if (!kinds.length) return [];
+  var placed = [];
+  for (i = 0; i < kinds.length; i++) {
+    var a = TAU * i / kinds.length + 0.25;
+    var rad = 40 + (i % 4) * 26;
+    var px = ox + Math.cos(a) * rad;
+    var py = oy + Math.sin(a) * rad;
+    placed.push(addUnit(kinds[i], px, py));
+  }
+  return placed;
+}
+function beginApotheosis(atX, atY) {
+  /* 剧本/导演里也能直接触发"帝皇特使"，这时场上可能根本没有支援流程对象。
+     缺了就现场补一个，否则 r 是 null，一按事件就报错 */
+  if (!W.reinf) {
+    W.reinf = {
+      phase: 1, t: 0,
+      cx: CFG.world.w * 0.5, cy: CFG.world.h * 0.5,
+      pillT: 0, pillMax: CFG.reinforce.pillarDur,
+      waveT: -1, waveR: 0, waveDur: CFG.reinforce.waveDur, parts: []
+    };
+  }
+  var r = W.reinf;
+  r.phase = 4;
+  r.cx = (typeof atX === "number") ? atX : CFG.world.w * 0.5;
+  r.cy = (typeof atY === "number") ? atY : CFG.world.h * 0.5;
+  r.pillT = CFG.reinforce.pillarDur;
+  r.pillMax = CFG.reinforce.pillarDur;
+  r.waveT = 0;
+  r.waveR = 0;
+  r.waveDur = CFG.reinforce.waveDur;
+  r.parts = [];
+  /* 光柱落点就地砸下一支中型混编小队，全员当场升格为英雄 */
+  var squad = spawnSupportUnits("emperor", r.cx, r.cy);
+  var civCount = 0;
+  for (var i = 0; i < squad.length; i++) {
+    if (isCivilianRole(squad[i])) civCount++;
+    promoteHero(squad[i], isCivilianRole(squad[i]) ? "civilian" : "armed", true);
+  }
+  /* 只放一次统一的冲击波：光柱落点是同一个地方，没必要每人都炸一圈 */
+  addShock(r.cx, r.cy, CFG.fearRCivilian * CFG.hero.shockR * 1.15, "rgba(255,215,90,1)");
+  /* 场上原有的平民英雄也一起升格，这里只给一个总数提示，不逐个弹 */
+  for (var j = 0; j < W.units.length; j++) {
+    var uu = W.units[j];
+    if (uu.dead || uu.hero) continue;
+    if (!isHuman(uu) || isZombieSide(uu)) continue;
+    if (isCivilianRole(uu)) civCount++;
+    promoteHero(uu, isCivilianRole(uu) ? "civilian" : "armed", true);
+  }
+  if (civCount > 0) {
+    storyLine("民心所向 · " + civCount + " 名平民英雄同时展开光环", { col: "255,214,90", glow: true, life: 5.5 });
+  }
+  /* 镜头平滑推到落点，让玩家看清这道通天光柱 */
+  focusCameraOn(r.cx, r.cy, 0.9);
+  /* 屏幕震动：只抖一下（0.45 秒）就收，够震撼但不至于让人看不清画面 */
+  W.shakeT = 0.05; W.shakeDur = 0.05; W.shakeMag = 8;
+  storyLine("帝皇特使降临 · 活圣人落地", { col: "255,210,74", glow: true, life: 6 });
+  storyLine("英雄小队 " + squad.length + " 人随光柱落地", { col: "255,232,150", glow: true, life: 6 });
+}
+function stepReinforce(dt) {
+  var r = W.reinf;
+  if (!r) return;
+
+  if (r.phase >= 1 && r.phase <= 3) {
+    r.t -= dt;
+    if (r.t > 0) return;
+    if (r.phase === 1) {
+      var c1 = humanCentroid();
+      beginSupportDrop("squad", c1.x, c1.y, "auto");
+      r.phase = 2; r.t = CFG.reinforce.wave2;
+    } else if (r.phase === 2) {
+      var c2 = humanCentroid();
+      beginSupportDrop("special", c2.x, c2.y, "auto");
+      r.phase = 3; r.t = CFG.reinforce.wave3;
+    } else {
+      var c3 = humanCentroid();
+      beginSupportDrop(START.emperor ? "emperor" : "legion", c3.x, c3.y, "auto");
+      r.phase = 5;
+    }
+    return;
+  }
+
+  if (r.phase !== 4) return;
+
+  /* 光柱持续期间不断向上喷发粒子 */
+  if (r.pillT > 0) {
+    r.pillT -= dt;
+    for (var s = 0; s < 30; s++) {
+      var ang = RNG.range(0, TAU);
+      var sp = RNG.range(30, 260);
+      var life = RNG.range(0.55, 1.35);
+      r.parts.push({
+        x: r.cx + Math.cos(ang) * RNG.range(0, 96),
+        y: r.cy + Math.sin(ang) * RNG.range(0, 96),
+        z: RNG.range(0, 96),
+        vx: Math.cos(ang) * sp * 1.6,
+        vy: Math.sin(ang) * sp * 1.6,
+        vz: RNG.range(420, 1500),
+        life: life, max: life,
+        br: RNG.range(0.40, 1.0),
+        w: RNG.range(15, 42)
+      });
+    }
+  }
+  /* 粒子推进：z 轴向上喷，受重力回落 */
+  for (var i = r.parts.length - 1; i >= 0; i--) {
+    var p = r.parts[i];
+    p.life -= dt;
+    if (p.life <= 0) { r.parts.splice(i, 1); continue; }
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+    p.z += p.vz * dt;
+    p.vz -= 1550 * dt;
+    if (p.z < 0) { p.z = 0; p.vz *= -0.34; }
+  }
+  /* 金光冲击波：匀速推行到全场，扫到谁就升格谁 */
+  if (r.waveT >= 0 && r.waveT < r.waveDur) {
+    r.waveT += dt;
+    if (r.waveT > r.waveDur) r.waveT = r.waveDur;
+    r.waveR = (r.waveT / r.waveDur) * CFG.reinforce.waveMax;
+    var rr = r.waveR * r.waveR;
+    for (var j = 0; j < W.units.length; j++) {
+      var u = W.units[j];
+      if (u.dead || u.hero || !isHuman(u) || isZombieSide(u)) continue;
+      var dx = u.x - r.cx, dy = u.y - r.cy;
+      if (dx * dx + dy * dy <= rr) promoteHero(u, isCivilianRole(u) ? "civilian" : "armed");
+    }
+  }
+  if (r.pillT <= 0 && r.waveT >= r.waveDur && r.parts.length === 0) r.phase = 5;
+}
+
+/* 每帧检查：某一类人从"不止一个"掉到"只剩一个"时，升格他 */
+function checkHeroPromotion() {
+  if (!CFG.hero.enabled) return;
+  var armedN = 0, armedLast = null, civN = 0, civLast = null, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    if (isArmed(u)) { armedN++; armedLast = u; }
+    else if (isCivilianRole(u)) { civN++; civLast = u; }
+  }
+  /* 必须"曾经多于一个"才升格，否则开局只有一个平民时就会立刻触发 */
+  if (armedN > 1) W.armedHadMany = 1;
+  if (civN > 1) W.civHadMany = 1;
+  if (armedN === 1 && W.armedHadMany && armedLast && !armedLast.hero) promoteHero(armedLast, "armed");
+  if (civN === 1 && W.civHadMany && civLast && !civLast.hero) promoteHero(civLast, "civilian");
+  /* 武装英雄与平民英雄同时在场的组合，会让两人拼命往一块凑 */
+  var hArm = null, hCiv = null;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    if (u.hero === "armed") hArm = u;
+    else if ((u.hero === "civilian" || u.hero === "militia")) hCiv = u;
+  }
+  W.heroDuo = (hArm && hCiv) ? { a: hArm, b: hCiv } : null;
+}
+/* 把单位掀飞：先让 pushUnit 算出不会穿墙的落点，再把人退回起点，
+   交给 airT 那段抛物线把他送过去。伤害记着，等落地才结算 */
+function blastKnock(v, dx, dy, push, dmg) {
+  if (v.kind === "nestEgg") return;
+  if (isBossUnit(v)) { dx *= 0.1; dy *= 0.1; push *= 0.1; }
+  var fx = v.x, fy = v.y;
+  pushUnit(v, dx, dy);
+  var tx = v.x, ty = v.y;
+  v.x = fx; v.y = fy;
+  v.airDur = controlDurOf(v, CFG.air.dur);
+  if (v.airT <= 0) v.airT = controlDurOf(v, CFG.air.dur);
+  v.airFromX = fx; v.airFromY = fy;
+  v.airToX = tx; v.airToY = ty;
+  if (dmg > 0) v.pendingDmg = (v.pendingDmg || 0) + dmg;
+}
+/* 纯视觉的抛飞：只算"离地多高"，不碰 u.x / u.y，也不改任何状态。
+   被爆炸气浪掀起来的人会有这么一下腾空，但该怎么走还怎么走 */
+function stepFly(u, dt) {
+  if (u.flyT <= 0) return;
+  u.flyT -= dt;
+  if (u.flyT <= 0) { u.flyT = 0; u.flyPeak = 0; }
+}
+/* 这条纯视觉抛飞此刻离地多高（世界坐标像素） */
+function flyHeightOf(u) {
+  if (!(u.flyT > 0) || !(u.flyDur > 0)) return 0;
+  var p = 1 - u.flyT / u.flyDur;
+  if (p <= 0 || p >= 1) return 0;
+  return 4 * u.flyPeak * p * (1 - p);
+}
+/* 推进一次抛飞动画，返回 true 表示还在空中 */
+function stepAir(u, dt) {
+  if (u.airT <= 0) return false;
+  u.airT -= dt;
+  var k = u.airDur > 0 ? 1 - Math.max(0, u.airT) / u.airDur : 1;
+  if (k > 1) k = 1;
+  u.x = u.airFromX + (u.airToX - u.airFromX) * k;
+  u.y = u.airFromY + (u.airToY - u.airFromY) * k;
+  u.airH = 4 * CFG.air.peak * k * (1 - k);      /* 标准抛物线，两端贴地 */
+  if (u.airT <= 0) {
+    u.airT = 0; u.airH = 0;
+    u.x = u.airToX; u.y = u.airToY;
+    if (u.pendingDmg > 0) {                       /* 摔到地上才结算伤害 */
+      var pd = u.pendingDmg;
+      u.pendingDmg = 0;
+      damageZombie(u, pd, null);
+    }
+  }
+  return true;
+}
+/* 很弱的推力冲击：护盾每掉一档就放一次，把贴身的丧尸轻轻顶开 */
+function shieldPulse(u, R, dmg, push) {
+  ZGRID.query(u.x, u.y, R + 20, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombie(v)) continue;
+    var dx = v.x - u.x, dy = v.y - u.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var dd1 = Math.max(0, d - (v.r || 0));
+    if (dd1 > R || d < 1e-6) continue;
+    var k = 1 - dd1 / R;
+    var pp = push * (0.35 + 0.65 * k);
+    blastKnock(v, dx / d * pp, dy / d * pp, pp, dmg);
+    if (v.dead) continue;
+    if (v.pounceT > 0) v.pounceT = 0;
+  }
+  addShock(u.x, u.y, R, "rgba(180,225,255,0.75)");
+}
+/* 盾兵护盾破裂：把恐惧范围内的丧尸整体推开，并打断它们的猛扑 */
+function shieldBlast(u) {
+  var R = CFG.fearR;
+  ZGRID.query(u.x, u.y, R + 20, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombie(v)) continue;
+    var dx = v.x - u.x, dy = v.y - u.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var ddr = Math.max(0, d - ((typeof v !== "undefined" && v.r) ? v.r : ((typeof z !== "undefined" && z.r) ? z.r : ((typeof zu !== "undefined" && zu.r) ? zu.r : 0))));
+    if (ddr > R || d < 1e-6) continue;
+    var k = 1 - ddr / R;                       /* 越近推得越远 */
+    /* 直接位移而不是加速度：丧尸的速度会被最大速度钳制，加力会被立刻吃掉 */
+    var push = CFG.shield.blastPush * (0.35 + 0.65 * k);
+    blastKnock(v, dx / d * push, dy / d * push, push, 0);   /* 分段推进，不会穿墙 */
+    blastInertia(v, dx / d, dy / d);                  /* 再给一段惯性，别当场停住 */
+    if (v.pounceT > 0) v.pounceT = 0;        /* 打断猛扑 */
+    if (v.hot !== 1) { v.locked = 0; v.attacker = null; v.target = null; }  /* 被震退的休眠丧尸重新安分 */
+  }
+  addShock(u.x, u.y, R, "rgba(255,255,255,1)");
+  SFX.blast(u.x, u.y);
+}
+/* 盾兵被感染后的自爆：对范围内丧尸造成伤害并推开 */
+function shieldDetonate(u) {
+  var R = CFG.fearR, dmg = CFG.shield.detonateDmg;
+  ZGRID.query(u.x, u.y, R + 20, _qc);
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombie(v)) continue;
+    var dx = v.x - u.x, dy = v.y - u.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    var ddr = Math.max(0, d - ((typeof v !== "undefined" && v.r) ? v.r : ((typeof z !== "undefined" && z.r) ? z.r : ((typeof zu !== "undefined" && zu.r) ? zu.r : 0))));
+    if (ddr > R || d < 1e-6) continue;
+    var k = 1 - d / R;
+    damageZombie(v, dmg, null);
+    if (v.dead) continue;
+    var push2 = CFG.shield.blastPushDet * (0.4 + 0.6 * k);
+    blastKnock(v, dx / d * push2, dy / d * push2, push2, 0);
+    blastInertia(v, dx / d, dy / d);
+    if (v.pounceT > 0) v.pounceT = 0;
+  }
+  addShock(u.x, u.y, R, "rgba(180,225,255,1)");
+  SFX.detonate(u.x, u.y);
+}
+function addShock(x, y, r, col, life) {
+  if (W.shocks.length > 40) return;
+  var L = life || CFG.shield.shockLife;
+  W.shocks.push({ x: x, y: y, r: r, life: L, max: L, col: col });
+}
+/* 自爆丧尸炸开：黄色冲击波慢慢扩散，波及到的人减速；
+   剩下的都是纯好看的东西，身下一大摊血、四周零散溅开的血点、
+   一圈圈往外挤的淡环 */
+function explodeBomber(v) {
+  var B = CFG.bomber;
+  var cx = v.x, cy = v.y;
+  var R = CFG.fearRCivilian * B.blastRMul;
+  v.dead = true;
+  v.armT = 0;
+  W.kills++;
+  W.resources = Math.min(CFG.econ.cap, W.resources + CFG.econ.killZombie);
+  addGlow("green", cx, cy);
+  /* 身下立刻出现一大摊血（体型越大摊得越开：多压两笔就是更大的血） */
+  addBloodStain(cx, cy);
+  addBloodStain(cx + RNG.range(-7, 7), cy + RNG.range(-7, 7));
+  addBloodStain(cx + RNG.range(-10, 10), cy + RNG.range(-10, 10));
+  if (!W.bombFx) W.bombFx = [];
+  /* 0.5 秒内、武装单位恐惧范围里随机位置随机时间落 5 块血 */
+  for (var i = 0; i < B.popCount; i++) {
+    var ba = RNG.range(0, TAU), br = Math.sqrt(RNG.next()) * CFG.fearR;
+    W.bombFx.push({ kind: "blood", x: cx + Math.cos(ba) * br, y: cy + Math.sin(ba) * br,
+      t: RNG.range(0, B.popT) });
+  }
+  /* 平民恐惧范围里每 0.1 秒挤出一圈半透明的环，纯装饰 */
+  var rings = Math.round(B.ringT / B.ringStep);
+  for (i = 0; i < rings; i++) {
+    W.bombFx.push({ kind: "ring", x: cx, y: cy, r: RNG.range(70, CFG.fearRCivilian),
+      t: i * B.ringStep, col: RNG.range(0, 1) });
+  }
+  /* 真正有作用的那圈：半径 = 平民恐惧范围的直径，慢慢摊开 */
+  addShock(cx, cy, R, "rgba(224,214,120,1)", B.shockLife);
+  /* 波及到的人类：1 秒里只剩两成速度 */
+  for (i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    var hd2 = dist2(h.x, h.y, cx, cy);
+    if (hd2 > R * R) continue;
+    if (h.slowT < B.slowT) { h.slowT = B.slowT; h.slowMul = B.slowMul; }
+    /* 纯视觉：被气浪掀起来一下再落下。越靠近爆心飞得越高。
+       注意这根动画不碰位置、不碰移速，也就不会干扰上面那个减速，他只是被"吹得晃了一下" */
+    if (h.flyT <= 0) {
+      var hk = Math.max(0, 1 - Math.sqrt(hd2) / R);
+      h.flyDur = 0.42 + 0.24 * hk;
+      h.flyT = h.flyDur;
+      h.flyPeak = 24 + 38 * hk;
+    }
+  }
+  if (SFX.ok && SFX.enabled) SFX.detonate(cx, cy);
+}
+/* 爆炸之后那些"随机时间出现"的东西：到点就落地 */
+function stepBombFx(dt) {
+  if (!W.bombFx || !W.bombFx.length) return;
+  for (var i = W.bombFx.length - 1; i >= 0; i--) {
+    var f = W.bombFx[i];
+    f.t -= dt;
+    if (f.t > 0) continue;
+    if (f.kind === "blood") addBloodStain(f.x, f.y);
+    else if (f.kind === "ring") {
+      W.shocks.push({ x: f.x, y: f.y, r: f.r, life: 0.42, max: 0.42,
+        col: f.col > 0.5 ? "rgba(235,225,150,1)" : "rgba(200,210,110,1)" });
+    }
+    W.bombFx.splice(i, 1);
+  }
+}
+function stepInfection(dt) {
+  var inf = CFG.infect;
+  var i, u, k, v;
+  /* 先结算盾兵护盾：被丧尸贴身接触会消耗耐久，破裂后计时恢复 */
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || u.rappeli || u.kind !== "shield") continue;
+    if (u.shieldBroken) {
+      u.shieldT += dt;
+      if (u.shieldT >= CFG.shield.regen) { u.shieldBroken = false; u.shieldHp = CFG.shield.hp; u.shieldT = 0; }
+      continue;
+    }
+    var touch = false, shieldDrain = dt;
+    ZGRID.query(u.x, u.y, u.r + 30, _qb);
+    for (k = 0; k < _qb.length; k++) {
+      v = _qb[k];
+      if (v.dead || !isZombie(v)) continue;
+      var rr = u.r + v.r + inf.touchPad;
+      if (dist2(u.x, u.y, v.x, v.y) <= rr * rr) {
+        touch = true;
+        if (isBossUnit(v)) shieldDrain = dt * 5;
+      }
+    }
+    if (touch) {
+      u.shieldHp -= shieldDrain;
+      /* 每掉掉一档就放一次很弱的推力，把贴身的那圈丧尸轻轻顶开 */
+      if (u.shieldHp <= u.shieldNextWave) {
+        u.shieldNextWave -= CFG.shield.hp * CFG.shield.pulseStep;
+        shieldPulse(u, CFG.fearR, CFG.shield.pulseDmg, CFG.shield.pulsePush);
+      }
+      if (u.shieldHp <= 0) {
+        u.shieldHp = 0; u.shieldBroken = true; u.shieldT = 0;
+        u.graceT = CFG.shield.graceT;        /* 碎裂瞬间的无敌帧 */
+        shieldBlast(u);                      /* 碎裂瞬间的冲击波 */
+      }
+    }
+  }
+  /* 再结算感染：举着护盾的盾兵不会被感染 */
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || u.rappeli || !isHuman(u) || isZombieSide(u) || hasShield(u)) continue;
+    if (u.graceT > 0) { u.graceT -= dt; continue; }   /* 破盾瞬间的无敌帧 */
+    /* 防护服：和盾兵护盾一个道理，被贴住就累计耐久，扛满才破裂。
+       破之前完全不吃感染；破了以后就和普通人一样了。
+       这套逻辑原来写死只对英雄生效，所以市场上买的防护服完全没起作用，现在按"有没有耐久"判断 */
+    if (!u.suitBroken && u.suitHp > 0) {
+      var touchH = false, suitDrain = dt;
+      ZGRID.query(u.x, u.y, u.r + 30, _qb);
+      for (k = 0; k < _qb.length; k++) {
+        v = _qb[k];
+        if (v.dead || !isZombie(v)) continue;
+        var rrH = u.r + v.r + inf.touchPad;
+        if (dist2(u.x, u.y, v.x, v.y) <= rrH * rrH) {
+          touchH = true;
+          if (isBossUnit(v)) suitDrain = dt * 5;
+        }
+      }
+      if (touchH) {
+        u.suitHp -= suitDrain;
+        if (u.suitHp <= 0) {
+          u.suitHp = 0; u.suitBroken = true;
+          /* 只有英雄破防才放金光冲击波，普通士兵的防护服破了就安静地碎掉 */
+          if (u.hero) addShock(u.x, u.y, u.r + 26, "rgba(255,215,90,1)");
+        }
+      }
+      continue;                      /* 防护服没破，感染流程整个跳过 */
+    }
+    /* 盾兵被感染不会变成丧尸，而是开始自爆倒计时 */
+    if ((u.kind === "shield" || u.kind === "militia") && u.infectLocked) {
+      u.state = "detonate";
+      u.incubT += dt;
+      if (u.incubT >= CFG.shield.detonateDelay) {
+        shieldDetonate(u);
+        u.dead = true;
+        W.shieldBlasts = (W.shieldBlasts || 0) + 1;
+      }
+      continue;
+    }
+    /* 第一阶段：只要被丧尸（含已变色的感染者）擦到，立刻感染，不可逆 */
+    if (!u.infectLocked) {
+      ZGRID.query(u.x, u.y, u.r + 30, _qb);
+      for (k = 0; k < _qb.length; k++) {
+        v = _qb[k];
+        if (v.dead || !isZombieSide(v)) continue;
+        var rr2 = u.r + v.r + inf.touchPad;
+        if (dist2(u.x, u.y, v.x, v.y) <= rr2 * rr2) {
+          u.infectLocked = true; u.incubT = 0; u.fadeT = 0;
+          addGlow("purple", u.x, u.y);
+          break;
+        }
+      }
+    }
+    if (!u.infectLocked) continue;
+    if (u.incubT < inf.incubation) {
+      /* 第二阶段：无症状期，已经感染，但外观和阵营判定都还是人类 */
+      u.incubT += dt;
+      u.state = "infected";
+    } else {
+      /* 第三阶段：开始变色，从这一刻起被全场当作丧尸判定 */
+      u.fadeT += dt;
+      u.state = "infecting";
+      if (u.fadeT >= inf.fade) convertToZombie(u);
+    }
+  }
+}
+function promoteCivilianToMilitia(u, quiet) {
+  if (!u || u.dead || u.kind !== "civilian") return false;
+  var c = CFG.unit.militia;
+  u.kind = "militia";
+  u.r = c.r;
+  u.vmax = c.vmax * (CFG.speedScale || 1);
+  u.vmaxCur = u.vmax;
+  u.acc = c.acc;
+  u.maxHp = c.hp;
+  u.hp = c.hp;
+  u.magSize = magOf("militia");
+  u.mag = u.magSize;
+  u.reloading = false; u.reloadT = 0;
+  u.state = "idle";
+  if (!quiet) {
+    addGlow("yellow", u.x, u.y);
+    storyLine("特殊事件：一名平民完成武装化", { col: "255,210,74", glow: true, life: 4 });
+  }
+  return true;
+}
+function tryMilitiaEvent() {
+  if (!W || !W.units || RNG.next() >= CFG.militiaEvent.chance) return;
+  var civs = [], i;
+  for (i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (!u.dead && u.kind === "civilian") civs.push(u);
+  }
+  if (!civs.length) return;
+  promoteCivilianToMilitia(civs[Math.floor(RNG.next() * civs.length)]);
+}
+function convertToZombie(u) {
+  SFX.infect(u.x, u.y);
+  /* 尸变也是一种减员：记进淘汰播报，不然场上人类怎么没的完全看不出来。
+     一次尸潮涌上来会连着变，用 infectGap 去重，免得把人类的击杀记录挤掉 */
+  if (W.t - (W.feedInfectT === undefined ? -99 : W.feedInfectT) >= CFG.killfeed.infectGap) {
+    W.feedInfectT = W.t;
+    addKillFeed(null, u, "感染");
+  }
+  u.dead = true;
+  if (u.post) { u.post.taken = null; u.post = null; }
+  var z = addUnit("zombie", u.x, u.y);
+  z.vx = u.vx * 0.5; z.vy = u.vy * 0.5;
+  z.pounceCd = CFG.pounce.cd * 0.5;
+  W.infected++;
+  if (isArmedKind(u.kind)) tryMilitiaEvent();
+}
+/* 感染渐变色：淡绿 -> 紫（HSL 色相 105 -> 275） */
+function infectColorHex(u) {
+  var p = (u.infectLocked && u.incubT >= CFG.infect.incubation) ? clamp(u.fadeT / CFG.infect.fade, 0, 1) : 0;
+  var h = lerp(105, 275, p), s = lerp(62, 70, p), l = lerp(80, 58, p);
+  return hsl2hex(h, s, l);
+}
+function hsl2hex(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  var c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+  var r = 0, g = 0, b = 0;
+  if (h < 60) { r = c; g = x; }
+  else if (h < 120) { r = x; g = c; }
+  else if (h < 180) { g = c; b = x; }
+  else if (h < 240) { g = x; b = c; }
+  else if (h < 300) { r = x; b = c; }
+  else { r = c; b = x; }
+  var R = Math.round((r + m) * 255), G = Math.round((g + m) * 255), B = Math.round((b + m) * 255);
+  return "rgb(" + R + "," + G + "," + B + ")";
+}
+/* --------------------------- 11. 防线岗位 --------------------------------- */
+function nearCover(x, y, r) {
+  var obs = W.obstacles;
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    var nx = clamp(x, o.x, o.x + o.w), ny = clamp(y, o.y, o.y + o.h);
+    if (dist2(x, y, nx, ny) <= r * r) return true;
+  }
+  return false;
+}
+/* ============================================================================
+   地形智能：分析地图上真正值得防守的位置
+   原本的岗位是沿地图右侧两条竖线机械撒点，既不管地形也不管敌人从哪来。
+   这里改成先读地图，再决定站哪儿。
+   ============================================================================ */
+var TERRAIN = {
+  rev: -1,          /* 分析所基于的地形版本（NAV.rev），变了就重算 */
+  main: null,       /* 主连通区域标记：1 = 属于最大连通块，0 = 飞地/不可达 */
+  mainSize: 0,
+  enclaves: [],     /* 封闭据点：{ cx, cy, cells, area, openings } */
+  doors: [],        /* 出口：门对象与关卡点位 */
+  gaps: [],         /* 缺口：被两侧墙夹住的可走格，编辑器画的房子留的口子就是这种 */
+  lanes: [],        /* 通道：{ cx, cy, dir, len } */
+  threatX: -1, threatY: 0   /* 威胁来向（单位向量），由出生区指向人类 */
+};
+
+/* 主连通区域：从地图中心洪泛，能被连通的格子记为 1。
+   飞地（封死的房子、墙里的小空腔）永远不会被标记，后续生成岗位时直接跳过 */
+function computeMainRegion() {
+  var cols = NAV.cols, rows = NAV.rows, n = cols * rows;
+  var mark = new Uint8Array(n);
+  var queue = new Int32Array(n), head = 0, tail = 0;
+  /* 起点：地图中心附近的第一个可走格 */
+  var sc = Math.floor(cols / 2), sr = Math.floor(rows / 2), start = -1;
+  for (var r = 0; r < Math.max(cols, rows) && start < 0; r++) {
+    for (var dy = -r; dy <= r && start < 0; dy++) {
+      for (var dx = -r; dx <= r; dx++) {
+        var cx = sc + dx, cy = sr + dy;
+        if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) continue;
+        if (!NAV.b(cx, cy)) { start = cy * cols + cx; break; }
+      }
+    }
+  }
+  if (start < 0) { TERRAIN.main = mark; TERRAIN.mainSize = 0; return; }
+  mark[start] = 1; queue[tail++] = start;
+  var DX4 = [1, -1, 0, 0], DY4 = [0, 0, 1, -1];
+  while (head < tail) {
+    var cur = queue[head++];
+    var cx2 = cur % cols, cy2 = (cur - cx2) / cols;
+    for (var d = 0; d < 4; d++) {
+      var nx = cx2 + DX4[d], ny = cy2 + DY4[d];
+      if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+      var ni = ny * cols + nx;
+      if (mark[ni]) continue;
+      if (NAV.b(nx, ny)) continue;
+      mark[ni] = 1; queue[tail++] = ni;
+    }
+  }
+  TERRAIN.main = mark;
+  TERRAIN.mainSize = tail;
+}
+/* 这个格子在主连通区域里吗（不可达的飞地一律不算） */
+function inMain(cx, cy) {
+  if (!TERRAIN.main) return true;
+  if (cx < 0 || cy < 0 || cx >= NAV.cols || cy >= NAV.rows) return false;
+  return TERRAIN.main[cy * NAV.cols + cx] === 1;
+}
+
+/* 通道识别：某一格如果左右都是墙、自身可走，就是纵向通道的一格；
+   连续累积成段。同理识别横向通道。通道的价值在于"敌人只能从正面来" */
+function findLanes() {
+  TERRAIN.lanes = [];
+  var cols = NAV.cols, rows = NAV.rows;
+  var i, x, y, len, cx0, cy0;
+  /* 纵向通道 */
+  for (x = 1; x < cols - 1; x++) {
+    len = 0; cy0 = 0;
+    for (y = 0; y < rows; y++) {
+      var wallL = NAV.b(x - 1, y), wallR = NAV.b(x + 1, y), free = !NAV.b(x, y);
+      if (free && wallL && wallR && inMain(x, y)) {
+        if (len === 0) cy0 = y;
+        len++;
+      } else {
+        if (len >= CFG.terrain.laneMin) {
+          TERRAIN.lanes.push({ cx: x, cy: cy0 + (len - 1) / 2, dir: "v", len: len });
+        }
+        len = 0;
+      }
+    }
+    if (len >= CFG.terrain.laneMin) TERRAIN.lanes.push({ cx: x, cy: cy0 + (len - 1) / 2, dir: "v", len: len });
+  }
+  /* 横向通道 */
+  for (y = 1; y < rows - 1; y++) {
+    len = 0; cx0 = 0;
+    for (x = 0; x < cols; x++) {
+      var wallU = NAV.b(x, y - 1), wallD = NAV.b(x, y + 1), free2 = !NAV.b(x, y);
+      if (free2 && wallU && wallD && inMain(x, y)) {
+        if (len === 0) cx0 = x;
+        len++;
+      } else {
+        if (len >= CFG.terrain.laneMin) {
+          TERRAIN.lanes.push({ cx: cx0 + (len - 1) / 2, cy: y, dir: "h", len: len });
+        }
+        len = 0;
+      }
+    }
+    if (len >= CFG.terrain.laneMin) TERRAIN.lanes.push({ cx: cx0 + (len - 1) / 2, cy: y, dir: "h", len: len });
+  }
+}
+
+/* 封闭据点：用"可走格被墙包围的连通块"来找。面积小而完整的就是能守的房子 */
+function findEnclaves() {
+  TERRAIN.enclaves = [];
+  var cols = NAV.cols, rows = NAV.rows, n = cols * rows;
+  var seen = new Uint8Array(n);
+  var queue = new Int32Array(n);
+  var DX8b = [1, -1, 0, 0, 1, 1, -1, -1], DY8b = [0, 0, 1, -1, 1, -1, 1, -1];
+  for (var s = 0; s < n; s++) {
+    if (seen[s] || NAV.b(s % cols, (s / cols) | 0)) { seen[s] = 1; continue; }
+    if (inMain(s % cols, (s / cols) | 0)) { seen[s] = 1; continue; }
+    /* 洪泛这一块 */
+    var head = 0, tail = 0, minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    seen[s] = 1; queue[tail++] = s;
+    var openBorder = 0;
+    while (head < tail) {
+      var cur = queue[head++];
+      var cx = cur % cols, cy = (cur - cx) / cols;
+      if (cx < minX) minX = cx; if (cx > maxX) maxX = cx;
+      if (cy < minY) minY = cy; if (cy > maxY) maxY = cy;
+      /* 数一下这一块"对外开口"有多少（贴着地图边缘算开阔） */
+      if (cx === 0 || cy === 0 || cx === cols - 1 || cy === rows - 1) openBorder++;
+      for (var d = 0; d < 8; d++) {
+        var nx = cx + DX8b[d], ny = cy + DY8b[d];
+        if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+        var ni = ny * cols + nx;
+        if (seen[ni]) continue;
+        if (NAV.b(nx, ny) || inMain(nx, ny)) { seen[ni] = 1; continue; }
+        seen[ni] = 1; queue[tail++] = ni;
+      }
+    }
+    var area = tail;
+    if (area < CFG.terrain.houseMin || area > CFG.terrain.houseMax) continue;
+    /* 太扁的长条不算房子 */
+    var bw = maxX - minX + 1, bh = maxY - minY + 1;
+    if (bw < 3 || bh < 3) continue;
+    if (area / (bw * bh) < 0.45) continue;
+    TERRAIN.enclaves.push({
+      cx: (minX + maxX) / 2, cy: (minY + maxY) / 2,
+      minX: minX, maxX: maxX, minY: minY, maxY: maxY,
+      area: area, openBorder: openBorder
+    });
+  }
+}
+
+/* 威胁来向：从丧尸出生区指向人类质心，归一化成单位向量。
+   岗位应该面朝这个方向，背对敌人守是没意义的 */
+function findEnclaveOpenings() {
+  var tile = NAV.tile, cols = NAV.cols, rows = NAV.rows;
+  var DX = [1, -1, 0, 0], DY = [0, 0, 1, -1];
+  var es = TERRAIN.enclaves || [];
+  for (var i = 0; i < es.length; i++) {
+    var e = es[i], seen = {}, out = [];
+    for (var gy = e.minY; gy <= e.maxY; gy++) {
+      for (var gx = e.minX; gx <= e.maxX; gx++) {
+        if (gx < 0 || gy < 0 || gx >= cols || gy >= rows) continue;
+        if (NAV.b(gx, gy)) continue;
+        var idx = gy * cols + gx;
+        if (TERRAIN.main && TERRAIN.main[idx] === 1) continue;
+        for (var d = 0; d < 4; d++) {
+          var nx = gx + DX[d], ny = gy + DY[d];
+          if (nx < 0 || ny < 0 || nx >= cols || ny >= rows) continue;
+          if (NAV.b(nx, ny)) continue;
+          var ni = ny * cols + nx;
+          if (!TERRAIN.main || TERRAIN.main[ni] !== 1) continue;
+          var key = ni;
+          if (seen[key]) continue;
+          seen[key] = 1;
+          if (out.length < 20) out.push({ x: (nx + 0.5) * tile, y: (ny + 0.5) * tile });
+        }
+      }
+    }
+    e.openings = out;
+    e.openN = out.length;
+  }
+}
+function computeThreatDir() {
+  var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+  var sx = zs.x + zs.w / 2, sy = zs.y + zs.h / 2;
+  var hx = 0, hy = 0, n = 0, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    hx += u.x; hy += u.y; n++;
+  }
+  if (!n) { hx = CFG.world.w / 2; hy = CFG.world.h / 2; }
+  else { hx /= n; hy /= n; }
+  var dx = hx - sx, dy = hy - sy, m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-6) { TERRAIN.threatX = 1; TERRAIN.threatY = 0; return; }
+  TERRAIN.threatX = dx / m; TERRAIN.threatY = dy / m;
+}
+
+/* 收集所有出口：门对象、建筑缺口、撤离点。撤退时这些都是"活路" */
+function collectExits() {
+  TERRAIN.doors = [];
+  var i, d;
+  var drs = W.doors;
+  if (drs) {
+    for (i = 0; i < drs.length; i++) {
+      d = drs[i];
+      TERRAIN.doors.push({ x: d.x + d.w / 2, y: d.y + d.h / 2 });
+    }
+  }
+  /* 关卡里的出生点、撤离点也算出口：往那儿跑通常是安全的 */
+  var L = activeLevel ? activeLevel() : null;
+  if (L) {
+    if (L.evac) TERRAIN.doors.push({ x: L.evac.x, y: L.evac.y });
+    if (L.squad) TERRAIN.doors.push({ x: L.squad.x, y: L.squad.y });
+  }
+}
+
+/* 缺口识别：墙带被切断的地方就是"出口"。
+   逐行 / 逐列扫描：一段可走格如果被两侧的墙夹住、宽度不超过 4 格，
+   并且它嵌在一条墙带里（上下或左右紧贴着墙），那它就是墙上开的一个口子。
+   编辑器里画的房子，墙段之间留的那一两格就是这种缝，从那儿能钻出去。
+   开阔处不会出现"两侧都被墙夹住的窄条"，所以不会污染结果。 */
+function findGaps() {
+  TERRAIN.gaps = [];
+  var cols = NAV.cols, rows = NAV.rows, tile = NAV.tile;
+  var x, y, s, e, w, mid;
+  /* 水平墙带上的开口（墙沿 x 延伸，中间断了一小段） */
+  for (y = 1; y < rows - 1; y++) {
+    x = 0;
+    while (x < cols) {
+      if (NAV.b(x, y)) { x++; continue; }
+      s = x;
+      while (x < cols && !NAV.b(x, y)) x++;
+      e = x - 1;
+      w = e - s + 1;
+      /* 左右被两段墙夹住、自己又只有 4 格以内，这就是墙带断开处留下的口子 */
+      if (w <= 4 && s > 0 && e < cols - 1 && NAV.b(s - 1, y) && NAV.b(e + 1, y)) {
+        mid = (s + e) >> 1;
+        if (inMain(mid, y)) TERRAIN.gaps.push({ x: mid * tile + tile / 2, y: y * tile + tile / 2 });
+      }
+    }
+  }
+  /* 竖直墙带上的开口（墙沿 y 延伸） */
+  for (x = 1; x < cols - 1; x++) {
+    y = 0;
+    while (y < rows) {
+      if (NAV.b(x, y)) { y++; continue; }
+      s = y;
+      while (y < rows && !NAV.b(x, y)) y++;
+      e = y - 1;
+      w = e - s + 1;
+      if (w <= 4 && s > 0 && e < rows - 1 && NAV.b(x, s - 1) && NAV.b(x, e + 1)) {
+        mid = (s + e) >> 1;
+        if (inMain(x, mid)) TERRAIN.gaps.push({ x: x * tile + tile / 2, y: mid * tile + tile / 2 });
+      }
+    }
+  }
+  /* 合并相邻点：导航网格给障碍留了 pad 余量，同一个口子会连着好几列都算"缝"，
+     这里按 56px 半径去重，一个口子只留一个代表点 */
+  var rawGaps = TERRAIN.gaps;
+  TERRAIN.gaps = [];
+  var seenG = new Grid(CFG.world.w, CFG.world.h, 128), tmpG = [];
+  for (var k = 0; k < rawGaps.length; k++) {
+    var gg = rawGaps[k];
+    seenG.query(gg.x, gg.y, 56, tmpG);
+    if (tmpG.length) continue;
+    TERRAIN.gaps.push(gg);
+    seenG.add(gg);
+  }
+  /* 太多就没意义了（说明地图本身很碎），直接清空 */
+  if (TERRAIN.gaps.length > 900) TERRAIN.gaps = [];
+  /* 用空间网格索引，撤退时按半径查询，避免每帧遍历全部缺口 */
+  TERRAIN.gapGrid = new Grid(CFG.world.w, CFG.world.h, 192);
+  for (var gi2 = 0; gi2 < TERRAIN.gaps.length; gi2++) TERRAIN.gapGrid.add(TERRAIN.gaps[gi2]);
+}
+/* 某个位置附近有没有缺口（能钻出去的口子） */
+var _gapOut = [], _gapRes = { hit: false, x: 0, y: 0 };
+function gapNear(x, y, r) {
+  if (!TERRAIN.gapGrid) return null;
+  TERRAIN.gapGrid.query(x, y, r, _gapOut);
+  if (!_gapOut.length) return null;
+  var best = null, bd = r * r;
+  for (var i = 0; i < _gapOut.length; i++) {
+    var g = _gapOut[i];
+    var d = dist2(x, y, g.x, g.y);
+    if (d < bd) { bd = d; best = g; }
+  }
+  return best;
+}
+
+function analyzeTerrain(force) {
+  if (!force && TERRAIN.rev === NAV.rev) return;
+  TERRAIN.rev = NAV.rev;
+  computeMainRegion();
+  findLanes();
+  findEnclaves();
+  findEnclaveOpenings();
+  computeThreatDir();
+  collectExits();
+  findGaps();
+}
+
+/* 沿威胁方向，从某点往外找一个"能站人、面朝敌人、靠掩体"的位置 */
+function tactialSpot(cx, cy, reach) {
+  var tile = NAV.tile;
+  var tx = cx - TERRAIN.threatX * reach, ty = cy - TERRAIN.threatY * reach;
+  var best = null, bestScore = -1e9;
+  for (var r = 0; r <= 3; r++) {
+    for (var a = 0; a < 12; a++) {
+      var ang = TAU * a / 12;
+      var px = tx + Math.cos(ang) * r * tile;
+      var py = ty + Math.sin(ang) * r * tile;
+      var gx = Math.floor(px / tile), gy = Math.floor(py / tile);
+      if (NAV.b(gx, gy)) continue;
+      if (!inMain(gx, gy)) continue;
+      if (px < 60 || py < 60 || px > CFG.world.w - 60 || py > CFG.world.h - 60) continue;
+      /* 打分：靠掩体加分、远离人类质心不减、别离原位置太远 */
+      var s = 0;
+      if (nearCover(px, py, CFG.line.coverMax)) s += 3;
+      s -= r * 0.6;
+      s -= dist2(px, py, cx, cy) / (tile * tile) * 0.15;
+      if (s > bestScore) { bestScore = s; best = { x: px, y: py, taken: null }; }
+    }
+  }
+  return best;
+}
+
+/* 岗位生成：先读地形，再从地形里长出来。
+   原来是在地图右侧两条竖线上机械撒点，不管那里是墙、是空地、还是背对敌人。
+   现在按"能守的地方"来选：房屋内侧、通道两端，并且岗位要面朝丧尸来的方向。 */
+/* 岗位生成：先读地形，再决定站哪儿。
+   原版是在地图右侧两条竖线上机械撒点，不管那里是墙、是空地、还是背对敌人。
+   改成给每个可走格打"掩体分"，选出真正能挡子弹、又能打到敌人的位置。 */
+function buildPosts() {
+  W.posts = [];
+  analyzeTerrain();
+  var T = CFG.terrain, tile = NAV.tile;
+  var i, j, u;
+
+  /* 人类质心：岗位要落在它朝敌人那一侧 */
+  var hx = 0, hy = 0, hn = 0;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    hx += u.x; hy += u.y; hn++;
+  }
+  if (hn) { hx /= hn; hy /= hn; }
+  else { hx = CFG.world.w / 2; hy = CFG.world.h / 2; }
+
+  var tx = TERRAIN.threatX, ty = TERRAIN.threatY;
+  var px = -ty, py = tx;          /* 垂直于威胁方向的侧向轴 */
+
+  var cands = [];
+  for (var gy = 2; gy < NAV.rows - 2; gy += T.sample) {
+    for (var gx = 2; gx < NAV.cols - 2; gx += T.sample) {
+      if (NAV.b(gx, gy) || !inMain(gx, gy)) continue;
+      var wx = gx * tile + tile / 2, wy = gy * tile + tile / 2;
+
+      /* ---- 打分 1：朝敌人方向有没有墙可以挡子弹 ----
+         tx/ty 是"敌人→人类"的方向，所以朝敌人那一侧是 -tx/-ty */
+      var cover = 0;
+      for (j = 1; j <= T.coverR; j++) {
+        var bgx = gx - Math.round(tx * j), bgy = gy - Math.round(ty * j);
+        if (NAV.b(bgx, bgy)) { cover = 3 - (j - 1) * 0.8; break; }
+      }
+      /* ---- 打分 2：左右有没有墙（侧翼掩护，不用怕被包抄） ---- */
+      var flank = 0;
+      for (j = 1; j <= T.flankR; j++) {
+        if (NAV.b(gx + Math.round(px * j), gy + Math.round(py * j))) { flank = 1.5; break; }
+        if (NAV.b(gx - Math.round(px * j), gy - Math.round(py * j))) { flank = 1.5; break; }
+      }
+      /* ---- 打分 3：别站得太开阔，周围 3 格内空旷就减分 ---- */
+      var open = 0;
+      for (j = 0; j < 8; j++) {
+        var ang = TAU * j / 8;
+        var ox = gx + Math.round(Math.cos(ang) * 3), oy = gy + Math.round(Math.sin(ang) * 3);
+        if (!NAV.b(ox, oy)) open++;
+      }
+      var openness = 1 - open / 8;
+
+      /* ---- 打分 4：位置要落在人类质心朝敌人那一侧（前线） ----
+         rel > 0 表示在后方，所以前线分要取负号 */
+      var rel = (wx - hx) * tx + (wy - hy) * ty;
+      var front = -Math.max(-1, Math.min(1, rel / 400));
+
+      var score = cover + flank + openness * 1.2 + front * 2.2 - 0.0;
+      if (tx === 0 && ty === 0) score = cover + flank + openness;
+
+      cands.push({ x: wx, y: wy, s: score });
+    }
+  }
+
+  /* 按分数从高到低取，彼此至少间隔 spacing，避免挤成一坨 */
+  cands.sort(function (a, b) { return b.s - a.s; });
+  var minD2 = T.spacing * T.spacing;
+  for (i = 0; i < cands.length && W.posts.length < T.maxPosts; i++) {
+    var c = cands[i];
+    if (c.s < 0.4) break;
+    var ok = true;
+    for (j = 0; j < W.posts.length; j++) {
+      if (dist2(c.x, c.y, W.posts[j].x, W.posts[j].y) < minD2) { ok = false; break; }
+    }
+    if (ok) W.posts.push({ x: c.x, y: c.y, taken: null });
+  }
+
+  /* ---- 兜底：地图太开阔、找不到掩体时，沿威胁方向拉一道散兵线 ---- */
+  if (W.posts.length < T.minPosts) {
+    var bx = hx - tx * 200, by = hy - ty * 200;   /* 往敌人那一侧退出去 200px */
+    for (j = -8; j <= 8; j++) {
+      var fx = bx + px * j * CFG.line.spacing;
+      var fy = by + py * j * CFG.line.spacing;
+      var fgx = Math.floor(fx / tile), fgy = Math.floor(fy / tile);
+      if (fgx < 1 || fgy < 1 || fgx >= NAV.cols - 1 || fgy >= NAV.rows - 1) continue;
+      if (NAV.b(fgx, fgy) || !inMain(fgx, fgy)) continue;
+      W.posts.push({ x: fx, y: fy, taken: null });
+    }
+  }
+}
+function assignPost(u) {
+  if (u.post && u.post.taken === u) return;
+  var best = null, bd = Infinity;
+  for (var i = 0; i < W.posts.length; i++) {
+    var p = W.posts[i];
+    if (p.taken) continue;
+    var d = dist2(u.x, u.y, p.x, p.y);
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (best) { best.taken = u; u.post = best; }
+}
+/* ------------------------------ 12. 模拟步进 ------------------------------ */
+function cleanup() {
+  var arr = W.units, w = 0;
+  for (var i = 0; i < arr.length; i++) {
+    var u = arr[i];
+    if (u.dead) {
+      if (u.post) { u.post.taken = null; u.post = null; }
+      continue;
+    }
+    arr[w++] = u;
+  }
+  arr.length = w;
+}
+function countUnits() {
+  var z = 0, h = 0, m = 0, civ = 0;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.kind === "mother") m++;
+    var zside = isZombieSide(u);
+    if (zside) z++; else h++;
+    if (isCivilianRole(u) && !zside) civ++;
+  }
+  return { z: z, h: h, m: m, civ: civ };
+}
+/* ===================== 护送模式流程 ===================== */
+/* side: -1 = 左半场，+1 = 右半场（撤离点那一半），0 = 骑在中线上、两侧通用 */
+function edgeSpawnPoints() {
+  var L = activeLevel();
+  if (L && L.zones && L.zones.length) {
+    var out = [], zi;
+    for (zi = 0; zi < L.zones.length; zi++) {
+      var zn = L.zones[zi];
+      out.push({ x0: zn.x, x1: zn.x + zn.w, y0: zn.y, y1: zn.y + zn.h, side: zn.side });
+    }
+    return out;
+  }
+  var w = CFG.world.w, h = CFG.world.h, m = 70, s = 110;
+  return [
+    { x0: w / 2 - s, x1: w / 2 + s, y0: m, y1: m + 80, side: 0 },
+    { x0: w / 2 - s, x1: w / 2 + s, y0: h - m - 80, y1: h - m, side: 0 },
+    { x0: m, x1: m + 80, y0: h / 2 - s, y1: h / 2 + s, side: -1 },
+    { x0: w - m - 80, x1: w - m, y0: h / 2 - s, y1: h / 2 + s, side: 1 },
+    { x0: m, x1: m + 80, y0: m, y1: m + 80, side: -1 },
+    { x0: w - m - 80, x1: w - m, y0: m, y1: m + 80, side: 1 },
+    { x0: m, x1: m + 80, y0: h - m - 80, y1: h - m, side: -1 },
+    { x0: w - m - 80, x1: w - m, y0: h - m - 80, y1: h - m, side: 1 }
+  ];
+}
+/* 这一波该从哪半边压过来。
+   开门后从撤离点那一半（右）刷，丧尸挡在小队撤退的路上；
+   等小队回撤越过中线，就整批换到另一半（左），等于从队伍背后追上来。
+   同一条原则：永远不在队伍所在的半场凭空生成 */
+function escortSpawnSide() {
+  var w = CFG.world.w, cx = 0, n = 0, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u) || u.penned) continue;
+    cx += u.x; n++;
+  }
+  if (n === 0) return 1;
+  return (cx / n > w / 2) ? -1 : 1;
+}
+/* 从地图边缘的刷新点投放一批全图索敌的僵尸，速度带 ±10% 浮动 */
+/* 尸群混编：普通丧尸与奔跑者 20:1，也就是每 21 只里出 1 只奔跑者 */
+function pickZombieKind() {
+  /* 舔舐者 80 : 1，奔跑者 20 : 1，其余是普通丧尸。
+     先判最稀有的那个，否则永远刷不出来 */
+  if (RNG.int(1, 100) === 1) return "bomber";
+  if (RNG.int(1, 80) === 1) return "licker";
+  return (RNG.range(0, 1) < 1 / 21) ? "runner" : "zombie";
+}
+function spawnFromEdge(n, side) {
+  var all = edgeSpawnPoints(), pts = [], i;
+  for (i = 0; i < all.length; i++) {
+    if (side === undefined || all[i].side === 0 || all[i].side === side) pts.push(all[i]);
+  }
+  if (!pts.length) pts = all;
+  for (i = 0; i < n; i++) {
+    if (countUnits().z >= CFG.caps.zombies) return;
+    var p = pts[RNG.int(0, pts.length - 1)];
+    var zk = pickZombieKind();
+    var z = addUnit(zk, RNG.range(p.x0, p.x1), RNG.range(p.y0, p.y1));
+    z.hot = 1;
+    var k = RNG.range(0.9, 1.1);
+    z.vmax = CFG.unit[zk].vmax * k;
+    z.vmaxCur = z.vmax;
+  }
+}
+/* 第一名平民撤离后，在地图离撤离点最远的角落放一只母体 */
+function spawnMotherFar() {
+  var pts = edgeSpawnPoints(), far = pts[0], fd = -1;
+  for (var i = 0; i < pts.length; i++) {
+    var cx = (pts[i].x0 + pts[i].x1) / 2, cy = (pts[i].y0 + pts[i].y1) / 2;
+    var ep = curEvac();
+  var d = dist2(cx, cy, ep.x, ep.y);
+    if (d > fd) { fd = d; far = pts[i]; }
+  }
+  var m = addUnit("mother", (far.x0 + far.x1) / 2, (far.y0 + far.y1) / 2);
+  m.hot = 1;
+  W.motherSpawned = true;
+}
+/* 当前生效的撤离点与小队出生点：玩家在沙盒编辑器里改过就用玩家的布置 */
+function curEvac() {
+  var L = activeLevel();
+  return (L && L.evac) ? L.evac : CFG.escort.evac;
+}
+function curSquadSpawn() {
+  var L = activeLevel();
+  return (L && L.squad) ? L.squad : CFG.escort.evac;
+}
+function curMounds() {
+  var L = activeLevel();
+  return (L && L.mounds && L.mounds.length) ? L.mounds : CFG.escort.mounds;
+}
+/* 护送模式的威胁倍率：营救人数越多，初始尸群与每波刷新量等比上升，但涨幅很小。
+   基准是 baseCivilians（默认 8 人）= 1.0 倍，每多救一名 +4%，最多 +60% */
+function escortThreatScale() {
+  var E = CFG.escort;
+  var n = W.civTotal || LAST_CIV_COUNT || E.baseCivilians;
+  return clamp(1 + (n - E.baseCivilians) * E.civScale, 0.7, E.civScaleMax);
+}
+/* 护送模式当前阶段人类的目的地 */
+/* 撤离阶段的侧翼岗：一半的武装单位（按 id 奇偶分）插到平民队伍的左右两侧，
+   把两翼兜住，而不是全都挤在队伍前面领队 */
+function escortWingSpot(u) {
+  if (u.id % 2 === 0) return null;      /* 另一半继续当领队 */
+  var i, v, cx = 0, cy = 0, n = 0;
+  for (i = 0; i < W.units.length; i++) {
+    v = W.units[i];
+    if (v.dead || v.kind !== "civilian" || isZombieSide(v)) continue;
+    cx += v.x; cy += v.y; n++;
+  }
+  if (n < 2) return null;
+  cx /= n; cy /= n;
+  var obj = escortObjective();
+  if (!obj) return null;
+  var dx = obj.x - cx, dy = obj.y - cy;
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m < 1e-6) return null;
+  dx /= m; dy /= m;
+  var side = (u.id % 4 === 1) ? 1 : -1;          /* 奇数 id 再分左右两侧 */
+  var bx = -dy * side, by = dx * side;
+  var off = CFG.escort.wingDist;
+  /* 稍微落在队伍后侧一点：侧翼是兜后用的，不是冲在前面 */
+  return {
+    x: clamp(cx + bx * off - dx * CFG.escort.wingBack, 24, CFG.world.w - 24),
+    y: clamp(cy + by * off - dy * CFG.escort.wingBack, 24, CFG.world.h - 24)
+  };
+}
+function escortObjective() {
+  if (W.mode !== "escort") return null;
+  var d = W.prisonDoor, E = CFG.escort;
+  if (!d) return null;
+  if (W.phase === "infiltrate") return { x: d.x + 70, y: d.y + d.h / 2 };
+  if (W.phase === "rescue") return { x: d.x + 90, y: d.y + d.h / 2 };
+  var ep2 = curEvac(); return { x: ep2.x, y: ep2.y };
+}
+/* 潜行：躲开休眠丧尸的扫描圈，绕过去而不是硬闯 */
+function stealthAvoid(u) {
+  if (W.mode !== "escort" || W.phase !== "infiltrate") return null;
+  ZGRID.query(u.x, u.y, CFG.escort.scanR + 70, _qc);
+  var ax = 0, ay = 0, n = 0;
+  for (var i = 0; i < _qc.length; i++) {
+    var v = _qc[i];
+    if (v.dead || !isZombie(v) || v.locked) continue;
+    var dx = u.x - v.x, dy = u.y - v.y;
+    var d = Math.sqrt(dx * dx + dy * dy) || 1;
+    if (d > CFG.escort.scanR + 60) continue;
+    var wgt = (CFG.escort.scanR + 60 - d) / (CFG.escort.scanR + 60);
+    ax += dx / d * wgt; ay += dy / d * wgt; n++;
+  }
+  if (!n) return null;
+  var m = Math.sqrt(ax * ax + ay * ay);
+  if (m < 1e-6) return null;
+  return { x: ax / m, y: ay / m };
+}
+function stepEscort(dt) {
+  if (W.mode !== "escort") return;
+  var E = CFG.escort, EV = curEvac(), i, u;
+  /* ① 武装单位摸到大门 → 解除封锁 */
+  if (!W.doorOpen && W.prisonDoor) {
+    var pd = W.prisonDoor;
+    var cx = pd.x + pd.w / 2, cy = pd.y + pd.h / 2;
+    for (i = 0; i < W.units.length; i++) {
+      u = W.units[i];
+      /* 医疗兵同样能解封：既然让他上小队，就不能把他当摆设 */
+      if (u.dead) continue;
+      if (!isArmed(u) && u.kind !== "medic") continue;
+      if (dist2(u.x, u.y, cx, cy) <= E.touchR * E.touchR) {
+        W.doorOpen = true;
+        W.phase = "rescue";
+        W.doorT = E.doorInterval;
+        W.spawnT = E.spawnInterval;   /* 波次从这一刻才开始计时 */
+        storyLine("封锁解除，平民开始转移", { col: "255,226,140", life: 5 });
+    storyLine("撤离点方向出现尸潮", { col: "255,146,146", life: 5 });
+        break;
+      }
+    }
+  }
+  /* ② 大门每 2 秒放行一名平民；屋里没人了立刻转入撤离阶段（避免卡死） */
+  if (W.doorOpen && W.phase === "rescue") {
+    var stillPenned = false;
+    for (i = 0; i < W.units.length; i++) {
+      if (!W.units[i].dead && W.units[i].penned) { stillPenned = true; break; }
+    }
+    if (!stillPenned) {
+      W.phase = "retreat";
+      storyLine("人员转移完毕，全队返回撤离点", { col: "180,255,200", life: 5 });
+    } else {
+      W.doorT -= dt;
+      if (W.doorT <= 0) {
+        W.doorT = E.doorInterval;
+        var pick = null;
+        for (i = 0; i < W.units.length; i++) {
+          if (!W.units[i].dead && W.units[i].penned) { pick = W.units[i]; break; }
+        }
+        if (pick) {
+          pick.penned = false;
+          pick.x = W.prisonDoor.x + 46;
+          pick.y = W.prisonDoor.y + W.prisonDoor.h / 2;
+          pick.vx = 0; pick.vy = 0;
+          W.released++;
+          W.lastReleaseT = W.t;
+        }
+      }
+    }
+  }
+  /* ③ 撤离点：每 2 秒送走一个，平民优先 */
+  if (W.phase === "retreat") {
+    W.evacT -= dt;
+    if (W.evacT <= 0) {
+      var lim = E.evacR * E.evacR, cand = null, bd = lim;
+      for (i = 0; i < W.units.length; i++) {
+        u = W.units[i];
+        if (u.dead || u.penned || u.kind !== "civilian") continue;
+        var d1 = dist2(u.x, u.y, EV.x, EV.y);
+        if (d1 <= bd) { bd = d1; cand = u; }
+      }
+      if (!cand) {
+        bd = lim;
+        for (i = 0; i < W.units.length; i++) {
+          u = W.units[i];
+          if (u.dead || u.penned || !isHuman(u) || isCivilianRole(u)) continue;
+          var d2 = dist2(u.x, u.y, EV.x, EV.y);
+          if (d2 <= bd) { bd = d2; cand = u; }
+        }
+      }
+      if (cand) {
+        var wasCiv = isCivilianRole(cand);
+        cand.dead = true;
+        W.evacCount++;
+        W.score++;
+        W.evacT = E.evacInterval;
+        if (wasCiv && !W.hotPhase) { W.hotPhase = true; spawnMotherFar(); storyLine("人员撤离完毕，尸潮强度上升", { col: "255,146,146", life: 5 }); }
+      }
+    }
+  }
+  /* ④ 波次刷怪：解锁大门之前一只都不刷，场上只有开局布置的休眠尸群。
+     开门后从撤离点半场压过来；小队回撤越过中线后整批换到另一半场。
+     刷新量不分散，该刷的那一波全投到同一侧 */
+  if (W.doorOpen) {
+    W.spawnT -= dt;
+    if (W.spawnT <= 0) {
+      var lo = W.hotPhase ? E.spawnMinHot : E.spawnMin;
+      var hi = W.hotPhase ? E.spawnMaxHot : E.spawnMax;
+      /* 每一波按营救人数放大，再乘"初始兵力系数"；
+         兵力多时不仅一波更多，间隔也会缩短，但缩短幅度有上限，不会无限堆叠 */
+      var mul = escortSquadScale();
+      var wave = Math.max(1, Math.round(RNG.int(lo, hi) * escortThreatScale() * mul));
+      W.spawnT = E.spawnInterval / Math.min(2.0, Math.pow(mul, 0.3));
+      spawnFromEdge(wave, escortSpawnSide());
+    }
+  }
+}
+/* 兵力系数：只看"开局玩家选出并派出的武装单位数"，乘数级缩放。
+   基准 5 名；每多一名，刷新量乘以 armedGrowth（1.18），少一名按同一比例缩小。
+   一个人进场仍然按四成压力刷，不然不是难度问题，是物理上清不完。
+   中途支援/投放不影响这个系数——它是"你带了多少人下本"，不是"你现在还有几个活人" */
+function escortSquadScale() {
+  var n = (W.squadArmed | 0);
+  if (!n) {
+    /* 旧存档/直开局没有记录就退回编成表算一遍 */
+    n = 0;
+    for (var i = 0; i < (LAST_SQUAD || []).length; i++) {
+      if (isArmedKind(LAST_SQUAD[i])) n++;
+    }
+  }
+  if (!n) n = CFG.escort.armedBase;
+  var k = Math.pow(CFG.escort.armedGrowth, n - CFG.escort.armedBase);
+  if (k < 0.4) k = 0.4;
+  if (k > CFG.escort.armedScaleMax) k = CFG.escort.armedScaleMax;
+  return k;
+}
+/* 分出胜负的那一刻放特效：赢放烟花，输泛红光 */
+function startEndFx(result) {
+  if (result === "win") {
+    W.fxWin = CFG.fx.winDur;
+    W.fwT = 0;
+    SFX.firework(W.humanList.length ? W.humanList[0].x : CFG.world.w / 2, CFG.world.h / 2);
+  } else {
+    W.fxLose = CFG.fx.loseDur;
+    SFX.alarm();
+  }
+}
+function checkEnd() {
+  if (W.over) return;
+  var c = countUnits();
+  /* 波次模式下"场上暂时清空"不等于赢：前一波杀完了、下一波还没刷出来的那段空档，
+     必须继续等。只有全部波次都已经投放完毕，清空才算通关 */
+  var wavesLeft = !!(W.waves && W.waves.left > 0);
+  if (W.mode === "escort") {
+    if (c.h === 0) {
+      W.over = true;
+      W.result = (W.totalHumans > 0 && W.evacCount >= W.totalHumans) ? "win" : "lose";
+      startEndFx(W.result);
+    }
+    return;
+  }
+  /* 混沌模式：只看两边的总数，丧尸清空算赢，人类死绝算输 */
+  if (W.mode === "chaos") {
+    if (c.z === 0 && !wavesLeft) { W.over = true; W.result = "win"; startEndFx("win"); }
+    else if (c.h === 0) { W.over = true; W.result = "lose"; startEndFx("lose"); }
+    return;
+  }
+  if (c.z === 0 && !wavesLeft) { W.over = true; W.result = "win"; startEndFx("win"); }
+  /* 平民是必须守住的人：平民全灭即失败 */
+  else if (W.hadCivilians && c.civ === 0) { W.over = true; W.result = "lose"; startEndFx("lose"); }
+  else if (c.h === 0) { W.over = true; W.result = "lose"; startEndFx("lose"); }
+}
+/* 混沌模式：倒计时走完的那一刻，全场身份重排 */
+function chaosConvert() {
+  var civs = [], i, k;
+  for (i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (!u.dead && isCivilianRole(u)) civs.push(u);
+  }
+  var n = civs.length;
+  if (!n) return;
+  /* 打乱顺序，谁变成谁纯随机 */
+  for (i = civs.length - 1; i > 0; i--) {
+    var j = RNG.int(0, i);
+    var t = civs[i]; civs[i] = civs[j]; civs[j] = t;
+  }
+  var mix = CFG.chaos.mix, idx = 0;
+  for (k in mix) {
+    if (!Object.prototype.hasOwnProperty.call(mix, k)) continue;
+    var want = Math.floor(n * mix[k]);
+    if (want < 1) continue;                 /* 不足一个就这局不生成该兵种 */
+    for (i = 0; i < want && idx < civs.length; i++) morphUnit(civs[idx++], k);
+  }
+  /* 母体：基础一只，初始平民每多 200 再加一只；开了英雄模式再加五成。
+     名额要先留出来，否则"剩下的全变普通丧尸"会把所有人都用光 */
+  var momN = 1 + Math.floor(n / CFG.chaos.motherPer);
+  if (CFG.hero.enabled) momN = Math.max(1, Math.round(momN * (1 + CFG.chaos.heroMotherBonus)));
+  var reserve = Math.min(momN, civs.length - idx);
+  var zombieEnd = Math.max(idx, civs.length - reserve);
+  for (; idx < zombieEnd; idx++) morphUnit(civs[idx], "zombie");
+  for (i = 0; i < reserve; i++) morphUnit(civs[idx++], "mother");
+  W.chaosDone = 1;
+  rebuildGrids();
+  storyLine("身份重排完成 · 母体 " + momN + " 只", { col: "200,160,255", life: 5 });
+}
+/* 就地改换兵种：属性、弹药、体型全部按新兵种重置 */
+function morphUnit(u, kind) {
+  var c = CFG.unit[kind];
+  u.kind = kind;
+  u.r = c.r; u.vmax = c.vmax; u.vmaxCur = c.vmax; u.acc = c.acc;
+  /* 丧尸阵营按模式倍率加血 */
+  var hpMul = isZombieKind(kind) ? CFG.game.zombieHpMul : 1;
+  u.hp = c.hp * hpMul; u.maxHp = c.hp * hpMul;
+  u.mag = magOf(kind); u.magSize = magOf(kind);
+  u.reloading = false; u.reloadT = 0;
+  u.path = []; u.pathT = 0;
+  u.target = null; u.nzCache = null;
+  u.state = "idle";
+  if (isHuman(u)) { u.guards = u.guards || []; assignPost(u); }
+  if (kind === "shield") { u.shieldHp = CFG.shield.hp; u.shieldBroken = false; u.shieldT = 0; u.shieldNextWave = CFG.shield.hp * (1 - CFG.shield.pulseStep); }
+  if (kind === "mother") { u.nextSpawnHp = c.hp * (1 - CFG.brood.step); u.hot = 1; }
+  if (kind === "zombie" || kind === "runner") { u.pounceCd = RNG.range(0, 1.5); u.hot = 1; }
+}
+/* ===== 瘟疫巢主：卵、血量分段冲击波与死亡爆裂 ===== */
+function spawnNestEggs(boss) {
+  var D = CFG.plagueNest;
+  var segLeft = plagueSegOf(boss.hp, boss.maxHp);
+  /* 每次产卵数量翻倍；每枚卵只孵化 1 名母体 */
+  var n = Math.max(2, Math.min(12, (6 - segLeft) * 2));
+  for (var i = 0; i < n; i++) {
+    var a = TAU * i / n + RNG.range(-0.25, 0.25);
+    var p = broodSpot(boss, a, boss.r + (D.eggSpawnR || 300) + RNG.range(-24, 24));
+    var e = addUnit("nestEgg", p.x, p.y);
+    if (e) {
+      e.eggOwner = boss;
+      e.eggIdx = i;
+      if (W.bossStats) W.bossStats.plagueEggs++;
+    }
+  }
+  return n;
+}
+function plagueRetreatSpot(u) {
+  var nearest = null, bd = Infinity;
+  for (var i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    var q = dist2(u.x, u.y, h.x, h.y);
+    if (q < bd) { bd = q; nearest = h; }
+  }
+  var awayX = nearest ? (u.x - nearest.x) : -Math.cos(u.faceAng || 0);
+  var awayY = nearest ? (u.y - nearest.y) : -Math.sin(u.faceAng || 0);
+  var am = Math.sqrt(awayX * awayX + awayY * awayY) || 1;
+  awayX /= am; awayY /= am;
+  var best = null, bestScore = -Infinity;
+  for (var ring = 0; ring < 2; ring++) {
+    var rr = u.r * (1.45 + ring * 0.55);
+    for (var k = 0; k < 16; k++) {
+      var a = TAU * k / 16;
+      var px = u.x + Math.cos(a) * rr, py = u.y + Math.sin(a) * rr;
+      px = clamp(px, u.r + 8, CFG.world.w - u.r - 8);
+      py = clamp(py, u.r + 8, CFG.world.h - u.r - 8);
+      if (blockedForPlacement(px, py, Math.min(80, u.r * 0.35))) continue;
+      var open = NAV.openAt(px, py);
+      var dot = Math.cos(a) * awayX + Math.sin(a) * awayY;
+      var score = open * 8 + dot * 3.2 - ring * 0.5;
+      if (score > bestScore) { bestScore = score; best = { x: px, y: py }; }
+    }
+  }
+  if (best) return best;
+  return { x: clamp(u.x + awayX * u.r * 1.2, u.r + 8, CFG.world.w - u.r - 8),
+           y: clamp(u.y + awayY * u.r * 1.2, u.r + 8, CFG.world.h - u.r - 8) };
+}
+function stepPlagueNest(u, dt) {
+  if (u.dead) return;
+  if (u.pnStuckT === undefined) { u.pnStuckT = 0; u.pnStuckX = u.x; u.pnStuckY = u.y; u.pnAvoidT = 0; u.pnAvoidX = u.x; u.pnAvoidY = u.y; }
+  u.eggT = (u.eggT === undefined ? CFG.plagueNest.eggEvery : u.eggT) - dt;
+  if (u.eggT <= 0) {
+    u.eggT = CFG.plagueNest.eggEvery;
+    var laid = spawnNestEggs(u);
+    storyLine("瘟疫巢主产下 " + laid + " 枚疫卵", { col: "170,225,150", life: 3 });
+  }
+  /* 港口中央主通道净宽 820，已经为巢主留足转向空间；
+     这里不再触发窄口回退，否则它会在开阔通道里反复后退。 */
+  var portBossLane = CFG.mapPreset === "port" && Math.abs(u.y - CFG.world.h / 2) < 430;
+  if (portBossLane) u.pnAvoidT = 0;
+  /* 大体型卡在窄口：先退到附近更开阔的位置，让幼体从缺口过去，
+     不在缺口处继续硬挤，避免把整条路封死 */
+  if (!portBossLane && u.pnAvoidT > 0) {
+    u.pnAvoidT -= dt;
+    var rdx = u.pnAvoidX - u.x, rdy = u.pnAvoidY - u.y;
+    var rdm = Math.sqrt(rdx * rdx + rdy * rdy);
+    if (rdm > 2) {
+      var rux = rdx / rdm, ruy = rdy / rdm;
+      u.faceAng = Math.atan2(ruy, rux);
+      /* 大体型不走 A*：窄口附近本来就没有足够宽的路径，直接朝开阔点退 */
+      u.ax = rux * u.acc; u.ay = ruy * u.acc;
+      u.path = []; u.pathT = 0;
+    } else { u.ax = 0; u.ay = 0; }
+    return;
+  }
+  if (portBossLane) {
+    u.pnStuckT = 0; u.pnStuckX = u.x; u.pnStuckY = u.y;
+  } else {
+  u.pnStuckT += dt;
+  if (u.pnStuckT > 1.15) {
+    var moved = dist2(u.x, u.y, u.pnStuckX, u.pnStuckY);
+    if (moved < 22 * 22 && u.target && !u.target.dead) {
+      var rp = plagueRetreatSpot(u);
+      u.pnAvoidX = rp.x; u.pnAvoidY = rp.y;
+      u.pnAvoidT = 3.0;
+      u.pnStuckT = 0; u.pnStuckX = u.x; u.pnStuckY = u.y;
+      u.stuckT = 0; u.pathT = 0;
+      return;
+    }
+    u.pnStuckT = 0; u.pnStuckX = u.x; u.pnStuckY = u.y;
+  }
+  }
+  aiZombieChase(u, dt);
+}
+function stepNestEgg(u, dt) {
+  if (u.dead) return;
+  u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+  u.eggHatch = (u.eggHatch === undefined ? CFG.plagueNest.eggHatch : u.eggHatch) - dt;
+  if (u.eggHatch > 0) return;
+  u.eggReleaseT = (u.eggReleaseT === undefined ? CFG.plagueNest.eggRelease : u.eggReleaseT) - dt;
+  if (u.eggReleaseT > 0) return;
+  u.eggReleaseT = CFG.plagueNest.eggRelease;
+  var a = RNG.range(0, TAU), p = broodSpot(u, a, u.r + 8 + RNG.range(0, 24));
+  var m = addUnit("mother", p.x, p.y);
+  if (m) collideObstacles(m);
+  u.eggReleased = (u.eggReleased || 0) + 1;
+  if (u.eggReleased >= (CFG.plagueNest.eggMax || 3)) {
+    addShock(u.x, u.y, CFG.fearR, "rgba(190,255,180,.9)", Math.max(0.03, CFG.fearR / CFG.bullet.speed));
+    W.bossFx.push({ kind: "eggBurst", x: u.x, y: u.y, t: 0, life: 0.7 });
+    u.dead = true;
+  }
+}
+function plagueSegOf(hp, maxHp) {
+  var r = maxHp > 0 ? hp / maxHp : 0;
+  var p = CFG.plagueNest.segPct || [0.28, 0.24, 0.20, 0.16, 0.12];
+  var cum = 1;
+  for (var i = 0; i < p.length; i++) {
+    cum -= p[i];
+    if (r > cum) return p.length - i;
+  }
+  return hp > 0 ? 1 : 0;
+}
+function bossCheckSegments(boss) {
+  if (!boss || boss.dead) return;
+  var seg = plagueSegOf(boss.hp, boss.maxHp);
+  if (boss.bossSeg === undefined) boss.bossSeg = 5;
+  var guard = 0;
+  while (boss.bossSeg > seg && guard++ < 5) {
+    boss.bossSeg--;
+    bossHpShock(boss);
+  }
+}
+function bossHpShock(boss) {
+  var D = CFG.plagueNest;
+  /* 首领每次释放治愈波，也给自己套一层 10% 最大血量的护盾 */
+  boss.energyShieldHp = (boss.energyShieldHp || 0) + boss.maxHp * 0.1;
+  boss.energyShieldMax = Math.max(boss.energyShieldMax || 0, boss.energyShieldHp);
+  addShock(boss.x, boss.y, D.hpShockR * 1.3, "rgba(155,255,45,1)", D.hpShockLife);
+  addShock(boss.x, boss.y, D.hpShockR * 0.72, "rgba(225,255,145,.85)", D.hpShockLife * 0.8);
+  W.bossFx.push({ kind: "hpShock", x: boss.x, y: boss.y, t: 0, life: D.hpShockLife, visualR: D.hpShockR * 1.45 });
+  W.shakeT = 0.035; W.shakeDur = 0.035; W.shakeMag = 3;
+  /* 巢主每被打掉一格血，在身旁产下 10 名母体 */
+  for (var mi = 0; mi < 10; mi++) {
+    var ma = TAU * mi / 10 + RNG.range(-0.2, 0.2);
+    var mp = broodSpot(boss, ma, boss.r + 80 + RNG.range(0, 140));
+    var mm = addUnit("mother", mp.x, mp.y);
+    if (mm) { collideObstacles(mm); mm.hot = 1; }
+  }
+  for (var i = 0; i < W.units.length; i++) {
+    var z = W.units[i];
+    if (z === boss || z.dead || !isZombieSide(z)) continue;
+    /* 首领级单位不参与首领的治愈冲击波：否则多首领时互相回血叠盾，永远打不死 */
+    if (isBossUnit(z)) continue;
+    var bd = Math.sqrt(dist2(boss.x, boss.y, z.x, z.y)) - (z.r || 0);
+    if (bd > D.hpShockR) continue;
+    if (z.hp < z.maxHp) z.hp = z.maxHp;
+    var gain = (z.maxHp || 1) + Math.floor((z.maxHp || 1) / 10) * 5;
+    z.energyShieldHp = (z.energyShieldHp || 0) + gain;
+    z.energyShieldMax = Math.max(z.energyShieldMax || 0, z.energyShieldHp);
+  }
+}
+
+/* ===== 毁灭暴君：阶段血珠、冲撞与阵亡爆裂 ===== */
+function tyrantInit(u) {
+  if (u.tyState === undefined) u.tyState = "idle";
+  if (u.tyCd === undefined) u.tyCd = 0;
+  if (u.tySearchT === undefined) u.tySearchT = RNG.range(0.1, CFG.tyrant.searchRate);
+  if (u.tySpawnT === undefined) u.tySpawnT = CFG.tyrant.spawnEvery;
+  if (u.tyChargeT === undefined) u.tyChargeT = 0;
+  if (u.tyDashT === undefined) u.tyDashT = 0;
+  if (u.tyDashLen === undefined) u.tyDashLen = 0;
+  if (u.tyShockDone === undefined) u.tyShockDone = 0;
+  if (u.tyHitIds === undefined) u.tyHitIds = null;
+  if (u.tyrantShieldHp === undefined) u.tyrantShieldHp = 0;
+  if (u.tyrantShieldMax === undefined) u.tyrantShieldMax = 0;
+  if (u.tyrantShieldT === undefined) u.tyrantShieldT = 0;
+  if (u.tyrantInvuln === undefined) u.tyrantInvuln = false;
+  if (u.tyrantStageLock === undefined) u.tyrantStageLock = false;
+  if (u.tyrantStageSeq === undefined) u.tyrantStageSeq = 0;
+  if (u.tyShieldHits === undefined) u.tyShieldHits = null;
+  if (u.tyStuckT === undefined) u.tyStuckT = 0;
+  if (u.tyReverseDash === undefined) u.tyReverseDash = false;
+  if (u.tyWallHit === undefined) u.tyWallHit = 0;
+  if (u.tyWallCount === undefined) u.tyWallCount = 0;
+  if (u.tyWallX === undefined) u.tyWallX = u.x;
+  if (u.tyWallY === undefined) u.tyWallY = u.y;
+  if (u.tyReposT === undefined) u.tyReposT = 0;
+  if (u.tyReposStuckT === undefined) u.tyReposStuckT = 0;
+  if (u.tyReposX === undefined) u.tyReposX = u.x;
+  if (u.tyReposY === undefined) u.tyReposY = u.y;
+  if (u.tyNoChargeT === undefined) u.tyNoChargeT = 0;
+  if (u.tyStuckX === undefined) u.tyStuckX = u.x;
+  if (u.tyStuckY === undefined) u.tyStuckY = u.y;
+  if (u.tyBackstepT === undefined) u.tyBackstepT = 0;
+  if (u.tyStagePending === undefined) u.tyStagePending = 0;
+  if (u.tyBackstepCd === undefined) u.tyBackstepCd = 0;
+  if (u.tyBackstepThenRepos === undefined) u.tyBackstepThenRepos = false;
+  if (u.tyBackstepThenCharge === undefined) u.tyBackstepThenCharge = false;
+  if (u.tyFleeT === undefined) u.tyFleeT = 0;
+}
+function tyrantSpawnRunner(boss) {
+  var D = CFG.tyrant;
+  var tyAppear = (W.bossStats && W.bossStats.tyrantAppearances) || 1;
+  var tyBase = Math.floor((D.spawnCount || 1) * (D.spawnInitialMul || 1.35));
+  var tyCount = tyBase * Math.max(1, tyAppear);
+  if (CFG.caps.zombies > 0 && countUnits().z >= CFG.caps.zombies) return;
+  var x = null, y = null;
+  /* 优先使用护送模式的生存区 / 攻防模式的波次刷新区 */
+  var L = activeLevel();
+  if (GAME_MODE === "escort" && L && L.safeZones && L.safeZones.length) {
+    for (var tries = 0; tries < 12 && x === null; tries++) {
+      var sz = L.safeZones[Math.floor(RNG.next() * L.safeZones.length)];
+      var sx = sz.x + RNG.range(8, Math.max(9, sz.w - 8));
+      var sy = sz.y + RNG.range(8, Math.max(9, sz.h - 8));
+      var sp2 = freeSpotNear(sx, sy, 18);
+      if (sp2) { x = sp2.x; y = sp2.y; }
+    }
+  }
+  if (x === null && (GAME_MODE === "defense" || W.mode === "defense")) {
+    var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+    for (var tz = 0; tz < 12 && x === null; tz++) {
+      var wx = zs.x + RNG.range(8, Math.max(9, zs.w - 8));
+      var wy = zs.y + RNG.range(8, Math.max(9, zs.h - 8));
+      var wp = freeSpotNear(wx, wy, 18);
+      if (wp) { x = wp.x; y = wp.y; }
+    }
+  }
+  if (x === null && W.spawners && W.spawners.length) {
+    var sp = W.spawners[Math.floor(RNG.next() * W.spawners.length)];
+    x = sp.x + RNG.range(4, Math.max(5, sp.w - 4));
+    y = sp.y + RNG.range(4, Math.max(5, sp.h - 4));
+  }
+  if (x === null) {
+    var a = RNG.range(0, TAU), p = broodSpot(boss, a, boss.r + 90 + RNG.range(0, 90));
+    x = p.x; y = p.y;
+  }
+  for (var i = 0; i < tyCount; i++) {
+    var z = addUnit("runner", x + RNG.range(-12, 12), y + RNG.range(-12, 12));
+    if (z) { collideObstacles(z); z.hot = 1; z.pounceCd = RNG.range(0, 0.6); if (W.bossStats) W.bossStats.tyrantSpawns++; }
+    if (CFG.caps.zombies > 0 && countUnits().z >= CFG.caps.zombies) break;
+  }
+}
+function tyrantSpawnElites(boss, n) {
+  var D = CFG.tyrant;
+  for (var i = 0; i < n; i++) {
+    if (CFG.caps.zombies > 0 && countUnits().z >= CFG.caps.zombies) break;
+    var a = TAU * i / Math.max(1, n) + RNG.range(-0.15, 0.15);
+    var p = broodSpot(boss, a, boss.r + 36 + RNG.range(0, 70));
+    var e = addUnit("runner", p.x, p.y);
+    if (!e) continue;
+    e.elite = 1; e.r = D.eliteR || 10;
+    e.hp = e.maxHp = D.eliteHp || 15;
+    e.hot = 1; e.pounceCd = RNG.range(0, 0.5);
+    if (W.bossStats) W.bossStats.tyrantSpawns++;
+    collideObstacles(e);
+  }
+}
+function tyrantStageSkill(boss) {
+  if (boss.dead) return;
+  var cap = boss.maxHp * boss.bossSeg / 5;
+  var cands = [], i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u === boss || u.dead || !isZombieSide(u)) continue;
+    if (isBossUnit(u) || u.kind === "nestEgg") continue;
+    if (u.stageKilled) continue;
+    cands.push(u);
+  }
+  if (!cands.length) {
+    tyrantImpactShock(boss.x, boss.y, false);
+    tyrantSpawnElites(boss, CFG.tyrant.stageEliteCount || 30);
+    return;
+  }
+  var killN = Math.floor(cands.length * 2 / 3);
+  if (killN < 1) killN = 1;
+  var total = 0, killed = [], j;
+  for (i = 0; i < killN; i++) {
+    j = i + Math.floor(RNG.next() * (cands.length - i));
+    var tmp = cands[i]; cands[i] = cands[j]; cands[j] = tmp;
+    var v = cands[i];
+    total += Math.max(1, v.hp);
+    v.dead = true; v.stageKilled = 1; v.hp = 0;
+    W.kills++;
+    killed.push(v);
+  }
+  if (!W.bloodOrbs) W.bloodOrbs = [];
+  var maxOrb = Math.max(1, CFG.tyrant.orbMax || 80);
+  var orbN = Math.min(killed.length, maxOrb);
+  var per = total / orbN;
+  for (i = 0; i < orbN; i++) {
+    var src = killed[Math.floor(i * killed.length / orbN)];
+    W.bloodOrbs.push({
+      x: src.x, y: src.y, target: boss, cap: cap,
+      amount: (i === orbN - 1) ? (total - per * (orbN - 1)) : per,
+      speed: CFG.tyrant.orbSpeed || 620, trail: [], t: 0
+    });
+  }
+  boss.tyrantStageSeq = (boss.tyrantStageSeq || 0) + 1;
+  boss.tyrantStageLock = true;
+  boss.tyrantInvuln = true;
+  boss.tyState = "stage";
+  boss.vx = 0; boss.vy = 0; boss.ax = 0; boss.ay = 0;
+  tyrantImpactShock(boss.x, boss.y, false);
+  tyrantSpawnElites(boss, CFG.tyrant.stageEliteCount || 30);
+  storyLine("毁灭暴君吞噬 " + killed.length + " 只丧尸", { col: "235,120,110", life: 3.2 });
+}
+function tyrantCheckSegments(boss) {
+  if (!boss || boss.dead) return;
+  if (boss.tyState === "dash" || boss.tyState === "backstep") { boss.tyStagePending = 1; return; }
+  var seg = Math.max(0, Math.ceil(boss.hp / (boss.maxHp / 5)));
+  if (boss.bossSeg === undefined) boss.bossSeg = 5;
+  var guard = 0;
+  while (boss.bossSeg > seg && guard++ < 5) {
+    boss.bossSeg--;
+    tyrantStageSkill(boss);
+  }
+}
+function tyrantImpactShock(x, y, full) {
+  var D = CFG.tyrant;
+  var R = full ? Math.hypot(CFG.world.w, CFG.world.h) * 1.1 : CFG.fearRCivilian * (CFG.tyrant.shockMul || 3);
+  addShock(x, y, R, "rgba(255,120,45,1)", full ? 1.3 : 0.65);
+  addShock(x, y, R * 0.72, "rgba(255,185,90,.85)", full ? 1.0 : 0.45);
+  addShock(x, y, R * 0.45, "rgba(255,225,150,.55)", full ? 0.8 : 0.32);
+  W.shakeT = full ? 0.55 : 0.18; W.shakeDur = full ? 0.55 : 0.18; W.shakeMag = full ? 12 : 4;
+  var hitN = 0;
+  for (var i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    var dx = h.x - x, dy = h.y - y, d = Math.sqrt(dx * dx + dy * dy);
+    if (!full && d > R) continue;
+    if (d < 1e-6) { dx = 1; dy = 0; d = 1; }
+    h.slowT = Math.max(h.slowT || 0, CFG.bomber.slowT * 2);
+    h.slowMul = CFG.bomber.slowMul;
+    var push = full ? 260 : (170 * (1 - Math.min(1, d / R)) + 90);
+    if (h.airT <= 0) blastKnock(h, dx / d * push, dy / d * push, push, 0);
+    if (h.flyT <= 0) { h.flyDur = 0.5; h.flyT = 0.5; h.flyPeak = full ? 42 : 30; }
+    hitN++;
+  }
+  if (W.bossStats) W.bossStats.tyrantShockHits += hitN;
+  W.glowP = Math.max(W.glowP || 0, full ? 0.35 : 0.12);
+}
+function tyrantDashClear(u, ang, len) {
+  var rad = Math.max(24, u.r * 0.6);
+  var ca = Math.cos(ang), sa = Math.sin(ang);
+  var steps = Math.max(2, Math.min(18, Math.ceil(len / (NAV.tile * 2))));
+  for (var i = 1; i <= steps; i++) {
+    var px = u.x + ca * len * i / steps;
+    var py = u.y + sa * len * i / steps;
+    if (px < u.r || py < u.r || px > CFG.world.w - u.r || py > CFG.world.h - u.r) return false;
+    if (pointBlocked(px, py)) return false;
+    if (!navAreaClear(Math.floor(px / NAV.tile), Math.floor(py / NAV.tile), rad)) return false;
+  }
+  return true;
+}
+function tyrantFindTarget(boss) {
+  var R = CFG.fearRCivilian * CFG.tyrant.searchMul;
+  var best = null, bd = R * R;
+  for (var i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    var d2 = dist2(boss.x, boss.y, h.x, h.y);
+    if (d2 > bd) continue;
+    if (segBlockedByWall(boss.x, boss.y, h.x, h.y)) continue;
+    var da = Math.atan2(h.y - boss.y, h.x - boss.x);
+    if (!tyrantDashClear(boss, da, Math.min(CFG.fearRCivilian * CFG.tyrant.dashLenMul, Math.sqrt(d2) + 30))) continue;
+    bd = d2; best = h;
+  }
+  return best;
+}
+function tyrantStartCharge(u, h) {
+  var D = CFG.tyrant;
+  u.tyState = "charge";
+  u.tyChargeT = D.chargeTime;
+  u.tyAng = Math.atan2(h.y - u.y, h.x - u.x);
+  u.tyDashLen = CFG.fearRCivilian * D.dashLenMul;
+  u.tyTarget = h;
+  u.tyShockDone = 0;
+  u.tyWallHit = 0;
+  u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+  u.tyShieldHits = {};
+  u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+  u.state = "charge";
+}
+function tyrantShieldEdgeHit(boss, x0, y0, x1, y1) {
+  var hit = false;
+  if (!boss.tyShieldHits) boss.tyShieldHits = {};
+  for (var i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h) || !h.domeOn || h.domeHp <= 0) continue;
+    var key = "h" + h.id;
+    if (boss.tyShieldHits[key]) continue;
+    var rr = CFG.fearRCivilian;
+    if (segCircleT(x0, y0, x1, y1, h.x, h.y, rr) < 0) continue;
+    boss.tyShieldHits[key] = 1;
+    h.domeHp -= 20;                 /* domeHp 本身就是秒数 */
+    if (h.domeHp <= 0) {
+      h.domeHp = 0; h.domeOn = false; h.domeDownT = CFG.shield.domeRestore; h.domeIdle = 0;
+    }
+    hit = true;
+  }
+  if (W.domes) {
+    for (var di = 0; di < W.domes.length; di++) {
+      var d = W.domes[di];
+      if (!d || !d.on || d.hp <= 0) continue;
+      var dk = "d" + di;
+      if (boss.tyShieldHits[dk]) continue;
+      if (segCircleT(x0, y0, x1, y1, d.x, d.y, d.R || 260) < 0) continue;
+      boss.tyShieldHits[dk] = 1;
+      d.hp -= 20;
+      if (d.hp <= 0) { d.hp = 0; d.on = false; d.broken = true; d.pending = false; }
+      hit = true;
+    }
+  }
+  return hit;
+}
+function tyrantPickFleeTarget(u) {
+  var hx = 0, hy = 0, hn = 0, i;
+  for (i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    hx += h.x; hy += h.y; hn++;
+  }
+  var base;
+  if (hn) base = Math.atan2(u.y - hy / hn, u.x - hx / hn);
+  else base = (u.tyAng || 0) + Math.PI;
+  var best = null, bestScore = -Infinity;
+  for (var k = 0; k < 13; k++) {
+    var side = (k % 2) ? 1 : -1;
+    var ang = base + side * Math.ceil(k / 2) * 0.42;
+    var rp = freeSpotNear(u.x + Math.cos(ang) * 780, u.y + Math.sin(ang) * 780, 64);
+    if (!rp) continue;
+    var td = dist2(rp.x, rp.y, u.x, u.y);
+    if (td < 420 * 420) continue;
+    var clearance = 1e9;
+    for (i = 0; i < W.units.length; i++) {
+      var hh = W.units[i];
+      if (hh.dead || !isHuman(hh)) continue;
+      clearance = Math.min(clearance, dist2(rp.x, rp.y, hh.x, hh.y));
+    }
+    var score = clearance + td * 0.08;
+    if (score > bestScore) { bestScore = score; best = { x: rp.x, y: rp.y }; }
+  }
+  if (!best) best = { x: u.x + Math.cos(base) * 700, y: u.y + Math.sin(base) * 700 };
+  u.tyFleeX = best.x; u.tyFleeY = best.y; u.tyFleeT = 0;
+}
+function startTyrantBackstep(u, thenRepos, thenCharge) {
+  var away = tyrantAwayDir(u);
+  if (!isFinite(away)) away = (u.tyAng || 0) + Math.PI;
+  u.tyAng = away;
+  u.tyBackstepT = 0.32;
+  u.tyBackstepThenRepos = !!thenRepos;
+  u.tyBackstepThenCharge = !!thenCharge;
+  u.tyBackstepCd = 0;
+  u.tyState = "backstep";
+  u.state = "bossBackstep";
+  u.tyCd = Math.max(u.tyCd || 0, 0.4);
+  u.tyWallHit = 0;
+  u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+}
+function startTyrantReposition(u) {
+  u.tyWallCount = (u.tyWallCount || 0) + 1;
+  var sideAng = (u.tyAng || 0) + ((u.tyWallCount % 2) ? 1 : -1) * Math.PI * 0.55;
+  var rdist = u.r + 320;
+  var rp = null;
+  for (var rk = 0; rk < 9; rk++) {
+    var ra = sideAng + ((rk % 2) ? 1 : -1) * Math.ceil(rk / 2) * 0.42;
+    var cand = freeSpotNear(u.x + Math.cos(ra) * rdist, u.y + Math.sin(ra) * rdist, 48);
+    if (!cand || dist2(cand.x, cand.y, u.x, u.y) < 200 * 200) continue;
+    if (bossLineClear(u, cand)) { rp = cand; sideAng = ra; break; }
+    if (!rp) rp = cand;
+  }
+  if (!rp) rp = freeSpotNear(u.x + Math.cos(sideAng) * rdist, u.y + Math.sin(sideAng) * rdist, 48);
+  u.tyReposX = rp ? rp.x : u.x + Math.cos(sideAng) * rdist;
+  u.tyReposY = rp ? rp.y : u.y + Math.sin(sideAng) * rdist;
+  u.tyReposT = 4.2;
+  u.tyReposCheckX = u.x; u.tyReposCheckY = u.y; u.tyReposStuckT = 0;
+  u.tyNoChargeT = 5.0 + Math.min(2.0, u.tyWallCount * 0.4);
+  u.tyCd = Math.max(u.tyCd || 0, 0.6);
+  u.tyState = "reposition";
+  u.state = "bossReposition";
+  u.tyWallHit = 0;
+  u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+}
+function stepTyrantDash(u, dt) {
+  if (u.tyState !== "dash") return;
+  var D = CFG.tyrant;
+  var total = u.tyDashLen || CFG.fearRCivilian;
+  var speed = total / Math.max(0.1, D.dashDur || 0.55);
+  var step = speed * dt;
+  var ox = u.x, oy = u.y;
+  var nx2 = u.x + Math.cos(u.tyAng) * step;
+  var ny2 = u.y + Math.sin(u.tyAng) * step;
+  var boundaryHit = (nx2 - u.r < 0 || ny2 - u.r < 0 || nx2 + u.r > CFG.world.w || ny2 + u.r > CFG.world.h);
+  if (boundaryHit) {
+    nx2 = clamp(nx2, u.r + 1, CFG.world.w - u.r - 1);
+    ny2 = clamp(ny2, u.r + 1, CFG.world.h - u.r - 1);
+  }
+  var wallHit = pointBlocked(nx2, ny2);
+  u.x = nx2; u.y = ny2;
+  collideObstacles(u);
+  var dashMoved = Math.sqrt((u.x - ox) * (u.x - ox) + (u.y - oy) * (u.y - oy));
+  if (step > 2 && dashMoved < step * 0.35) u.tyWallHit = 1;
+  var shieldHit = tyrantShieldEdgeHit(u, ox, oy, u.x, u.y);
+  if (!u.tyShockDone && (shieldHit || boundaryHit)) {
+    u.tyShockDone = 1;
+    if (boundaryHit) u.tyWallHit = 1;
+    tyrantImpactShock(u.x, u.y, false);
+  }
+  if (!u.tyShockDone) {
+    var hx = 0, hy = 0, hit = false;
+    for (var i = 0; i < W.units.length; i++) {
+      var h = W.units[i];
+      if (h.dead || !isHuman(h)) continue;
+      var rr = u.r + h.r;
+      if (dist2(u.x, u.y, h.x, h.y) <= rr * rr) { hx = h.x; hy = h.y; hit = true; break; }
+    }
+    if (hit || wallHit) {
+      u.tyShockDone = 1;
+      if (hit && W.bossStats) W.bossStats.tyrantDashHits++;
+      if (wallHit && !hit) u.tyWallHit = 1;
+      tyrantImpactShock(hit ? hx : u.x, hit ? hy : u.y, false);
+    }
+  }
+  u.tyDashT -= dt;
+  if (u.tyDashT <= 0) {
+    if (u.tyStagePending) {
+      u.tyStagePending = 0;
+      u.tyDashT = 0; u.tyState = "idle"; u.state = "idle"; u.tyWallHit = 0;
+      tyrantCheckSegments(u);
+      if (u.tyrantStageLock) { u.tyDashLen = 0; u.tyReverseDash = false; return; }
+    }
+    tyrantSpawnElites(u, CFG.tyrant.eliteCount || 10);
+    if (u.tyWallHit || !u.tyReverseDash) {
+      startTyrantBackstep(u, !!u.tyWallHit, !u.tyShockDone);
+    } else if (u.tyWallHit && !u.tyReverseDash) {
+      startTyrantReposition(u);
+    } else {
+      u.tyState = "idle";
+      u.state = "idle";
+      u.tyCd = u.tyReverseDash ? 0 : 2.5;
+      u.tyWallCount = 0;
+      u.tyNoChargeT = 0;
+    }
+    u.tyReverseDash = false;
+    u.tyDashLen = 0;
+    u.tyWallHit = 0;
+    u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+  }
+}
+function tyrantAwayDir(u) {
+  var best = null, bd = Infinity;
+  for (var i = 0; i < W.units.length; i++) {
+    var h = W.units[i];
+    if (h.dead || !isHuman(h)) continue;
+    var d2 = dist2(u.x, u.y, h.x, h.y);
+    if (d2 < bd) { bd = d2; best = h; }
+  }
+  var ax, ay;
+  if (best) { ax = u.x - best.x; ay = u.y - best.y; }
+  else { ax = -Math.cos(u.faceAng || 0); ay = -Math.sin(u.faceAng || 0); }
+  var base = Math.atan2(ay, ax);
+  var offs = [0, 0.55, -0.55, 1.05, -1.05, 1.57, -1.57, 2.2, -2.2];
+  for (var k = 0; k < offs.length; k++) {
+    var a = base + offs[k];
+    var px = u.x + Math.cos(a) * (u.r + 34);
+    var py = u.y + Math.sin(a) * (u.r + 34);
+    if (px < u.r + 4 || py < u.r + 4 || px > CFG.world.w - u.r - 4 || py > CFG.world.h - u.r - 4) continue;
+    if (!pointBlocked(px, py)) return a;
+  }
+  return base;
+}
+function stepTyrant(u, dt) {
+  tyrantInit(u);
+  if (u.dead) return;
+  if (u.tyrantStageLock) {
+    u.tyState = "flee";
+    u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+    if (!W.bloodOrbs || !W.bloodOrbs.length) {
+      u.tyrantStageLock = false;
+      u.tyrantInvuln = false;
+      u.tyState = "idle";
+      u.state = "idle";
+      u.tySearchT = 0.2;
+      u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+      return;
+    }
+    /* 无敌期间锁定一个远处撤离点，避免每帧换方向导致原地抖动 */
+    if (!isFinite(u.tyFleeX) || !isFinite(u.tyFleeY) || dist2(u.x, u.y, u.tyFleeX, u.tyFleeY) < 35 * 35) tyrantPickFleeTarget(u);
+    var fdx = u.tyFleeX - u.x, fdy = u.tyFleeY - u.y, fdm = Math.sqrt(fdx * fdx + fdy * fdy) || 1;
+    var fax = fdx / fdm, fay = fdy / fdm;
+    for (var hi = 0; hi < W.units.length; hi++) {
+      var hh = W.units[hi];
+      if (hh.dead || !isHuman(hh)) continue;
+      var hdx = u.x - hh.x, hdy = u.y - hh.y, hd = Math.sqrt(hdx * hdx + hdy * hdy) || 1;
+      if (hd < 520) { var hw = (520 - hd) / 520 * 1.8; fax += hdx / hd * hw; fay += hdy / hd * hw; }
+    }
+    var fnn = Math.sqrt(fax * fax + fay * fay) || 1;
+    var fa = Math.atan2(fay / fnn, fax / fnn);
+    var fspeed = u.vmax * 8 * dt;
+    var fox = u.x, foy = u.y;
+    u.x += Math.cos(fa) * fspeed;
+    u.y += Math.sin(fa) * fspeed;
+    u.faceAng = fa;
+    collideObstacles(u);
+    u.tyFleeT += dt;
+    if (u.tyFleeT > 0.45) {
+      if (dist2(u.x, u.y, fox, foy) < fspeed * fspeed * 0.06) tyrantPickFleeTarget(u);
+      else u.tyFleeT = 0;
+    }
+    return;
+  }
+  if (u.tyNoChargeT > 0) u.tyNoChargeT -= dt;
+  if (u.tyState === "reposition") {
+    u.tyReposT -= dt;
+    var rdx = u.tyReposX - u.x, rdy = u.tyReposY - u.y;
+    var rdm = Math.sqrt(rdx * rdx + rdy * rdy);
+    u.state = "bossReposition";
+    u.tyReposStuckT += dt;
+    if (u.tyReposStuckT > 0.55) {
+      var rmove = dist2(u.x, u.y, u.tyReposCheckX === undefined ? u.x : u.tyReposCheckX, u.tyReposCheckY === undefined ? u.y : u.tyReposCheckY);
+      if (rmove < 20 * 20) { startTyrantReposition(u); return; }
+      u.tyReposStuckT = 0; u.tyReposCheckX = u.x; u.tyReposCheckY = u.y;
+    }
+    if (rdm > 8) {
+      u.faceAng = Math.atan2(rdy, rdx);
+      u.ax = (rdx / rdm) * u.acc * 1.5;
+      u.ay = (rdy / rdm) * u.acc * 1.5;
+      u.vmaxCur = u.vmax * 1.05;
+    } else {
+      u.ax = 0; u.ay = 0; u.vx = 0; u.vy = 0;
+    }
+    if (rdm <= 18 || u.tyReposT <= 0) {
+      u.tyState = "idle";
+      u.state = "idle";
+      u.tyCd = Math.max(u.tyCd, 0.6);
+      u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+    }
+    return;
+  }
+  if (u.tyrantShieldT > 0) {
+    u.tyrantShieldT -= dt;
+    if (u.tyrantShieldT <= 0) { u.tyrantShieldHp = 0; u.tyrantShieldMax = 0; }
+  }
+  u.tySpawnT -= dt;
+  while (u.tySpawnT <= 0) {
+    u.tySpawnT += CFG.tyrant.spawnEvery || 0.1;
+    tyrantSpawnRunner(u);
+  }
+  if (u.tyState === "charge") {
+    u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+    u.tyChargeT -= dt;
+    if (u.tyChargeT <= 0) {
+      u.tyState = "dash";
+      u.tyDashT = CFG.tyrant.dashDur || 0.55;
+      u.tyShockDone = 0;
+      u.state = "dash";
+    }
+    return;
+  }
+  if (u.tyState === "dash") { stepTyrantDash(u, dt); return; }
+  if (u.tyState === "backstep") {
+    u.tyBackstepT -= dt;
+    var bsSpeed = u.vmax * 5.5;
+    var bnx = u.x + Math.cos(u.tyAng) * bsSpeed * dt;
+    var bny = u.y + Math.sin(u.tyAng) * bsSpeed * dt;
+    u.x = bnx; u.y = bny;
+    collideObstacles(u);
+    u.faceAng = u.tyAng;
+    u.state = "bossBackstep";
+    if (u.tyBackstepT <= 0) {
+      if (u.tyBackstepThenCharge) {
+        u.tyBackstepThenCharge = false;
+        u.tyNoChargeT = 0; u.tyCd = 0;
+        var bh = tyrantFindTarget(u);
+        if (bh) { tyrantStartCharge(u, bh); }
+        else { u.tyState = "idle"; u.state = "idle"; u.tySearchT = 0; }
+      } else if (u.tyBackstepThenRepos) {
+        startTyrantReposition(u);
+      } else {
+        u.tyState = "idle";
+        u.state = "idle";
+        u.tyNoChargeT = Math.max(u.tyNoChargeT || 0, 1.6);
+        u.tyCd = Math.max(u.tyCd || 0, 0.6);
+        u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+      }
+    }
+    return;
+  }
+  if (u.tyCd > 0) u.tyCd -= dt;
+  /* 狭窄地形卡住：不硬挤，朝远离人类的方向反向冲刺一次 */
+  u.tyStuckT += dt;
+  if (u.tyStuckT > 1.2) {
+    var moved = dist2(u.x, u.y, u.tyStuckX, u.tyStuckY);
+    if (moved < 24 * 24) {
+      u.tyAng = tyrantAwayDir(u);
+      startTyrantReposition(u);
+      return;
+    }
+    u.tyStuckT = 0; u.tyStuckX = u.x; u.tyStuckY = u.y;
+  }
+  u.tySearchT -= dt;
+  if (u.tySearchT <= 0) {
+    u.tySearchT = CFG.tyrant.searchRate || 0.5;
+    if (u.tyCd <= 0 && u.tyNoChargeT <= 0 && u.state !== "bossReposition") {
+      var h = tyrantFindTarget(u);
+      if (h) { tyrantStartCharge(u, h); return; }
+    }
+  }
+  aiZombieChase(u, dt);
+}
+function stepBloodOrbs(dt) {
+  var L = W.bloodOrbs;
+  if (!L || !L.length) return;
+  for (var i = L.length - 1; i >= 0; i--) {
+    var o = L[i];
+    var b = o.target;
+    if (!b || b.dead) { L.splice(i, 1); continue; }
+    var dx = b.x - o.x, dy = b.y - o.y, d = Math.sqrt(dx * dx + dy * dy);
+    if (d <= b.r + 12) {
+      var room = Math.max(0, o.cap - b.hp);
+      var heal = Math.min(o.amount, room);
+      b.hp = Math.min(b.maxHp, b.hp + heal);
+      var over = o.amount - heal;
+      if (over > 0) {
+        var sh = over * (CFG.tyrant.shieldMul || 10);
+        b.tyrantShieldHp = Math.max(b.tyrantShieldHp || 0, sh);
+        b.tyrantShieldMax = Math.max(b.tyrantShieldMax || 0, b.tyrantShieldHp);
+        b.tyrantShieldT = CFG.tyrant.shieldDur || 20;
+      }
+      L.splice(i, 1);
+      if (b.kind === "tyrant" && b.tyrantStageLock && L.length === 0) {
+        b.tyrantStageLock = false;
+        b.tyrantInvuln = false;
+        b.tyState = "idle";
+        b.state = "idle";
+      }
+      continue;
+    }
+    var sp = o.speed * dt;
+    o.x += dx / d * sp; o.y += dy / d * sp;
+    o.trail.push(o.x); o.trail.push(o.y);
+    if (o.trail.length > 16) o.trail.splice(0, 2);
+    o.t += dt;
+  }
+}
+function tyrantDeath(v) {
+  v.tyState = "dead";
+  v.tyChargeT = 0; v.tyDashT = 0;
+  tyrantImpactShock(v.x, v.y, true);
+  W.bossFx.push({ kind: "tyrantDeath", x: v.x, y: v.y, t: 0, life: 1.4 });
+  if (W.bloodOrbs) W.bloodOrbs.length = 0;
+}
+function bossDeath(boss) {
+  var D = CFG.plagueNest;
+  W.boss = null;
+  W.bossFx.push({ kind: "death", x: boss.x, y: boss.y, t: 0, life: 1.2 });
+  addShock(boss.x, boss.y, D.hpShockR * 1.25, "rgba(190,245,110,1)", 0.9);
+  addShock(boss.x, boss.y, D.hpShockR * 1.7, "rgba(140,220,120,.8)", 1.15);
+  W.shakeT = 0.07; W.shakeDur = 0.07; W.shakeMag = 7;
+  var n = D.deathMothers || 30;
+  for (var i = 0; i < n; i++) {
+    var a = TAU * i / n + RNG.range(-0.2, 0.2);
+    var p = broodSpot(boss, a, boss.r + (D.deathRadius || 220) * RNG.range(0.35, 1));
+    var m = addUnit("mother", p.x, p.y);
+    if (m) collideObstacles(m);
+  }
+  storyLine("瘟疫巢主爆裂：原地留下十只母体", { col: "190,245,110", life: 5 });
+}
+function stepSim(dt) {
+  LOCK.tick();
+  W.astarLeft = CFG.astarPerFrame;
+  rebuildGrids();
+  /* 混沌模式的开场倒计时：走完之前所有单位原地不动 */
+  if (W.countdown > 0) {
+    W.countdown -= dt;
+    if (W.countdown <= 0) { W.countdown = 0; chaosConvert(); }
+    return;
+  }
+  checkHeroPromotion();
+  /* 刷新能量防护罩列表（通常 0 或 1 个），并结算它的耐久 */
+  W.domes.length = 0;
+  for (var di = 0; di < W.units.length; di++) {
+    var du = W.units[di];
+    if (du.dead || du.kind !== "shield" || !du.hero) continue;
+    stepDome(du, dt);
+    if (du.domeOn) W.domes.push(du);
+  }
+  var hti;
+  for (hti = W.heroTexts.length - 1; hti >= 0; hti--) {
+    W.heroTexts[hti].t -= dt;
+    if (W.heroTexts[hti].t <= 0) W.heroTexts.splice(hti, 1);
+  }
+  /* 护卫编组定期重算：平民找武装单位抱团，名额会随人数比自动上调 */
+  W.squadT -= dt;
+  if (W.squadT <= 0) { W.squadT = CFG.squad.rebalance; rebalanceGuards(); }
+  var i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead) continue;
+    if (u.hitFlash > 0) u.hitFlash -= dt;
+    if (u.tempHpT > 0) { u.tempHpT -= dt; if (u.tempHpT <= 0) { u.tempHpT = 0; u.tempHp = 0; } }
+    if (u.rappeli) { stepRappelUnit(u, dt); continue; }
+    stepFly(u, dt);
+    /* 自爆丧尸蓄爆：钉在原地，倒计时走完就炸 */
+    if (u.armT > 0) {
+      u.armT -= dt;
+      u.vx = 0; u.vy = 0; u.ax = 0; u.ay = 0;
+      if (u.armT <= 0) explodeBomber(u);
+      continue;
+    }
+    if (u.kind === "nestEgg") { stepNestEgg(u, dt); continue; }
+    if (u.kind === "plagueNest") { stepPlagueNest(u, dt); continue; }
+    if (u.kind === "tyrant") { stepTyrant(u, dt); continue; }
+    if (isZombie(u)) {
+      /* 远处降频：跳过本帧 AI 时不清加速度，单位会沿上一帧的惯性继续走 */
+      var lodSkip = false;
+      /* 舔舐者不参与降频：它的读条和冷却都按真实时间走，
+         一旦被 3 帧一次的节流拖住，表现出来就是"半天憋不出一次" */
+      if (CFG.lod.on && u.kind !== "licker") {
+        var ldc = dist2(u.x, u.y, CAM.x, CAM.y);
+        if (ldc > CFG.lod.dist * CFG.lod.dist) {
+          u.lodT = ((u.lodT || 0) + 1) % CFG.lod.step;
+          lodSkip = (u.lodT !== 0);
+        }
+      }
+      if (!lodSkip) aiZombie(u, dt);
+    } else aiHuman(u, dt);
+  }
+  stepBossFx(dt);
+  stepBloodOrbs(dt);
+  stepTongues(dt);
+  stepHeals(dt);
+  stepHealPops(dt);
+  stepBombFx(dt);
+  /* 新兵种的持续伤害/减速要在积分之前结算：这一帧就生效，而不是拖到下一帧 */
+  stepNewUnits(dt);
+  integrate(dt);
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (!u.dead && u.kind !== "nestEgg") { collideObstacles(u); pushOutOfDomes(u); }
+  }
+  separateUnits();
+  /* 分离是靠位置修正把单位推开的，可能把它们顶进墙里，所以必须再解一次障碍 */
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (!u.dead) { collideObstacles(u); pushOutOfDomes(u); }
+  }
+  stepBullets(dt);
+  stepZones(dt);
+  stepSpawners(dt);
+  stepHolds(dt);
+  stepShells(dt);
+  for (var rpi = W.reloadPops.length - 1; rpi >= 0; rpi--) {
+    W.reloadPops[rpi].t -= dt;
+    if (W.reloadPops[rpi].t <= 0) W.reloadPops.splice(rpi, 1);
+  }
+  stepReinforce(dt);
+  stepSupportOps(dt);
+  if (W.craters && W.craters.length) {
+    for (var ci2 = W.craters.length - 1; ci2 >= 0; ci2--) {
+      var cc2 = W.craters[ci2];
+      cc2.age = (cc2.age || 0) + dt;
+      if (cc2.age > 8) W.craters.splice(ci2, 1);
+    }
+  }
+  stepInfection(dt);
+  /* 屏幕反馈计时 */
+  if (W.glowG > 0) W.glowG -= dt;
+  if (W.glowP > 0) W.glowP -= dt;
+  cleanup();
+  W.resources = Math.min(CFG.econ.cap, W.resources + CFG.econ.perSec * dt);
+  W.t += dt;
+  /* 尸群嘶吼：数量越多吼得越低沉，也越密集；只挑离镜头最近的那只发声 */
+  if (SFX.ok && SFX.enabled) {
+    W.groanT -= dt;
+    if (W.groanT <= 0) {
+      var zc = countUnits().z;
+      W.groanT = clamp(3.2 / (1 + Math.log10(zc + 1) * 1.7), 0.45, 3.2) * (0.6 + Math.random() * 0.9);
+      if (zc > 0) {
+        var gpick = null, gbd = Infinity;
+        for (i = 0; i < W.units.length; i++) {
+          u = W.units[i];
+          if (u.dead || !isZombie(u)) continue;
+          var gd = dist2(u.x, u.y, CAM.x, CAM.y);
+          if (gd < gbd) { gbd = gd; gpick = u; }
+        }
+        if (gpick) SFX.groan(gpick.x, gpick.y, clamp(1.18 - Math.log10(zc + 1) * 0.14, 0.55, 1.18));
+      }
+    }
+  }
+  if (W.mode === "escort") stepEscort(dt);
+  recordReplayFrame();
+  checkEnd();
+}
+
+/* ------------------------------ 13. 场景生成 ----------------------------- */
+/* 一面带门的墙：有门就拆成两段，门的位置单独记录给渲染用 */
+function addWallSide(x, y, w, h, vertical, hasDoor, doorSize) {
+  var len = vertical ? h : w;
+  if (!hasDoor || len < doorSize * 2.1) {
+    W.obstacles.push(makeObstacle(x, y, w, h, "wall"));
+    return;
+  }
+  var pos = clamp(Math.floor(RNG.range(len * 0.15, len * 0.85 - doorSize)), 6, len - doorSize - 6);
+  if (pos > 6) {
+    W.obstacles.push(vertical ? makeObstacle(x, y, w, pos, "wall") : makeObstacle(x, y, pos, h, "wall"));
+  }
+  var tail = len - pos - doorSize;
+  if (tail > 6) {
+    W.obstacles.push(vertical ? makeObstacle(x, y + pos + doorSize, w, tail, "wall")
+                              : makeObstacle(x + pos + doorSize, y, tail, h, "wall"));
+  }
+  W.doors.push({
+    x: vertical ? x : x + pos,
+    y: vertical ? y + pos : y,
+    w: vertical ? w : doorSize,
+    h: vertical ? doorSize : h,
+    vertical: vertical
+  });
+}
+/* 中空建筑：四周实心薄墙 + 随机 1~3 个门 */
+/* 建筑体之间的重叠检测：房屋与走廊不得穿插生成 */
+function rectBlocked(x, y, w, h, pad) {
+  var obs = W.obstacles;
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (x - pad < o.x + o.w && x + w + pad > o.x && y - pad < o.y + o.h && y + h + pad > o.y) return true;
+  }
+  return false;
+}
+function addBuilding(x, y, w, h, doorCount, force) {
+  if (!force && rectBlocked(x, y, w, h, 48)) return false;
+  var t = 20, doorSize = 96;
+  var flags = [0, 0, 0, 0], placed = 0, guard = 0;
+  while (placed < doorCount && guard++ < 40) {
+    var si = RNG.int(0, 3);
+    if (flags[si]) continue;
+    flags[si] = 1; placed++;
+  }
+  addWallSide(x, y, w, t, false, flags[0], doorSize);
+  addWallSide(x, y + h - t, w, t, false, flags[1], doorSize);
+  addWallSide(x, y + t, t, h - 2 * t, true, flags[2], doorSize);
+  addWallSide(x + w - t, y + t, t, h - 2 * t, true, flags[3], doorSize);
+  return true;
+}
+/* 长条走廊：两道平行长墙，两端开口 */
+function addCorridor(x, y, w, h, thick, vertical) {
+  if (rectBlocked(x, y, w, h, 48)) return false;
+  if (vertical) {
+    W.obstacles.push(makeObstacle(x, y, thick, h, "wall"));
+    W.obstacles.push(makeObstacle(x + w - thick, y, thick, h, "wall"));
+  } else {
+    W.obstacles.push(makeObstacle(x, y, w, thick, "wall"));
+    W.obstacles.push(makeObstacle(x, y + h - thick, w, thick, "wall"));
+  }
+  return true;
+}
+/* 全场景唯一的矮墙：大本营正前方一排整齐、留有空隙的半墙掩体（只挡移动，子弹可穿透） */
+function addFrontHalfWalls(x, y0, y1, step, len, thick) {
+  for (var y = y0; y + len <= y1; y += step) {
+    W.obstacles.push(makeObstacle(x, y, thick, len, "low"));
+  }
+}
+/* 关押平民的房屋：四周实心墙，只在东侧留一道封锁大门 */
+/* 玩家框出的锁门落在哪面墙上：取门中心离得最近的那一面 */
+function prisonDoorWall(H, rect) {
+  var t = 20;
+  var cx = rect.x + rect.w / 2, cy = rect.y + rect.h / 2;
+  var half = 0;
+  var dL = Math.abs(cx - H.x), dR = Math.abs(cx - (H.x + H.w));
+  var dT = Math.abs(cy - H.y), dB = Math.abs(cy - (H.y + H.h));
+  var m = Math.min(dL, dR, dT, dB);
+  if (m === dL || m === dR) {
+    half = Math.max(50, rect.h) / 2;
+    return { vert: true, side: (m === dR ? 1 : -1),
+             at: clamp(cy, H.y + t + half, H.y + H.h - t - half), len: Math.max(50, rect.h) };
+  }
+  half = Math.max(50, rect.w) / 2;
+  return { vert: false, side: (m === dB ? 1 : -1),
+           at: clamp(cx, H.x + t + half, H.x + H.w - t - half), len: Math.max(50, rect.w) };
+}
+function buildPrisonHouse(H, doorRect) {
+  var t = 20, ds = 120;
+  var vert = true, side = 1, at = H.y + H.h / 2, len = ds;
+  if (doorRect) {
+    var sp = prisonDoorWall(H, doorRect);
+    vert = sp.vert; side = sp.side; at = sp.at; len = sp.len;
+  }
+  var half = len / 2;
+  function push(x, y, w2, h2) { if (w2 > 4 && h2 > 4) W.obstacles.push(makeObstacle(x, y, w2, h2, "wall")); }
+  /* 上下两面墙（门开在某一面墙上时留出缺口） */
+  if (!vert && side < 0) { push(H.x, H.y, at - half - H.x, t); push(at + half, H.y, H.x + H.w - (at + half), t); }
+  else push(H.x, H.y, H.w, t);
+  if (!vert && side > 0) { push(H.x, H.y + H.h - t, at - half - H.x, t); push(at + half, H.y + H.h - t, H.x + H.w - (at + half), t); }
+  else push(H.x, H.y + H.h - t, H.w, t);
+  /* 左右两面墙 */
+  if (vert && side < 0) { push(H.x, H.y + t, t, at - half - (H.y + t)); push(H.x, at + half, t, (H.y + H.h - t) - (at + half)); }
+  else push(H.x, H.y + t, t, H.h - 2 * t);
+  if (vert && side > 0) { push(H.x + H.w - t, H.y + t, t, at - half - (H.y + t)); push(H.x + H.w - t, at + half, t, (H.y + H.h - t) - (at + half)); }
+  else push(H.x + H.w - t, H.y + t, t, H.h - 2 * t);
+  var dd;
+  if (vert) dd = { x: side > 0 ? H.x + H.w - t : H.x, y: at - half, w: t, h: len, vertical: true, prison: true };
+  else dd = { x: at - half, y: side > 0 ? H.y + H.h - t : H.y, w: len, h: t, vertical: false, prison: true };
+  W.doors.push(dd);
+  W.prisonDoor = dd;
+  /* 封锁大门同时是一堵实体墙：平民靠疏散流程"放行"，其余单位一律穿不过（丧尸也不行） */
+  W.obstacles.push({ x: dd.x, y: dd.y, w: dd.w, h: dd.h, kind: "wall",
+    hue: 0, sat: 0, lit: 26, prison: true });
+}
+/* 护送模式的地图：右侧出发 → 中部三道丧尸堆 → 左侧关押平民的房屋 */
+function buildEscortScenario(seed, civCount, squad) {
+  GAME_MODE = "escort";
+  resetWorld(seed);
+  CFG.game.zombieHpMul = 1; CFG.game.knockMul = 1;
+  CFG.game.recoverT = 0; CFG.game.recoverAcc = 1;
+  W.seed = RNG.s;
+  W.mode = "escort";
+  var w = CFG.world.w, h = CFG.world.h, i, k;
+  var L = activeLevel();
+  var H = (L && L.prison) ? L.prison : CFG.escort.house;
+  buildPrisonHouse(H, L ? L.prisonDoor : null);
+  /* 沿途掩体，供潜行绕行利用 */
+  for (i = 0; i < 18; i++) {
+    var bx = RNG.range(920, 3450);
+    var by = RNG.range(130, h - 230);
+    W.obstacles.push(makeObstacle(bx, by, RNG.range(70, 200), RNG.range(26, 58), "low"));
+  }
+  NAV.build(CFG.world, W.obstacles, 9);
+  buildPosts();
+  /* 平民：全部关在房屋内 */
+  var n = Math.min(civCount || 8, CFG.escort.maxCivilians);
+  W.civTotal = n;
+  var guard = 0;
+  for (i = 0; i < n && guard++ < 9000;) {
+    var hx = RNG.range(H.x + 70, H.x + H.w - 95);
+    var hy = RNG.range(H.y + 70, H.y + H.h - 75);
+    if (blockedForPlacement(hx, hy, 14)) continue;
+    addUnit("civilian", hx, hy).penned = true;
+    i++;
+  }
+  W.hadCivilians = n > 0;
+  /* 武装小队：在玩家指定的出生点集结待命（默认是地图最右侧） */
+  var E = curSquadSpawn();
+  var list = (squad && squad.length) ? squad : ["rifle", "rifle", "rifle", "rifle", "rifle", "mg"];
+  var armedN = 0;
+  for (i = 0; i < list.length; i++) if (isArmedKind(list[i])) armedN++;
+  W.squadArmed = armedN;      /* 兵力系数只看开局派出去的这批人，中途补人不算 */
+  for (i = 0; i < list.length; i++) {
+    var sx = clamp(E.x - 80 - (i % 3) * 46, 40, w - 40);
+    var sy = clamp(E.y - 100 + Math.floor(i / 3) * 56, 40, h - 40);
+    if (blockedForPlacement(sx, sy, 14)) { sx = E.x - 40; sy = E.y; }
+    assignPost(addUnit(list[i], sx, sy));
+  }
+  /* 初始丧尸：中间三堆，全部休眠、原地不动。
+     每一堆的大小随营救人数等比放大（倍率见 escortThreatScale） */
+  var threat = escortThreatScale();
+  var mounds = curMounds();
+  for (i = 0; i < mounds.length; i++) {
+    var md = mounds[i];
+    var mn = Math.max(1, Math.round(md.n * threat));
+    for (k = 0; k < mn; k++) {
+      var a = RNG.range(0, TAU), r = RNG.range(0, 118);
+      var zx = clamp(md.x + Math.cos(a) * r, 40, w - 40);
+      var zy = clamp(md.y + Math.sin(a) * r, 40, h - 40);
+      if (blockedForPlacement(zx, zy, 12)) continue;
+      var z = addUnit(pickZombieKind(), zx, zy);
+      z.native = 1;
+      z.scanT = RNG.range(0, 0.25);
+    }
+  }
+  W.spawned = 0;
+  W.totalHumans = n + list.length;
+}
+/* 混沌模式的地图：随机撒一批带门的中空房屋 + 一堆互相错开的短墙。
+   房屋本身自带开口，短墙每段都不超过地图高度的六分之一，
+   所以不可能出现"从地图这头封到那头"的密闭长墙 */
+function buildChaosScenario(seed) {
+  GAME_MODE = "chaos";
+  resetWorld(seed);
+  W.seed = RNG.s;
+  W.mode = "chaos";
+  /* 这个模式里丧尸全员三倍血，同时子弹的击退翻倍 */
+  CFG.game.zombieHpMul = CFG.chaos.zombieHpMul;
+  CFG.game.knockMul = CFG.chaos.knockMul;
+  CFG.game.recoverT = CFG.chaos.recoverT;
+  CFG.game.recoverAcc = CFG.chaos.recoverAcc;
+  var w = CFG.world.w, h = CFG.world.h, i;
+  /* 随机房屋：位置与大小都重新摇一次，每局都不一样 */
+  var nHouse = 12 + RNG.int(0, 8);
+  /* 房屋的单边也不许超过"地图高度六分之一"，免得出现贯穿式的大块体 */
+  var sideCap = Math.round(h / 6);
+  for (i = 0; i < nHouse; i++) {
+    var bw = RNG.range(200, Math.min(500, sideCap)), bh = RNG.range(180, Math.min(430, sideCap));
+    var bx = RNG.range(120, w - bw - 120), by = RNG.range(110, h - bh - 110);
+    addBuilding(bx, by, bw, bh, RNG.int(1, 3));
+  }
+  /* 散落的矮墙与短墙：长度封顶，绝不会连成贯穿整图的死墙 */
+  var nWall = 16 + RNG.int(0, 10);
+  var maxLen = Math.round(h / 6);
+  for (i = 0; i < nWall; i++) {
+    if (RNG.range(0, 1) < 0.5) {
+      var ww = RNG.range(90, maxLen), wy = RNG.range(100, h - 140);
+      var wx = RNG.range(100, w - ww - 100);
+      W.obstacles.push(makeObstacle(wx, wy, ww, RNG.range(18, 26), "wall"));
+    } else {
+      var wh = RNG.range(90, maxLen), wx2 = RNG.range(100, w - 140);
+      var wy2 = RNG.range(100, h - wh - 100);
+      W.obstacles.push(makeObstacle(wx2, wy2, RNG.range(18, 26), wh, "wall"));
+    }
+  }
+  /* 再来一批矮墙（子弹能穿过去那种）当掩体 */
+  for (i = 0; i < 26; i++) {
+    W.obstacles.push(makeObstacle(RNG.range(120, w - 320), RNG.range(120, h - 200),
+      RNG.range(60, 200), RNG.range(22, 30), "low"));
+  }
+  NAV.build(CFG.world, W.obstacles, 9);
+  /* 刚撒完的房屋与短墙有可能互相贴成死角，把某个区域彻底封住，
+     洪泛一遍找出所有"可通行却走不到"的格子，把压在那些格子上的障碍整个拆掉 */
+  var guardPocket = 0;
+  while (guardPocket++ < 10) {
+    var sealed = punchOutPockets();
+    if (!sealed) break;
+  }
+  /* 平民：按网格均匀撒满全图，每个网格随机取一点 */
+  var n = clamp(START.chaosCiv | 0 || CFG.chaos.defCiv, CFG.chaos.minCiv, CFG.chaos.maxCiv);
+  var cell = CFG.chaos.spreadCell;
+  var cols = Math.max(1, Math.ceil(Math.sqrt(n * w / h)));
+  var rows = Math.max(1, Math.ceil(n / cols));
+  var cw = w / cols, chh = h / rows;
+  var placed = 0, guard = 0;
+  for (var ry = 0; ry < rows && placed < n; ry++) {
+    for (var rx = 0; rx < cols && placed < n; rx++) {
+      guard = 0;
+      while (guard++ < 24) {
+        var px = rx * cw + RNG.range(6, Math.max(8, cw - 6));
+        var py = ry * chh + RNG.range(6, Math.max(8, chh - 6));
+        if (blockedForPlacement(px, py, 12)) continue;
+        addUnit("civilian", clamp(px, 24, w - 24), clamp(py, 24, h - 24));
+        placed++;
+        break;
+      }
+    }
+  }
+  W.hadCivilians = true;
+  W.totalHumans = placed;
+  W.civTotal = placed;
+  W.chaosCiv0 = placed;
+  /* 开局先不动：等倒计时走完再洗牌 */
+  W.countdown = CFG.chaos.countdown;
+  W.paused = false;
+}
+/* ---------------------------- 地图预设 ---------------------------- */
+/* 四个固定布局。地图尺寸跟着预设走，所以每个预设都要自己摆好地形和出生位置。
+   town 是原来那张图，其余三个是新增的。 */
+var MAP_PRESETS = {
+  town:    { name: "城镇",     w: 4096, h: 2304 },
+  plains:  { name: "平原",     w: 5120, h: 2880 },
+  indoor:  { name: "室内",     w: 2400, h: 1500 },
+  channel: { name: "H 型通道", w: 3200, h: 1600 },
+  port:    { name: "港口",     w: 4800, h: 2700 }
+};
+/* 各张地图的守军编制不同，打法和地形互相搭。
+   城镇是基准，平原偏救人，室内靠盾兵顶门。 */
+var MAP_SQUADS = {
+  /* 城镇：12 步枪 + 3 机枪，不变 */
+  town:    { rifle: 12, mg: 3 },
+  /* 平原：两名步枪兵换成医疗兵，一名机枪兵换成狙击手，总数还是 15 */
+  plains:  { rifle: 10, mg: 2, medic: 2, sniper: 1 },
+  /* 室内：两名步枪兵换成一名盾兵，总数少一个 */
+  indoor:  { rifle: 10, mg: 3, shield: 1 },
+  /* H 型通道沿用基础编制 */
+  channel: { rifle: 12, mg: 3 },
+  port:    { rifle: 12, mg: 2, sniper: 1 }
+};
+function mapSquadOf(id) {
+  return MAP_SQUADS[id] || MAP_SQUADS.town;
+}
+function applyMapSize(id) {
+  var p = MAP_PRESETS[id] || MAP_PRESETS.town;
+  CFG.world.w = p.w;
+  CFG.world.h = p.h;
+  return p;
+}
+/* 平原：一望无际，只有零星几处残垣。丧尸从左边扫过来，人类在右边守着 */
+function buildPlainsTerrain() {
+  var w = CFG.world.w, h = CFG.world.h, i;
+  /* 大本营：贴着右边缘的一间长屋 */
+  var house = { x: w - 760, y: h * 0.5 - 520, w: 620, h: 1040 };
+  addBuilding(house.x, house.y, house.w, house.h, 3);
+  /* 零星残垣：数量少、位置随机。注意起点必须让开左边的丧尸出生区，
+     否则残垣会正好压在出生点上，把刷出来的丧尸关进封闭的屋子里，最后一只永远打不到 */
+  var sz = mapSpawnZone("plains");
+  var xMin = sz.x + sz.w + 120;   /* 出生区右边再留一点余量 */
+  for (i = 0; i < 9; i++) {
+    var bw = RNG.range(160, 340), bh = RNG.range(120, 260);
+    var bx = RNG.range(xMin, w - 1400);
+    addBuilding(bx, RNG.range(200, h - bh - 200), bw, bh, RNG.int(1, 2));
+  }
+  /* 大片矮墙当掩体，平原上没遮没拦，得给点能趴的东西 */
+  for (i = 0; i < 40; i++) {
+    W.obstacles.push(makeObstacle(RNG.range(220, w - 900), RNG.range(160, h - 220),
+      RNG.range(70, 210), RNG.range(20, 28), "low"));
+  }
+  return house;
+}
+/* 室内：一间大厂房被隔成几个房间，走廊窄，视野短。人类在右下角 */
+function buildIndoorTerrain() {
+  var w = CFG.world.w, h = CFG.world.h, i;
+  /* 外墙 */
+  W.obstacles.push(makeObstacle(0, 0, w, 36, "wall"));
+  W.obstacles.push(makeObstacle(0, h - 36, w, 36, "wall"));
+  W.obstacles.push(makeObstacle(0, 0, 36, h, "wall"));
+  W.obstacles.push(makeObstacle(w - 36, 0, 36, h, "wall"));
+  /* 内部隔断：几道带缺口的墙，把空间切成房间 */
+  W.obstacles.push(makeObstacle(620, 36, 36, h * 0.42, "wall"));
+  W.obstacles.push(makeObstacle(620, h - 36 - h * 0.42, 36, h * 0.42, "wall"));
+  W.obstacles.push(makeObstacle(1250, 36, 36, h * 0.36, "wall"));
+  W.obstacles.push(makeObstacle(1250, h - 36 - h * 0.36, 36, h * 0.36, "wall"));
+  W.obstacles.push(makeObstacle(1900, 36, 36, h * 0.30, "wall"));
+  W.obstacles.push(makeObstacle(1900, h - 36 - h * 0.30, 36, h * 0.30, "wall"));
+  /* 几处矮墙当货架 */
+  for (i = 0; i < 12; i++) {
+    W.obstacles.push(makeObstacle(RNG.range(120, w - 320), RNG.range(120, h - 200),
+      RNG.range(90, 190), RNG.range(22, 30), "low"));
+  }
+  var house = { x: w - 520, y: h - 560, w: 440, h: 470 };
+  return house;
+}
+/* H 型通道（横屏）：左右各一间封闭长房，中间一条水平走廊把两间房连起来。
+   走廊只在房间的侧墙上开口，房间其余部分是完整封闭的矩形空间，
+   两队各占一间，只能通过中间这条走廊交火，专门用来看人机对战。 */
+function buildChannelTerrain() {
+  var w = CFG.world.w, h = CFG.world.h;
+  var roomW = 760;                 /* 两侧房间宽度 */
+  var gap = 170;                   /* 走廊净高（原来 340，收窄一半） */
+  var t = 30;                      /* 墙厚 */
+  var cy = h / 2 - gap / 2;        /* 走廊上沿 */
+  function wallBox(x, y, ww, hh) {
+    if (ww > 2 && hh > 2) W.obstacles.push(makeObstacle(x, y, ww, hh, "wall"));
+  }
+  /* 左房间：上下左右四面墙，只有右墙在走廊高度处断开一段 */
+  wallBox(0, 0, roomW, t);                       /* 上沿 */
+  wallBox(0, h - t, roomW, t);                   /* 下沿 */
+  wallBox(0, 0, t, h);                           /* 左侧外墙 */
+  wallBox(roomW - t, t, t, cy - t);              /* 右墙上段 */
+  wallBox(roomW - t, cy + gap, t, h - t - cy - gap); /* 右墙下段 */
+  /* 右房间：镜像 */
+  wallBox(w - roomW, 0, roomW, t);
+  wallBox(w - roomW, h - t, roomW, t);
+  wallBox(w - t, 0, t, h);
+  wallBox(w - roomW, t, t, cy - t);
+  wallBox(w - roomW, cy + gap, t, h - t - cy - gap);
+  /* 走廊上下沿：实墙封住，人只能沿着走廊走，绕不进房间外那片空地 */
+  wallBox(roomW, cy - t, w - roomW * 2, t);
+  wallBox(roomW, cy + gap, w - roomW * 2, t);
+  /* 走廊里撒两块矮墙当掩体。走廊收窄到 170 之后，掩体也得跟着缩，否则会把通道堵死 */
+  var midY = cy + gap / 2;
+  wallBox(w * 0.44, midY - 10, 90, 20);
+  W.obstacles[W.obstacles.length - 1].kind = "low";
+  wallBox(w * 0.56 - 90, midY - 10, 90, 20);
+  W.obstacles[W.obstacles.length - 1].kind = "low";
+  /* 房间内部完全空着，留给双方自己布阵。人类默认站右房间 */
+  return { x: w - roomW + 80, y: t + 60, w: roomW - 160, h: h - t * 2 - 120 };
+}
+/* 港口：右侧仓库是防线，左侧码头是出生区，中间集装箱堆场切成多条通道。 */
+function buildPortTerrain() {
+  var w = CFG.world.w, h = CFG.world.h;
+  var house = { x: w - 820, y: h / 2 - 520, w: 600, h: 1040 };
+  addBuilding(house.x, house.y, house.w, house.h, 3);
+  var sz = mapSpawnZone("port");
+  var startX = sz.x + sz.w + 180;
+  var cols = 5, rows = 6, i, j;
+  /* 首领体型：瘟疫巢主半径 240，毁灭暴君半径 120。
+     中央横向通道净宽 820，纵向连接带净宽 720，给最大首领留出转向余量。 */
+  var bossLaneY = h / 2;
+  var bossLaneH = 820;
+  var bossLaneX = w * 0.56;
+  var bossLaneW = 720;
+  var firstColSeen = 0;
+  for (j = 0; j < rows; j++) {
+    var rowOff = RNG.range(-65, 65);
+    for (i = 0; i < cols; i++) {
+      /* 规则网格里随机抽掉几格，避免整张图看起来像仓库货架 */
+      if ((i * 3 + j * 5) % 11 === 0) continue;
+      var bx = startX + i * 420 + rowOff + RNG.range(-42, 42);
+      var by = 310 + j * 390 + RNG.range(-32, 32);
+      var bw = 210 + RNG.range(0, 82);
+      var bh = 90 + RNG.range(0, 54);
+      if ((i + j) % 4 === 0) bh += 64;
+      if (bx + bw > w - 1080) continue;
+      /* 第一列最多放两个集装箱，禁止三连排形成直角凹槽 */
+      if (i === 0) {
+        if (firstColSeen === 2) { firstColSeen++; continue; }
+        firstColSeen++;
+      }
+      /* 首领横向主通道：任何集装箱都不许压进来 */
+      if (by + bh > bossLaneY - bossLaneH / 2 && by < bossLaneY + bossLaneH / 2) continue;
+      /* 首领纵向连接带：把上下堆场打通 */
+      if (bx + bw > bossLaneX - bossLaneW / 2 && bx < bossLaneX + bossLaneW / 2) continue;
+      W.obstacles.push(makeObstacle(bx, by, bw, bh, (i + j) % 5 === 0 ? "low" : "wall"));
+      /* 少量双箱并排，增加轮廓变化 */
+      if ((i * 2 + j) % 7 === 0) {
+        W.obstacles.push(makeObstacle(bx + bw + 14, by + RNG.range(-10, 10), 80 + RNG.range(0, 40), bh * 0.8, "wall"));
+      }
+    }
+  }
+  /* 中央护栏也打散，但不能进入首领横向通道 */
+  for (i = 0; i < 9; i++) {
+    var lx = 1120 + i * 270 + RNG.range(-70, 70);
+    var ly = h / 2 + RNG.range(-130, 130);
+    if (ly > bossLaneY - bossLaneH / 2 && ly < bossLaneY + bossLaneH / 2) continue;
+    W.obstacles.push(makeObstacle(lx, ly, 130 + RNG.range(0, 70), 22 + RNG.range(0, 10), "low"));
+  }
+  return { x: house.x + 70, y: house.y + 90, w: house.w - 140, h: house.h - 180 };
+}
+
+function buildScenario(seed, zombieCount) {
+  if (GAME_MODE === "escort") { buildEscortScenario(seed, LAST_CIV_COUNT, LAST_SQUAD); return; }
+  if (GAME_MODE === "chaos") { buildChaosScenario(seed); return; }
+  /* 防线模式：把模式倍率清回原样，别让上一局的混沌设定漏过来 */
+  CFG.game.zombieHpMul = 1; CFG.game.knockMul = 1;
+  CFG.game.recoverT = 0; CFG.game.recoverAcc = 1;
+  /* 先按地形预设把地图尺寸定下来，后面的 NAV、岗位、相机全都读这个值 */
+  applyMapSize(CFG.mapPreset);
+  resetWorld(seed);
+  W.seed = RNG.s;
+  var w = CFG.world.w, h = CFG.world.h, i;
+  /* 1) 大本营：地形按预设生成，返回人类集中的那块区域 */
+  var house;
+  if (CFG.mapPreset === "plains") {
+    house = buildPlainsTerrain();
+  } else if (CFG.mapPreset === "indoor") {
+    house = buildIndoorTerrain();
+  } else if (CFG.mapPreset === "channel") {
+    house = buildChannelTerrain();
+  } else if (CFG.mapPreset === "port") {
+    house = buildPortTerrain();
+  } else {
+    /* 城镇：原来那张图，一砖一瓦都不动 */
+    house = { x: 3060, y: 520, w: 920, h: 1240 };
+    addBuilding(house.x, house.y, house.w, house.h, 3);
+    addBuilding(1080, 240, 470, 400, 2);
+    addBuilding(1120, 1420, 430, 470, 2);
+    addBuilding(2180, 700, 560, 580, 3);
+    addBuilding(2300, 1560, 400, 440, 1);
+    addBuilding(2440, 260, 360, 320, 2);
+    addFrontHalfWalls(2940, 380, 1900, 190, 120, 26);
+  }
+  NAV.build(CFG.world, W.obstacles, 9);
+  buildPosts();
+  /* 4) 人类：集中在幸存者大屋内。平民数量与丧尸数量相同（超出上限时按上限封顶） */
+  var zcountPre = zombieCount || LAST_ZOMBIE_COUNT || CFG.start.baseZombies;
+  var civCount = Math.min(zcountPre, CFG.caps.civilians);
+  if (civCount > 0) W.hadCivilians = true;
+  /* 武装单位沿防线（大本营西侧内墙）排成整齐的一整排，面朝丧尸来袭方向。
+     具体编制跟着地图走，平地救人靠医疗兵跟着，室内窄道靠盾兵顶门 */
+  var armedKinds = [];
+  var squadOfMap = mapSquadOf(CFG.mapPreset), sk;
+  for (sk in squadOfMap) {
+    for (i = 0; i < (squadOfMap[sk] | 0); i++) armedKinds.push(sk);
+  }
+  /* 防线放在大本营西侧外沿，不再缩在墙内；三排交错，给每个人射界和退路 */
+  var lineX = house.x - 120;
+  var ly0 = house.y + 130, ly1 = house.y + house.h - 130;
+  for (i = 0; i < armedKinds.length; i++) {
+    var ly = (armedKinds.length === 1) ? (ly0 + ly1) / 2 : ly0 + (ly1 - ly0) * i / (armedKinds.length - 1);
+    var rank = i % 3;
+    /* 直接落在大本营西侧外沿，不让 nearestFree 把人吸回墙内 */
+    var ax = lineX - rank * 34;
+    var ay = ly + (rank - 1) * 20;
+    var nu = addUnit(armedKinds[i], ax, ay);
+    /* 即使没开「值守岗位」，也给一条西侧外沿的坚守点：不会被队形拉回屋内 */
+    nu.defend = { x: ax, y: ay };
+    assignPost(nu);
+  }
+  /* 平民随机分布在大本营内部（排在武装单位身后） */
+  var civPlaced = 0, guard = 0;
+  while (civPlaced < civCount && guard++ < 40000) {
+    var hx = RNG.range(house.x + 90, house.x + house.w - 50);
+    var hy = RNG.range(house.y + 50, house.y + house.h - 50);
+    if (blockedForPlacement(hx, hy, 14)) continue;
+    assignPost(addUnit("civilian", hx, hy));
+    civPlaced++;
+  }
+  /* 6) 丧尸潮：从左侧涌入，规模由开局面板决定 */
+  var zcount = zombieCount || LAST_ZOMBIE_COUNT || CFG.start.baseZombies;
+  var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+  for (i = 0; i < zcount; i++) {
+    spawnAtFreeSpot(pickZombieKind(), zs);
+  }
+  var mothers = Math.max(1, Math.round(zcount / 60));
+  for (i = 0; i < mothers; i++) {
+    spawnAtFreeSpot("mother", zs);
+  }
+  W.spawned = zcount + mothers;
+}
+/* ------------------------------ 14. 渲染 --------------------------------- */
+var CANVAS = null, CTX = null, DPR = 1, VW = 800, VH = 600, RENDER_NO_HUD = false;
+/* 顶部/底部工具栏是盖在画布上的 DOM，画面里的 HUD 文字要躲开它们 */
+var TOPBAR_H = 0, BOTBAR_H = 0;
+var CAM = { x: 1500, y: 1152, zoom: 0.5, minZ: 0.12, maxZ: 2.4 };
+var QUALITY = { scale: 1, baseDpr: 1, lowT: 0, highT: 0 };
+var GLOW = { canvas: null, ctx: null, w: 0, h: 0 };
+var REC = { rec: null, stream: null, chunks: [], active: false, startedAt: 0, mime: "" };
+var REPLAY = { frames: [], lastT: -1 };
+/* 镜头聚焦：把镜头平滑推到某个世界坐标，期间接管 followPlayerCamera */
+var CAM_FOCUS = null;
+/* 滚轮缩放的目标值与锚点：不直接跳，改成每帧平滑逼近 */
+var ZOOM_TO = null;
+var ZOOM_ANCHOR = { x: 0, y: 0 };
+function centerCamera() {
+  CAM.x = CFG.world.w * 0.42;
+  CAM.y = CFG.world.h / 2;
+  CAM.zoom = clamp(Math.max(VW, VH) / 3000, 0.18, 0.55);
+}
+function ctxHintText() {
+  var touch = isTouchPrimary();
+  if (DIRECTOR.on) {
+    return touch ? "剧情模式：框选单位后点地图下指令 · 点「解除」退出"
+      : "剧情模式：M 移动 · O 跟随 · K 待命 · G 坚守 · 完整键位见「快捷键与操作」";
+  }
+  if (PLAYER.on && PLAYER.unit) {
+    return touch ? "左摇杆移动 · 右摇杆瞄准并开火 · 点「操控」交还 AI"
+      : "R 换弹 · V 开火模式 · 空格 暂停 · 点「操控」交还 AI";
+  }
+  return touch ? "底栏选单位 → 点地图放置 · ☰ 菜单查看设置与键位"
+    : "空格 暂停 · Z 装备市场 · 1–6 快速投放 · 更多键位见 ☰";
+}
+function updateCtxHint() {
+  var el = document.getElementById("ctxHint");
+  if (!el) return;
+  var show = W && W.t > 0 && !W.over && !EDIT.active && !TUTOR.on &&
+    overlayEl && overlayEl.className.indexOf("show") < 0;
+  if (!show) { if (el.className) el.className = ""; return; }
+  var txt = ctxHintText();
+  if (el.textContent !== txt) el.textContent = txt;
+  el.className = "show";
+  /* 场景提示同样移到顶栏下方：底栏上方是场内兵种统计条 */
+  var topBar2 = document.getElementById("top");
+  el.style.bottom = "auto";
+  el.style.top = ((topBar2 && topBar2.offsetHeight ? topBar2.offsetHeight : 56) + 8) + "px";
+}
+function resize() {
+  QUALITY.baseDpr = Math.min(window.devicePixelRatio || 1, 2);
+  DPR = Math.max(0.5, QUALITY.baseDpr * (CFG.quality.enabled ? QUALITY.scale : 1));
+  /* 同样的问题：innerHeight 在手机上是"含地址栏"的高度，画布会比可视区高一截，
+     底部一截按钮就被顶到屏幕外面。优先用 visualViewport 的真实可视尺寸 */
+  var vvp = window.visualViewport;
+  VW = (vvp && vvp.width) || window.innerWidth;
+  VH = (vvp && vvp.height) || window.innerHeight;
+  CANVAS.width = Math.floor(VW * DPR);
+  CANVAS.height = Math.floor(VH * DPR);
+  CANVAS.style.width = VW + "px";
+  CANVAS.style.height = VH + "px";
+  var tb = document.getElementById("top"), bb = document.getElementById("bottom");
+  TOPBAR_H = tb ? (tb.offsetHeight || 0) : 0;
+  BOTBAR_H = bb ? (bb.offsetHeight || 0) : 0;
+  if (toastEl) toastEl.style.bottom = (BOTBAR_H + 22) + "px";
+}
+function w2sx(x) { return (x - CAM.x) * CAM.zoom + VW / 2; }
+function w2sy(y) { return (y - CAM.y) * CAM.zoom + VH / 2; }
+function s2wx(sx) { return (sx - VW / 2) / CAM.zoom + CAM.x; }
+function s2wy(sy) { return (sy - VH / 2) / CAM.zoom + CAM.y; }
+function vis(sx, sy, pad) { return sx > -pad && sx < VW + pad && sy > -pad && sy < VH + pad; }
+/* ============================================================================
+   1.3.3 新兵种的画面：寒冷圈 / 液氮罐 / 火墙 / 火焰束 / 闪电 / 激光柱
+   全部用 Canvas 基本图元画，不引入任何贴图依赖。
+   ============================================================================ */
+function drawCryoFields(z) {
+  var list = W.cryoFields;
+  if (!list || !list.length) return;
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i];
+    var sx = w2sx(f.x), sy = w2sy(f.y);
+    var life = 1 - f.t / f.life;
+    if (!vis(sx, sy, f.r * z + 80)) continue;
+    var grow = clamp(f.t / CFG.cryo.fieldGrow, 0, 1);
+    var rr = f.r * z * (0.25 + 0.75 * grow);
+    /* 底色：淡蓝的冷雾，边缘亮、中心薄 */
+    var g = CTX.createRadialGradient(sx, sy, rr * 0.15, sx, sy, rr);
+    g.addColorStop(0, "rgba(150,225,255," + (0.05 * life).toFixed(3) + ")");
+    g.addColorStop(0.75, "rgba(140,215,255," + (0.13 * life).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(190,240,255," + (0.24 * life).toFixed(3) + ")");
+    CTX.fillStyle = g;
+    CTX.beginPath(); CTX.arc(sx, sy, rr, 0, TAU); CTX.fill();
+    CTX.strokeStyle = "rgba(180,238,255," + (0.55 * life).toFixed(3) + ")";
+    CTX.lineWidth = Math.max(1, 2 * z);
+    CTX.beginPath(); CTX.arc(sx, sy, rr, 0, TAU); CTX.stroke();
+    /* 六边形雪花：沿着圈内缓慢飘，越靠外越淡 */
+    for (var k = 0; k < 9; k++) {
+      /* 雪花位置固定（只上下轻微浮动），不绕圈心转：它不是螺旋桨 */
+      var a = f.seed + k * 0.7;
+      var rad = rr * (0.25 + 0.65 * ((k * 37 % 100) / 100));
+      var bob = Math.sin(W.t * 1.3 + k * 2.1) * 2.6 * z;
+      var px = sx + Math.cos(a) * rad, py = sy + Math.sin(a) * rad * 0.92 + bob;
+      var sz = Math.max(2.2, 5.4 * z) * (0.7 + 0.5 * ((k * 17 % 10) / 10));
+      CTX.strokeStyle = "rgba(225,250,255," + (0.55 * life).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(0.7, 0.9 * z);
+      CTX.beginPath();
+      for (var b = 0; b < 3; b++) {
+        var ba = a * 0.6 + b * Math.PI / 3;
+        CTX.moveTo(px - Math.cos(ba) * sz, py - Math.sin(ba) * sz);
+        CTX.lineTo(px + Math.cos(ba) * sz, py + Math.sin(ba) * sz);
+      }
+      CTX.stroke();
+    }
+  }
+}
+function drawFirePatches(z) {
+  var list = W.firePatches;
+  if (!list || !list.length) return;
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    var sx = w2sx(p.x), sy = w2sy(p.y);
+    var life = 1 - p.t / p.life;
+    if (!vis(sx, sy, p.r * z + 50)) continue;
+    var flick = 0.7 + 0.3 * Math.sin(W.t * (9 + (p.seed % 5)) + p.seed * 3);
+    var rr = p.r * z * (0.85 + 0.25 * flick);
+    /* 一片火 = 三层同心圆：外圈暗红、中间橙、内芯亮黄，叠在一起才像烧着的地面 */
+    CTX.fillStyle = "hsla(" + p.hue + ",100%,42%," + (0.15 * life * flick).toFixed(3) + ")";
+    CTX.beginPath(); CTX.arc(sx, sy, rr * 1.25, 0, TAU); CTX.fill();
+    CTX.fillStyle = "hsla(" + (p.hue + 10) + ",100%,54%," + (0.20 * life * flick).toFixed(3) + ")";
+    CTX.beginPath(); CTX.arc(sx, sy, rr * 0.82, 0, TAU); CTX.fill();
+    CTX.fillStyle = "hsla(" + (p.hue + 20) + ",100%,70%," + (0.13 * life * flick).toFixed(3) + ")";
+    CTX.beginPath(); CTX.arc(sx, sy, rr * 0.46, 0, TAU); CTX.fill();
+    /* 偶尔一点更高的火舌，别让地面看起来像静止的贴图 */
+    var lh = (0.5 + 0.5 * Math.sin(W.t * 15 + p.seed * 5));
+    if (lh > 0.86) {
+      CTX.fillStyle = "hsla(" + (p.hue + 24) + ",100%,76%," + (0.18 * life).toFixed(3) + ")";
+      CTX.beginPath();
+      CTX.arc(sx + Math.cos(p.seed * 4) * rr * 0.3, sy - rr * 0.45, rr * 0.3, 0, TAU);
+      CTX.fill();
+    }
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+/* 火焰粒子：橙色圆片，色相与透明度随机，靠数量堆出火柱的体积 */
+function drawFlameParts(z) {
+  var list = W.flameParts;
+  if (!list || !list.length) return;
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    var sx = w2sx(p.x), sy = w2sy(p.y);
+    if (!vis(sx, sy, p.r * z + 40)) continue;
+    var k = 1 - p.t / p.life;
+    if (k <= 0) continue;
+    CTX.fillStyle = "hsla(" + p.hue + ",100%," + Math.round(54 + 20 * k) + "%," +
+      (p.a * (0.35 + 0.65 * k)).toFixed(3) + ")";
+    CTX.beginPath();
+    CTX.arc(sx, sy, Math.max(1, p.r * z), 0, TAU);
+    CTX.fill();
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+function drawFlameJets(z) {
+  var list = W.flameJets;
+  if (!list || !list.length) return;
+  for (var i = 0; i < list.length; i++) {
+    var j = list[i];
+    var k = 1 - j.t / j.life;
+    if (k <= 0) continue;
+    var len = Math.min(j.len, 46);      /* 只有喷口的一小段亮火，不是长光柱 */
+    var sx = w2sx(j.x), sy = w2sy(j.y);
+    var ex = w2sx(j.x + Math.cos(j.ang) * len), ey = w2sy(j.y + Math.sin(j.ang) * len);
+    if (!vis((sx + ex) / 2, (sy + ey) / 2, 90)) continue;
+    CTX.globalCompositeOperation = "lighter";
+    var g = CTX.createLinearGradient(sx, sy, ex, ey);
+    g.addColorStop(0, "rgba(255,246,190," + (0.62 * k).toFixed(3) + ")");
+    g.addColorStop(0.5, "rgba(255,170,60," + (0.34 * k).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(255,70,20,0)");
+    CTX.strokeStyle = g;
+    CTX.lineCap = "round";
+    CTX.lineWidth = Math.max(8, 20 * z);
+    CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(ex, ey); CTX.stroke();
+    CTX.strokeStyle = "rgba(255,250,220," + (0.5 * k).toFixed(3) + ")";
+    CTX.lineWidth = Math.max(2, 5 * z);
+    CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(ex, ey); CTX.stroke();
+    /* 喷口的光晕 */
+    var gg = CTX.createRadialGradient(sx, sy, 0, sx, sy, 16 * z);
+    gg.addColorStop(0, "rgba(255,240,180," + (0.55 * k).toFixed(3) + ")");
+    gg.addColorStop(1, "rgba(255,120,30,0)");
+    CTX.fillStyle = gg;
+    CTX.beginPath(); CTX.arc(sx, sy, 16 * z, 0, TAU); CTX.fill();
+    CTX.globalCompositeOperation = "source-over";
+  }
+}
+function drawCryoPots(z) {
+  var list = W.cryoPots;
+  if (!list || !list.length) return;
+  for (var i = 0; i < list.length; i++) {
+    var p = list[i];
+    var sx = w2sx(p.x), sy = w2sy(p.y) - p.z * z;
+    if (!vis(sx, sy, 30)) continue;
+    var L = 13 * z, Wd = 6.4 * z;
+    /* 罐子不转：它只是个会闪的危险品警示灯，旋转反而像陀螺 */
+    var blink = 0.45 + 0.55 * (Math.sin(W.t * 26 + p.spin) * 0.5 + 0.5);
+    CTX.save();
+    CTX.translate(sx, sy);
+    CTX.scale(1, 1);
+    /* 罐体：灰色胶囊 */
+    CTX.fillStyle = "rgb(" + Math.round(120 + 60 * blink) + "," + Math.round(126 + 60 * blink) + "," + Math.round(136 + 58 * blink) + ")";
+    CTX.beginPath();
+    if (CTX.roundRect) CTX.roundRect(-L / 2, -Wd / 2, L, Wd, Wd / 2);
+    else CTX.rect(-L / 2, -Wd / 2, L, Wd);
+    CTX.fill();
+    /* 两侧黄黑警示带 */
+    CTX.fillStyle = "rgba(232,192,32," + (0.45 + 0.55 * blink).toFixed(3) + ")";
+    CTX.fillRect(-L * 0.30, -Wd / 2, L * 0.12, Wd);
+    CTX.fillRect(L * 0.12, -Wd / 2, L * 0.12, Wd);
+    CTX.strokeStyle = "rgba(160,230,255," + (0.25 + 0.45 * blink).toFixed(3) + ")";
+    CTX.lineWidth = Math.max(0.6, 0.9 * z);
+    CTX.beginPath();
+    if (CTX.roundRect) CTX.roundRect(-L / 2, -Wd / 2, L, Wd, Wd / 2);
+    else CTX.rect(-L / 2, -Wd / 2, L, Wd);
+    CTX.stroke();
+    CTX.fillStyle = "#1c1c1c";
+    for (var s = 0; s < 2; s++) {
+      var bx = -L * 0.30 + s * L * 0.12;
+      CTX.save();
+      CTX.beginPath(); CTX.rect(bx, -Wd / 2, L * 0.12, Wd); CTX.clip();
+      for (var q = -3; q < 4; q++) {
+        CTX.fillRect(bx + q * 4 * z, -Wd, 1.6 * z, Wd * 2);
+      }
+      CTX.restore();
+    }
+    /* 罐口的十字转接口 + 黑色密封圈 + 黄铜接口 */
+    CTX.strokeStyle = "#1a1a1a"; CTX.lineWidth = Math.max(1, 1.1 * z);
+    CTX.beginPath(); CTX.arc(0, 0, Wd * 0.5, 0, TAU); CTX.stroke();
+    CTX.strokeStyle = "#d8b24a"; CTX.lineWidth = Math.max(1, 1.6 * z);
+    CTX.beginPath();
+    CTX.moveTo(-Wd * 0.55, 0); CTX.lineTo(Wd * 0.55, 0);
+    CTX.moveTo(0, -Wd * 0.55); CTX.lineTo(0, Wd * 0.55);
+    CTX.stroke();
+    /* 顶端的压力表小圆 */
+    CTX.fillStyle = "#c8ccd4";
+    CTX.beginPath(); CTX.arc(-L * 0.22, -Wd * 0.62, Math.max(1.6, 2.6 * z), 0, TAU); CTX.fill();
+    CTX.strokeStyle = "#3a3d42"; CTX.lineWidth = 0.8;
+    CTX.beginPath(); CTX.moveTo(-L * 0.22, -Wd * 0.62);
+    CTX.lineTo(-L * 0.22 + 2 * z, -Wd * 0.62 - 1.4 * z); CTX.stroke();
+    CTX.restore();
+    /* 地面投影，给一点高低感 */
+    CTX.fillStyle = "rgba(0,0,0,0.30)";
+    CTX.beginPath();
+    CTX.ellipse(w2sx(p.x), w2sy(p.y), 7 * z, 3.4 * z, 0, 0, TAU);
+    CTX.fill();
+  }
+}
+function drawTeslaArcs(z) {
+  var list = W.teslaArcs;
+  if (!list || !list.length) return;
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < list.length; i++) {
+    var a = list[i];
+    var k = 1 - a.t / a.life;
+    if (k <= 0) continue;
+    var sx = w2sx(a.x1), sy = w2sy(a.y1), ex = w2sx(a.x2), ey = w2sy(a.y2);
+    if (!vis((sx + ex) / 2, (sy + ey) / 2, Math.abs(ex - sx) + Math.abs(ey - sy))) continue;
+    var dx = ex - sx, dy = ey - sy;
+    var len = Math.sqrt(dx * dx + dy * dy) || 1;
+    var nx = -dy / len, ny = dx / len;
+    var segs = 5;
+    var pts = [];
+    for (var s = 0; s <= segs; s++) {
+      var f = s / segs;
+      var j = (s === 0 || s === segs) ? 0 : Math.sin(a.seed + s * 2.7) * len * 0.055 * (0.5 + 0.8 * Math.sin(a.seed * 3 + s));
+      pts.push([sx + dx * f + nx * j, sy + dy * f + ny * j]);
+    }
+    var tglow = CFG.visualFx.enabled && CFG.visualFx.teslaGlow;
+    CTX.lineJoin = "round";
+    if (tglow) {
+      var tgHalf = Math.max(5, 11 * z);
+      var tgGrad = CTX.createLinearGradient(sx + nx * tgHalf, sy + ny * tgHalf, sx - nx * tgHalf, sy - ny * tgHalf);
+      tgGrad.addColorStop(0, "rgba(80,150,255,0)");
+      tgGrad.addColorStop(0.2, "rgba(80,150,255," + (0.025 * k).toFixed(3) + ")");
+      tgGrad.addColorStop(0.5, "rgba(120,190,255," + (0.13 * k).toFixed(3) + ")");
+      tgGrad.addColorStop(0.8, "rgba(80,150,255," + (0.025 * k).toFixed(3) + ")");
+      tgGrad.addColorStop(1, "rgba(80,150,255,0)");
+      CTX.strokeStyle = tgGrad;
+      CTX.lineWidth = tgHalf * 2;
+      CTX.beginPath();
+      CTX.moveTo(pts[0][0], pts[0][1]);
+      for (var qg = 1; qg < pts.length; qg++) CTX.lineTo(pts[qg][0], pts[qg][1]);
+      CTX.stroke();
+    }
+    for (var pass = 0; pass < 2; pass++) {
+      CTX.strokeStyle = pass === 0 ? "rgba(110,185,255," + (0.62 * k).toFixed(3) + ")" : "rgba(255,248,170," + (0.98 * k).toFixed(3) + ")";
+      CTX.lineWidth = pass === 0 ? Math.max(2.2, 5 * z) : Math.max(0.9, 1.6 * z);
+      CTX.beginPath();
+      CTX.moveTo(pts[0][0], pts[0][1]);
+      for (var q = 1; q < pts.length; q++) CTX.lineTo(pts[q][0], pts[q][1]);
+      CTX.stroke();
+    }
+    if (CFG.visualFx.enabled && CFG.visualFx.teslaGlow && k > 0.25) {
+      var bseed = Math.abs(Math.sin(a.seed * 7.1 + W.t * 5.3));
+      var bp = pts[1 + Math.floor(bseed * (pts.length - 2))], bx = bp[0], by = bp[1];
+      var bside = (Math.sin(a.seed * 3.1 + W.t * 9.7) < 0) ? -1 : 1;
+      var blen = len * (0.10 + 0.10 * bseed);
+      CTX.strokeStyle = "rgba(160,215,255," + (0.5 * k).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(0.8, 1.2 * z);
+      CTX.beginPath(); CTX.moveTo(bx, by); CTX.lineTo(bx + nx * bside * blen + dx * 0.08, by + ny * bside * blen + dy * 0.08); CTX.stroke();
+    }
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+/* 蓄力：光环从射程外缘极快地收进枪口，循环频率很高，看起来才有"聚能"的力量感 */
+/* 一根激光火花：源头略粗、末端略细，中心亮、末端透明——和十字臂同一套标准。
+   细线画法会变成蜘蛛网，所以所有放射状火花都用这个锥形来画 */
+/* 连续照射的颜色阶梯：青绿 → 黄 → 橙 → 红，t 是 0~1 的热度 */
+function laserHeatRGB(t) {
+  t = clamp(t, 0, 1);
+  var stops = [
+    [0.00, 90, 255, 225],
+    [0.33, 255, 232, 90],
+    [0.66, 255, 150, 50],
+    [1.00, 255, 55, 45]
+  ];
+  for (var i = 1; i < stops.length; i++) {
+    if (t <= stops[i][0]) {
+      var A = stops[i - 1], B = stops[i];
+      var k = (t - A[0]) / (B[0] - A[0] || 1);
+      return { r: Math.round(A[1] + (B[1] - A[1]) * k),
+               g: Math.round(A[2] + (B[2] - A[2]) * k),
+               b: Math.round(A[3] + (B[3] - A[3]) * k) };
+    }
+  }
+  return { r: 255, g: 55, b: 45 };
+}
+function drawLaserSpike(cx, cy, dx, dy, len, wBase, wTip, alpha, col) {
+  var cr = col ? col.r : 90, cgc = col ? col.g : 255, cb = col ? col.b : 225;
+  var nx = -dy, ny = dx;
+  var g = CTX.createLinearGradient(cx, cy, cx + dx * len, cy + dy * len);
+  g.addColorStop(0, "rgba(255,255,255," + (0.95 * alpha).toFixed(3) + ")");
+  g.addColorStop(0.5, "rgba(" + cr + "," + cgc + "," + cb + "," + (0.60 * alpha).toFixed(3) + ")");
+  g.addColorStop(1, "rgba(" + Math.round(cr * 0.7) + "," + Math.round(cgc * 0.7) + "," + Math.round(cb * 0.7) + ",0)");
+  CTX.fillStyle = g;
+  CTX.beginPath();
+  CTX.moveTo(cx + nx * wBase / 2, cy + ny * wBase / 2);
+  CTX.lineTo(cx + dx * len + nx * wTip / 2, cy + dy * len + ny * wTip / 2);
+  CTX.lineTo(cx + dx * len - nx * wTip / 2, cy + dy * len - ny * wTip / 2);
+  CTX.lineTo(cx - nx * wBase / 2, cy - ny * wBase / 2);
+  CTX.closePath();
+  CTX.fill();
+}
+function drawLaserCharge(u, sx, sy, z) {
+  var L = CFG.laser;
+  var R0 = laserBeamSpec(u).len * z * L.ringScale;
+  /* 整个蓄力只有三圈：0 / 0.7 / 1.4 秒各放一圈，每圈 0.42 秒收完。
+     后面的圈更宽、更亮——蓄得越久，力量感越足 */
+  var elapsed = L.charge - u.laserT;
+  var marks = [0, 0.7, 1.4];
+  for (var k = 0; k < 3; k++) {
+    var age = elapsed - marks[k];
+    if (age < 0 || age > 0.42) continue;
+    var ph = age / 0.42;
+    var rr = R0 * Math.pow(1 - ph, 1.7) + u.r * z;
+    var alpha = (0.15 + 0.5 * ph) * (0.7 + 0.3 * k) * L.ringAlpha;
+    var lw = (1.8 + k * 2.6) * Math.max(0.8, z) * (1 + ph * 0.6);
+    CTX.strokeStyle = "rgba(120,255,225," + alpha.toFixed(3) + ")";
+    CTX.lineWidth = lw;
+    CTX.beginPath(); CTX.arc(sx, sy, Math.max(u.r * z, rr), 0, TAU); CTX.stroke();
+  }
+  var pr = 1 - u.laserT / L.charge;
+  var orbR = Math.max(2, (5 + 9 * pr) * z);
+  var gg = CTX.createRadialGradient(sx, sy, 0, sx, sy, orbR * 2.4);
+  gg.addColorStop(0, "rgba(240,255,250,0.95)");
+  gg.addColorStop(0.35, "rgba(120,255,225,0.6)");
+  gg.addColorStop(1, "rgba(40,180,160,0)");
+  CTX.fillStyle = gg;
+  CTX.beginPath(); CTX.arc(sx, sy, orbR * 2.4, 0, TAU); CTX.fill();
+}
+function drawSniperSight(z) {
+  if (!PLAYER.on || !PLAYER.unit || PLAYER.unit.kind !== "sniper" || PLAYER.unit.dead) return;
+  if (RENDER_NO_HUD) return;
+  var u = PLAYER.unit;
+  var aim = playerGroundAim(u);
+  var ang = Math.atan2(aim.y - u.y, aim.x - u.x);
+  var maxD = 2600;
+  var wallD = rayWallDistExact(u.x, u.y, ang, maxD);
+  var hitWall = wallD < maxD - 1;
+  var dist = hitWall ? wallD : Math.min(maxD, Math.hypot(aim.x - u.x, aim.y - u.y));
+  var sx = w2sx(u.x), sy = w2sy(u.y);
+  var ex = w2sx(u.x + Math.cos(ang) * dist), ey = w2sy(u.y + Math.sin(ang) * dist);
+  CTX.save();
+  CTX.globalCompositeOperation = "lighter";
+  /* 整条红外线：外层光晕 + 内层细线 */
+  CTX.strokeStyle = "rgba(255,40,35,.16)"; CTX.lineWidth = Math.max(4, 5 * z);
+  CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(ex, ey); CTX.stroke();
+  CTX.strokeStyle = "rgba(255,80,60,.85)"; CTX.lineWidth = Math.max(1, 1.4 * z);
+  CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(ex, ey); CTX.stroke();
+  if (hitWall) {
+    /* 撞墙光点：光晕直径大于光线，核心点也大于光线 */
+    var gl = CTX.createRadialGradient(ex, ey, 0, ex, ey, Math.max(18, 26 * z));
+    gl.addColorStop(0, "rgba(255,90,60,.70)");
+    gl.addColorStop(0.45, "rgba(255,40,30,.28)");
+    gl.addColorStop(1, "rgba(255,20,20,0)");
+    CTX.fillStyle = gl;
+    CTX.beginPath(); CTX.arc(ex, ey, Math.max(18, 26 * z), 0, TAU); CTX.fill();
+    CTX.fillStyle = "rgba(255,230,210,.95)";
+    CTX.beginPath(); CTX.arc(ex, ey, Math.max(2.5, 3.2 * z), 0, TAU); CTX.fill();
+  }
+  CTX.restore();
+}
+function drawLaserHitTrails(z) {
+  var units = W.units, i;
+  CTX.globalCompositeOperation = "lighter";
+  for (i = 0; i < units.length; i++) {
+    var lu = units[i];
+    if (lu.dead || !lu.laserTrailEnd || lu.laserTrailEnd <= W.t) continue;
+    var la = lu.laserTrailAng || 0;
+    /* 直径略大于单位本体，并预留冰壳厚度；画在单位之前，由身体盖住中心，只露出包住身体的边缘 */
+    var trR = Math.max(4, (lu.r + 4) * CAM.zoom * 1.05);
+    var trW = trR * 2;
+    var lx = w2sx(lu.x), ly = w2sy(lu.y);
+    var tailLen = Math.max(56, trR * 4.2);
+    var trA = (lu.laserTrailAlpha === undefined) ? 1 : lu.laserTrailAlpha;
+    var ex = lx + Math.cos(la) * tailLen, ey = ly + Math.sin(la) * tailLen;
+    var lc = (lu.laserTrailR !== undefined) ? { r: lu.laserTrailR, g: lu.laserTrailG, b: lu.laserTrailB } : laserHeatRGB(0.4);
+    var lg = CTX.createLinearGradient(lx, ly, ex, ey);
+    lg.addColorStop(0, "rgba(" + lc.r + "," + lc.g + "," + lc.b + "," + (0.62 * trA).toFixed(3) + ")");
+    lg.addColorStop(0.55, "rgba(" + lc.r + "," + lc.g + "," + lc.b + "," + (0.24 * trA).toFixed(3) + ")");
+    lg.addColorStop(1, "rgba(" + lc.r + "," + lc.g + "," + lc.b + ",0)");
+    CTX.strokeStyle = lg;
+    CTX.lineWidth = trW;
+    CTX.lineCap = "round";
+    CTX.beginPath(); CTX.moveTo(lx, ly); CTX.lineTo(ex, ey); CTX.stroke();
+    CTX.strokeStyle = "rgba(" + lc.r + "," + lc.g + "," + lc.b + "," + (0.55 * trA).toFixed(3) + ")";
+    CTX.lineWidth = Math.max(1, 1.4 * z);
+    CTX.beginPath(); CTX.arc(lx, ly, trR, 0, TAU); CTX.stroke();
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+function drawLaserHitParticles(z) {
+  var lps = W.laserParticles || [];
+  if (!lps.length) return;
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < lps.length; i++) {
+    var p = lps[i];
+    var age = W.t - p.born;
+    if (age < 0 || age > p.life) continue;
+    var al = 1 - age / p.life;
+    var px = w2sx(p.x + p.vx * age), py = w2sy(p.y + p.vy * age);
+    CTX.fillStyle = "rgba(" + p.r + "," + p.g + "," + p.b + "," + (al * 0.85 * (p.a === undefined ? 1 : p.a)).toFixed(3) + ")";
+    CTX.beginPath(); CTX.arc(px, py, Math.max(0.6, p.size * al * CAM.zoom), 0, TAU); CTX.fill();
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+function drawLaserBeams(z) {
+  var units = W.units, i;
+  CTX.globalCompositeOperation = "lighter";
+  for (i = 0; i < units.length; i++) {
+    var u = units[i];
+    if (u.dead || u.kind !== "laser") continue;
+    var sx = w2sx(u.x), sy = w2sy(u.y);
+    if (u.laserPhase === 0 && u.laserT > 0 && u.laserT < CFG.laser.charge) {
+      drawLaserCharge(u, sx, sy, z);
+    }
+    if (u.laserPhase !== 1) continue;
+    var spec = laserBeamSpec(u);
+    var fxK = Math.max(0.8, Math.min(3.2, Math.pow(spec.w / CFG.laser.width, 0.42)));
+    var ca = Math.cos(u.laserAng), sa = Math.sin(u.laserAng);
+    /* 墙体截断：用精确求交，终点正好落在墙面上 */
+    var wallD = rayWallDistExact(u.x, u.y, u.laserAng, spec.len);
+    var len = Math.min(u.laserLen > 0 ? u.laserLen : spec.len, wallD);
+    if (len < 4) continue;
+    var nx = -sa, ny = ca;
+    var halfW = spec.w / 2;
+    var taper = Math.min(CFG.laser.taper, len * 0.6);
+    /* 光束轮廓：起点极细 → 两个身位内按半椭圆张到全宽 → 之后等宽，由长度渐变淡出 */
+    var steps = 18;
+    CTX.beginPath();
+    for (var s2 = 0; s2 <= steps; s2++) {
+      var f = s2 / steps, d = f * len;
+      var hw = (d < taper) ? halfW * Math.sin((d / taper) * Math.PI / 2) : halfW;
+      var wx = u.x + ca * d + nx * hw, wy = u.y + sa * d + ny * hw;
+      var px = w2sx(wx), py = w2sy(wy);
+      if (s2 === 0) CTX.moveTo(px, py); else CTX.lineTo(px, py);
+    }
+    for (var s3 = steps; s3 >= 0; s3--) {
+      var f3 = s3 / steps, d3 = f3 * len;
+      var hw3 = (d3 < taper) ? halfW * Math.sin((d3 / taper) * Math.PI / 2) : halfW;
+      var wx3 = u.x + ca * d3 - nx * hw3, wy3 = u.y + sa * d3 - ny * hw3;
+      CTX.lineTo(w2sx(wx3), w2sy(wy3));
+    }
+    CTX.closePath();
+    var tipX = w2sx(u.x + ca * len), tipY = w2sy(u.y + sa * len);
+    var hcB = laserHeatRGB((u.laserHeat || 0) / CFG.laser.heatMax);
+    var g2 = CTX.createLinearGradient(sx, sy, tipX, tipY);
+    g2.addColorStop(0, "rgba(235,255,250,0.92)");
+    g2.addColorStop(0.20, "rgba(" + hcB.r + "," + hcB.g + "," + hcB.b + ",0.62)");
+    g2.addColorStop(0.65, "rgba(" + hcB.r + "," + hcB.g + "," + hcB.b + ",0.30)");
+    g2.addColorStop(1, "rgba(" + hcB.r + "," + hcB.g + "," + hcB.b + ",0)");
+    CTX.fillStyle = g2;
+    CTX.fill();
+    if (CFG.visualFx.enabled && CFG.visualFx.laserGlow) {
+      CTX.save();
+      CTX.shadowBlur = Math.max(12, 24 * z);
+      CTX.shadowColor = "rgba(" + hcB.r + "," + hcB.g + "," + hcB.b + ",.55)";
+      CTX.strokeStyle = "rgba(" + hcB.r + "," + hcB.g + "," + hcB.b + ",.12)";
+      CTX.lineWidth = Math.max(1, 2 * z);
+      CTX.lineCap = "round";
+      CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(tipX, tipY); CTX.stroke();
+      CTX.restore();
+    }
+    /* 中轴亮芯：跟着一起由亮到淡 */
+    var g3 = CTX.createLinearGradient(sx, sy, tipX, tipY);
+    g3.addColorStop(0, "rgba(255,255,255,0.95)");
+    g3.addColorStop(0.5, "rgba(220,255,245,0.65)");
+    g3.addColorStop(1, "rgba(180,255,235,0)");
+    CTX.strokeStyle = g3;
+    CTX.lineWidth = Math.max(1.2, halfW * z * 0.5);
+    CTX.lineCap = "round";
+    CTX.beginPath(); CTX.moveTo(sx, sy); CTX.lineTo(tipX, tipY); CTX.stroke();
+    /* 撞墙处：先盖一层从中心向外渐隐的圆形柔光，再叠白热核心与锥形火花 */
+    if (len < spec.len - 1) {
+      var heroK0 = u.hero ? CFG.hero.sizeMul : 1;
+      var hc = laserHeatRGB((u.laserHeat || 0) / CFG.laser.heatMax);
+      var glowR = Math.max(34, 58 * z * heroK0) * fxK;
+      var gl = CTX.createRadialGradient(tipX, tipY, 0, tipX, tipY, glowR);
+      gl.addColorStop(0, "rgba(" + hc.r + "," + hc.g + "," + hc.b + ",0.55)");
+      gl.addColorStop(0.45, "rgba(" + hc.r + "," + hc.g + "," + hc.b + ",0.22)");
+      gl.addColorStop(1, "rgba(" + hc.r + "," + hc.g + "," + hc.b + ",0)");
+      CTX.fillStyle = gl;
+      CTX.beginPath(); CTX.arc(tipX, tipY, glowR, 0, TAU); CTX.fill();
+      var hot = Math.max(4, 6 * z * heroK0) * fxK;
+      var core = CTX.createRadialGradient(tipX, tipY, 0, tipX, tipY, hot);
+      core.addColorStop(0, "rgba(255,255,255,0.95)");
+      core.addColorStop(1, "rgba(" + hc.r + "," + hc.g + "," + hc.b + ",0)");
+      CTX.fillStyle = core;
+      CTX.beginPath(); CTX.arc(tipX, tipY, hot, 0, TAU); CTX.fill();
+      for (var sk2 = 0; sk2 < 8; sk2++) {
+        var sa2 = (sk2 / 8) * TAU + Math.sin(W.t * 37 + sk2 * 1.7) * 0.4;
+        var slen = (14 + 22 * Math.abs(Math.sin(W.t * 55 + sk2 * 2.3))) * z * heroK0 * fxK;
+        var flick2 = 0.4 + 0.6 * Math.abs(Math.sin(W.t * 90 + sk2 * 1.3));
+        drawLaserSpike(tipX, tipY, Math.cos(sa2), Math.sin(sa2), slen,
+          Math.max(2.4, 3.4 * z * heroK0) * fxK, Math.max(0.8, 1.1 * z * heroK0) * fxK, flick2, hc);
+      }
+    }
+    /* 出膛十字光带：固定横竖，不跟单位朝向旋转 */
+    var heroK = u.hero ? CFG.hero.sizeMul : 1;
+    var arm = Math.max(24, 36 * z) * heroK * fxK;
+    /* 电火花式高频闪烁：两个不同频率相乘，忽明忽暗更碎 */
+    var flick = 0.55 + 0.45 * Math.abs(Math.sin(W.t * 120 + u.id) * Math.sin(W.t * 47 + u.id * 2.3));
+    var wB = Math.max(2.6, 4.2 * z) * heroK * fxK, wT = Math.max(1, 1.4 * z) * heroK * fxK;
+    var hcC = laserHeatRGB((u.laserHeat || 0) / CFG.laser.heatMax);
+    drawLaserSpike(sx, sy, 1, 0, arm, wB, wT, flick, hcC);
+    drawLaserSpike(sx, sy, -1, 0, arm, wB, wT, flick, hcC);
+    drawLaserSpike(sx, sy, 0, 1, arm, wB, wT, flick, hcC);
+    drawLaserSpike(sx, sy, 0, -1, arm, wB, wT, flick, hcC);
+
+    /* 中心一点爆闪，把四根臂连起来 */
+    var cbR = Math.max(12, 16 * z) * heroK * fxK;
+    var cb = CTX.createRadialGradient(sx, sy, 0, sx, sy, cbR);
+    cb.addColorStop(0, "rgba(255,255,255," + (0.8 * flick).toFixed(3) + ")");
+    cb.addColorStop(1, "rgba(120,255,225,0)");
+    CTX.fillStyle = cb;
+    CTX.beginPath(); CTX.arc(sx, sy, cbR, 0, TAU); CTX.fill();
+  }
+  CTX.globalCompositeOperation = "source-over";
+}
+/* 被冻住的单位：一层淡蓝半透明滤镜 + 细冰壳 */
+function drawCryoShell(ux, uy, ur, u) {
+  var k = u.frozen ? 1 : (1 - (u.cryoSlow || 1));
+  if (k <= 0.01) return;
+  CTX.globalAlpha = 0.20 + 0.32 * k;
+  CTX.fillStyle = "#9fe8ff";
+  CTX.beginPath(); CTX.arc(ux, uy, ur + 1.5, 0, TAU); CTX.fill();
+  CTX.globalAlpha = 0.55 + 0.35 * k;
+  CTX.strokeStyle = "#d8f6ff";
+  CTX.lineWidth = Math.max(0.8, 1.1 * CAM.zoom);
+  CTX.beginPath(); CTX.arc(ux, uy, ur + 1.5, 0, TAU); CTX.stroke();
+  CTX.globalAlpha = 1;
+}
+/* 点燃：身上冒火星和灰烟 */
+function drawBurnOverlay(ux, uy, ur, u) {
+  var k = clamp((u.burnT || 0) / CFG.flame.igniteT, 0, 1);
+  CTX.globalAlpha = 0.22 + 0.3 * k;
+  CTX.fillStyle = "#ff8a2a";
+  CTX.beginPath(); CTX.arc(ux, uy, ur, 0, TAU); CTX.fill();
+  CTX.globalAlpha = 1;
+  for (var i = 0; i < 3; i++) {
+    var ph = (W.t * (1.6 + i * 0.4) + i * 2.1 + u.id * 0.37) % 1;
+    var px = ux + Math.sin(u.id + i * 2 + W.t * 3) * ur * 0.8;
+    var py = uy - ph * ur * 2.2;
+    CTX.fillStyle = "rgba(255," + (170 + i * 25) + ",60," + ((1 - ph) * 0.85 * k).toFixed(3) + ")";
+    CTX.beginPath(); CTX.arc(px, py, Math.max(0.8, (1.6 - ph) * CAM.zoom), 0, TAU); CTX.fill();
+  }
+  var sp = (W.t * 0.9 + u.id * 0.21) % 1;
+  CTX.fillStyle = "rgba(120,120,120," + ((1 - sp) * 0.22 * k).toFixed(3) + ")";
+  CTX.beginPath();
+  CTX.arc(ux + Math.sin(u.id) * ur, uy - ur - sp * ur * 2.6, Math.max(1.4, 3.2 * CAM.zoom * sp), 0, TAU);
+  CTX.fill();
+}
+
+function drawTeslaCoil(ux, uy, ur, z, u, fxa, fya, hxa, hya) {
+  var len = Math.max(ur * 0.92, 6 * z), w = Math.max(1, 1.7 * z);
+  var bx = ux + fxa * ur * 0.95, by = uy + fya * ur * 0.95;
+  var tx = bx + fxa * len, ty = by + fya * len;
+  CTX.strokeStyle = "#c8ced6"; CTX.lineWidth = w; CTX.lineCap = "round";
+  CTX.beginPath(); CTX.moveTo(bx, by); CTX.lineTo(tx, ty); CTX.stroke();
+  CTX.fillStyle = "#eef3f8";
+  CTX.beginPath(); CTX.arc(tx, ty, Math.max(1, 1.4 * z), 0, TAU); CTX.fill();
+  CTX.strokeStyle = "rgba(210,218,228,.80)"; CTX.lineWidth = Math.max(0.8, 1 * z);
+  for (var ri = 0; ri < 2; ri++) {
+    var rp = 0.38 + ri * 0.30;
+    CTX.beginPath();
+    CTX.ellipse(bx + fxa * len * rp, by + fya * len * rp, ur * 0.28, ur * 0.10,
+      u.faceAng + Math.PI / 2, 0, TAU);
+    CTX.stroke();
+  }
+  CTX.strokeStyle = "#f2f6fa"; CTX.lineWidth = Math.max(0.8, 1.2 * z);
+  CTX.beginPath(); CTX.moveTo(bx + fxa * len * 0.30, by + fya * len * 0.30);
+  CTX.lineTo(bx + fxa * len * 0.78, by + fya * len * 0.78); CTX.stroke();
+}
+function drawCryoBottle(ux, uy, ur, z, u, fxa, fya, hxa, hya) {
+  if (u.mag <= 0) return;
+  var off = ur * 0.92;
+  var bx = ux + fxa * ur * 0.55 + hxa * off;
+  var by = uy + fya * ur * 0.55 + hya * off;
+  CTX.save(); CTX.translate(bx, by); CTX.rotate(u.faceAng);
+  CTX.fillStyle = "#8fd8ff"; CTX.fillRect(-2 * z, -3 * z, 4.5 * z, 6.5 * z);
+  CTX.fillStyle = "#d9f3ff"; CTX.fillRect(-1 * z, -4.5 * z, 2 * z, 1.6 * z);
+  CTX.strokeStyle = "#4a8aa8"; CTX.lineWidth = Math.max(0.6, 0.7 * z);
+  CTX.strokeRect(-2 * z, -3 * z, 4.5 * z, 6.5 * z);
+  CTX.restore();
+}
+function drawLaserRig(ux, uy, ur, z, u, fxa, fya, hxa, hya) {
+  var la = (u.laserPhase === 1 || u.laserPhase === 2) ? u.laserAng : u.faceAng;
+  var lfx = Math.cos(la), lfy = Math.sin(la);
+  var len = Math.max(ur * 0.92, 6 * z);
+  var x0 = ux + lfx * ur * 0.95, y0 = uy + lfy * ur * 0.95;
+  var x1 = x0 + lfx * len, y1 = y0 + lfy * len;
+  CTX.lineCap = "butt"; CTX.strokeStyle = "#9aa2ab";
+  CTX.lineWidth = Math.max(2, ur * 0.62); CTX.beginPath(); CTX.moveTo(x0, y0);
+  CTX.lineTo(ux + lfx * (ur * 0.95 + len * 0.60), uy + lfy * (ur * 0.95 + len * 0.60)); CTX.stroke();
+  CTX.strokeStyle = "#c3c9d0"; CTX.lineWidth = Math.max(1.2, ur * 0.38);
+  CTX.beginPath(); CTX.moveTo(ux + lfx * (ur * 0.95 + len * 0.55), uy + lfy * (ur * 0.95 + len * 0.55));
+  CTX.lineTo(x1, y1); CTX.stroke();
+  CTX.fillStyle = "#bfe9ff";
+  CTX.beginPath(); CTX.arc(x1, y1, Math.max(1.2, ur * 0.30), 0, TAU); CTX.fill();
+  CTX.fillStyle = "rgba(255,255,255,.85)";
+  CTX.beginPath(); CTX.arc(x1 - lfx * ur * 0.12 + hxa * ur * 0.12,
+    y1 - lfy * ur * 0.12 + hya * ur * 0.12, Math.max(0.6, ur * 0.10), 0, TAU); CTX.fill();
+}
+function drawFlameTanks(ux, uy, ur, z, u) {
+  /* 燃料罐画在身体之前，并随角色朝向旋转，才是"背在身后" */
+  CTX.save();
+  CTX.translate(ux, uy);
+  CTX.rotate(u.faceAng);
+  for (var si = -1; si <= 1; si += 2) {
+    var tx = -ur * 1.05, ty = si * ur * 0.58;
+    CTX.fillStyle = "#858b93"; CTX.strokeStyle = "#4f555c";
+    CTX.lineWidth = Math.max(0.6, 0.8 * z);
+    CTX.beginPath();
+    if (CTX.roundRect) CTX.roundRect(tx - 3.2 * z, ty - 2.2 * z, 6.4 * z, 4.4 * z, 1.6 * z);
+    else CTX.rect(tx - 3.2 * z, ty - 2.2 * z, 6.4 * z, 4.4 * z);
+    CTX.fill(); CTX.stroke();
+    CTX.fillStyle = "#b9bec4";
+    CTX.fillRect(tx - 4.4 * z, ty - 1.1 * z, 1.4 * z, 2.2 * z);
+  }
+  CTX.restore();
+}
+function drawFlameRig(ux, uy, ur, z, u, fxa, fya, hxa, hya) {
+  var backX = ux - fxa * ur * 0.80, backY = uy - fya * ur * 0.80;
+  var nozX = ux + fxa * ur * 0.98 + hxa * ur * 0.55;
+  var nozY = uy + fya * ur * 0.98 + hya * ur * 0.55;
+  /* S 形绕过身体右侧，别从身体正中穿过去 */
+  var tankX = ux - fxa * ur * 0.80 + hxa * ur * 0.58;
+  var tankY = uy - fya * ur * 0.80 + hya * ur * 0.58;
+  var midX = ux + hxa * ur * 1.05 - fxa * ur * 0.10;
+  var midY = uy + hya * ur * 1.05 - fya * ur * 0.10;
+  CTX.strokeStyle = "#8f959c"; CTX.lineWidth = 1;
+  CTX.beginPath(); CTX.moveTo(tankX, tankY);
+  CTX.quadraticCurveTo(midX, midY, nozX, nozY); CTX.stroke();
+  CTX.strokeStyle = "#5a6067"; CTX.lineWidth = Math.max(1, 1.4 * z);
+  CTX.beginPath(); CTX.moveTo(nozX, nozY);
+  CTX.lineTo(nozX + fxa * ur * 0.50, nozY + fya * ur * 0.50); CTX.stroke();
+}
+function drawGenericWeaponBack(u, ux, uy, ur, z) {
+  var gsp = gunSpecOf(u.kind);
+  if (!gsp) return;
+  var fxa = Math.cos(u.faceAng), fya = Math.sin(u.faceAng);
+  var hxa = -fya, hya = fxa;
+  var off = ur * 0.35;                  /* 起点压在身体内部，随后被角色圆盖住 */
+  var sx0 = ux + fxa * ur * 0.15 + hxa * off;
+  var sy0 = uy + fya * ur * 0.15 + hya * off;
+  var reach = Math.max(gsp.len * z * 0.72, ur * 0.95);
+  CTX.strokeStyle = "#5a606b";
+  CTX.lineWidth = Math.max(1, gsp.w * z);
+  CTX.lineCap = "round";
+  CTX.beginPath();
+  CTX.moveTo(sx0, sy0);
+  CTX.lineTo(sx0 + fxa * reach, sy0 + fya * reach);
+  CTX.stroke();
+}
+var ECON_HUD_T = 0;
+function updateEconHud(dt) {
+  ECON_HUD_T -= dt;
+  if (ECON_HUD_T > 0) return;
+  ECON_HUD_T = 0.2;
+  var r = document.getElementById("econRes"), rate = document.getElementById("econRate");
+  var h = document.getElementById("econHumans"), z = document.getElementById("econZombies");
+  if (r) r.textContent = Math.floor(W.resources);
+  if (rate) rate.textContent = "+" + CFG.econ.perSec + " / 秒";
+  if (h || z) {
+    var c = countUnits();
+    if (h) h.textContent = c.h;
+    if (z) z.textContent = c.z;
+  }
+}
+function render() {
+  /* 先数一下场上现在有几个平民英雄：光环的绘制强度要按这个数量自动降级 */
+  var an = 0;
+  for (var ai = 0; ai < W.units.length; ai++) {
+    var au = W.units[ai];
+    if (!au.dead && (au.hero === "civilian" || au.hero === "militia")) an++;
+  }
+  W.auraCount = an;
+  AURA_CIRCLES.length = 0; MOTHER_SHIELDS.length = 0;
+  _fogTick = (_fogTick + 1) % 3;
+  if (_fogTick === 0) fogVisUpdate();
+  /* 打中丧尸时的极轻微抖动：把整个世界画面整体偏移一点点 */
+  var shx = 0, shy = 0;
+  if (W.shakeT > 0 && W.shakeDur > 0 && CFG.shake.enabled) {
+    var shk = W.shakeT / W.shakeDur;
+    var shakeCap = Math.min(W.shakeMag, CFG.shake.max || 3) * (CFG.shake.scale === undefined ? 1 : CFG.shake.scale);
+    shx = (Math.random() * 2 - 1) * shakeCap * shk;
+    shy = (Math.random() * 2 - 1) * shakeCap * shk;
+  }
+  CTX.setTransform(DPR, 0, 0, DPR, shx * DPR, shy * DPR);
+  CTX.fillStyle = CFG.palette.ground || "#0a0c13";
+  CTX.fillRect(-4, -4, VW + 8, VH + 8);
+  /* 地面网格 */
+  var gr = 128, z = CAM.zoom;
+  var gx0 = Math.floor(s2wx(0) / gr) * gr, gx1 = s2wx(VW), gy0 = Math.floor(s2wy(0) / gr) * gr, gy1 = s2wy(VH);
+  CTX.lineWidth = 1;
+  CTX.strokeStyle = CFG.palette.grid || "#161b2b";
+  CTX.beginPath();
+  for (var x = gx0; x <= gx1; x += gr) { var sx = w2sx(x); CTX.moveTo(sx, 0); CTX.lineTo(sx, VH); }
+  for (var y = gy0; y <= gy1; y += gr) { var sy = w2sy(y); CTX.moveTo(0, sy); CTX.lineTo(VW, sy); }
+  CTX.stroke();
+  /* 世界边界 */
+  CTX.strokeStyle = "#2f3b5c"; CTX.lineWidth = 2;
+  CTX.strokeRect(w2sx(0), w2sy(0), CFG.world.w * z, CFG.world.h * z);
+  /* 障碍：连成一体的墙体去掉内部接缝，只保留外轮廓；高墙与矮墙分开纹理 */
+  var obs = W.obstacles, wallList = [], wallBuckets = {}, wi2, i;
+  for (i = 0; i < obs.length; i++) {
+    var wo = obs[i];
+    if (wo.tile || wo.prison || (wo.kind !== "wall" && wo.kind !== "low")) continue;
+    wallList.push(wo);
+  }
+  for (i = 0; i < wallList.length; i++) {
+    var wq = wallList[i];
+    var wx0 = Math.floor(wq.x / 128), wx1 = Math.floor((wq.x + wq.w) / 128);
+    var wy0 = Math.floor(wq.y / 128), wy1 = Math.floor((wq.y + wq.h) / 128);
+    for (var wby = wy0; wby <= wy1; wby++) for (var wbx = wx0; wbx <= wx1; wbx++) {
+      var wk = wbx + "," + wby;
+      if (!wallBuckets[wk]) wallBuckets[wk] = [];
+      wallBuckets[wk].push(wq);
+    }
+  }
+  function wallEdgeJoined(o, side) {
+    var mx, my, list = [], kx, ky, k2;
+    if (side === "l" || side === "r") {
+      mx = side === "l" ? o.x : o.x + o.w;
+      my = o.y + o.h / 2;
+    } else {
+      mx = o.x + o.w / 2;
+      my = side === "t" ? o.y : o.y + o.h;
+    }
+    for (ky = -1; ky <= 1; ky++) for (kx = -1; kx <= 1; kx++) {
+      k2 = wallBuckets[(Math.floor(mx / 128) + kx) + "," + (Math.floor(my / 128) + ky)];
+      if (k2) list = list.concat(k2);
+    }
+    for (var q = 0; q < list.length; q++) {
+      var w2o = list[q];
+      if (w2o === o || w2o.kind !== o.kind) continue;
+      if (side === "l" && Math.abs(w2o.x + w2o.w - o.x) <= 2 &&
+          w2o.y < o.y + o.h - 3 && w2o.y + w2o.h > o.y + 3) return true;
+      if (side === "r" && Math.abs(w2o.x - (o.x + o.w)) <= 2 &&
+          w2o.y < o.y + o.h - 3 && w2o.y + w2o.h > o.y + 3) return true;
+      if (side === "t" && Math.abs(w2o.y + w2o.h - o.y) <= 2 &&
+          w2o.x < o.x + o.w - 3 && w2o.x + w2o.w > o.x + 3) return true;
+      if (side === "b" && Math.abs(w2o.y - (o.y + o.h)) <= 2 &&
+          w2o.x < o.x + o.w - 3 && w2o.x + w2o.w > o.x + 3) return true;
+    }
+    return false;
+  }
+  /* 极简墙：同类型墙体先合成一个整体填充，彻底去掉内部接缝 */
+  var wallFill = { wall: { h: 42, s: 12, l: 56 }, low: { h: 45, s: 9, l: 68 } };
+  for (var wk2 in wallFill) {
+    var tone = wallFill[wk2], any = false;
+    CTX.beginPath();
+    for (i = 0; i < wallList.length; i++) {
+      var wf = wallList[i];
+      if (wf.kind !== wk2 || wf.destructible) continue;
+      any = true;
+      CTX.rect(w2sx(wf.x), w2sy(wf.y), wf.w * z, wf.h * z);
+    }
+    if (!any) continue;
+    CTX.globalAlpha = wk2 === "low" ? 0.80 : 0.95;
+    CTX.fillStyle = "hsl(" + tone.h + "," + tone.s + "%," + tone.l + "%)";
+    CTX.fill();
+    CTX.globalAlpha = 1;
+  }
+  /* 可破坏墙/门：两端浅灰，中间黄黑警戒带 */
+  for (i = 0; i < wallList.length; i++) {
+    var dw = wallList[i];
+    if (!dw.destructible) continue;
+    var dx0 = w2sx(dw.x), dy0 = w2sy(dw.y), dwW = dw.w * z, dwH = dw.h * z;
+    if (!vis(dx0 + dwW / 2, dy0 + dwH / 2, Math.max(dwW, dwH))) continue;
+    CTX.fillStyle = "#b9bbb9";
+    CTX.fillRect(dx0, dy0, dwW, dwH);
+    var horiz = dwW >= dwH;
+    CTX.save();
+    CTX.beginPath(); CTX.rect(dx0, dy0, dwW, dwH); CTX.clip();
+    var bandW = horiz ? dwW * 0.42 : dwW, bandH = horiz ? dwH : dwH * 0.42;
+    var bandX = horiz ? dx0 + dwW * 0.29 : dx0, bandY = horiz ? dy0 : dy0 + dwH * 0.29;
+    CTX.fillStyle = "#e0b33c";
+    CTX.fillRect(bandX, bandY, bandW, bandH);
+    CTX.fillStyle = "rgba(30,30,28,.85)";
+    var step2 = Math.max(8, 14 * z);
+    if (horiz) {
+      for (var hx = bandX - bandH; hx < bandX + bandW + bandH; hx += step2) {
+        CTX.beginPath(); CTX.moveTo(hx, bandY + bandH); CTX.lineTo(hx + bandH * 0.5, bandY); CTX.lineTo(hx + bandH * 0.5 + 5, bandY); CTX.lineTo(hx + 5, bandY + bandH); CTX.closePath(); CTX.fill();
+      }
+    } else {
+      for (var hy = bandY - bandW; hy < bandY + bandH + bandW; hy += step2) {
+        CTX.beginPath(); CTX.moveTo(bandX, hy); CTX.lineTo(bandX + bandW, hy + bandW * 0.5); CTX.lineTo(bandX + bandW, hy + bandW * 0.5 + 5); CTX.lineTo(bandX, hy + 5); CTX.closePath(); CTX.fill();
+      }
+    }
+    CTX.restore();
+    CTX.strokeStyle = "rgba(46,46,44,.8)"; CTX.lineWidth = 1;
+    CTX.strokeRect(dx0 + .5, dy0 + .5, dwW - 1, dwH - 1);
+  }
+  /* 只给外露边描线：相邻墙共用边不描，视觉上就是一整块 */
+  for (i = 0; i < wallList.length; i++) {
+    var o = wallList[i];
+    if (o.destructible) continue;
+    var ox = w2sx(o.x), oy = w2sy(o.y), ow = o.w * z, oh = o.h * z;
+    if (!vis(ox + ow / 2, oy + oh / 2, Math.max(ow, oh))) continue;
+    CTX.strokeStyle = "rgba(38,32,24,.42)";
+    CTX.lineWidth = 1;
+    CTX.beginPath();
+    if (!wallEdgeJoined(o, "t")) { CTX.moveTo(ox, oy + .5); CTX.lineTo(ox + ow, oy + .5); }
+    if (!wallEdgeJoined(o, "b")) { CTX.moveTo(ox, oy + oh - .5); CTX.lineTo(ox + ow, oy + oh - .5); }
+    if (!wallEdgeJoined(o, "l")) { CTX.moveTo(ox + .5, oy); CTX.lineTo(ox + .5, oy + oh); }
+    if (!wallEdgeJoined(o, "r")) { CTX.moveTo(ox + ow - .5, oy); CTX.lineTo(ox + ow - .5, oy + oh); }
+    CTX.stroke();
+  }
+  /* 伪法线边缘光：只给外露的顶边和左边加亮，制造方向性感 */
+  if (CFG.visualFx.enabled && CFG.visualFx.wallRim) {
+    CTX.globalCompositeOperation = "lighter";
+    CTX.strokeStyle = "rgba(255,224,170,.32)";
+    CTX.lineWidth = 2;
+    for (i = 0; i < wallList.length; i++) {
+      var wr = wallList[i];
+      if (wr.destructible) continue;
+      var wrx = w2sx(wr.x), wry = w2sy(wr.y), wrw = wr.w * z, wrh = wr.h * z;
+      if (!vis(wrx + wrw / 2, wry + wrh / 2, Math.max(wrw, wrh))) continue;
+      if (!wallEdgeJoined(wr, "t")) {
+        CTX.beginPath(); CTX.moveTo(wrx, wry + 0.5); CTX.lineTo(wrx + wrw, wry + 0.5); CTX.stroke();
+      }
+      if (!wallEdgeJoined(wr, "l")) {
+        CTX.beginPath(); CTX.moveTo(wrx + 0.5, wry); CTX.lineTo(wrx + 0.5, wry + wrh); CTX.stroke();
+      }
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 移动光源照在墙面上：裁剪到墙体内部的径向光斑 + 边缘高光 */
+  if (CFG.visualFx.enabled && CFG.visualFx.projectileLight) {
+    CTX.globalCompositeOperation = "lighter";
+    for (i = 0; i < wallList.length; i++) {
+      var wl = wallList[i];
+      if (wl.destructible) continue;
+      var wlx = w2sx(wl.x), wly = w2sy(wl.y), wlw = wl.w * z, wlh = wl.h * z;
+      if (!vis(wlx + wlw / 2, wly + wlh / 2, Math.max(wlw, wlh))) continue;
+      var hitL = nearestLightSource(wlx + wlw / 2, wly + wlh / 2, 260);
+      if (!hitL) continue;
+      var wla = (1 - hitL.d / 260) * 0.55;
+      if (wla <= 0.01) continue;
+      var wg = CTX.createRadialGradient(hitL.x, hitL.y, 2, hitL.x, hitL.y, Math.max(50, 130 * z));
+      wg.addColorStop(0, glowColorAlpha(hitL.color, wla.toFixed(3)));
+      wg.addColorStop(0.55, glowColorAlpha(hitL.color, (wla * 0.28).toFixed(3)));
+      wg.addColorStop(1, glowColorAlpha(hitL.color, 0));
+      CTX.save();
+      CTX.beginPath(); CTX.rect(wlx, wly, wlw, wlh); CTX.clip();
+      CTX.fillStyle = wg; CTX.fillRect(wlx, wly, wlw, wlh);
+      CTX.restore();
+      CTX.strokeStyle = glowColorAlpha(hitL.color, (wla * 0.75).toFixed(3));
+      CTX.lineWidth = Math.max(1, 1.8 * z);
+      if (!wallEdgeJoined(wl, "t")) {
+        CTX.beginPath(); CTX.moveTo(wlx, wly + 0.5); CTX.lineTo(wlx + wlw, wly + 0.5); CTX.stroke();
+      }
+      if (!wallEdgeJoined(wl, "l")) {
+        CTX.beginPath(); CTX.moveTo(wlx + 0.5, wly); CTX.lineTo(wlx + 0.5, wly + wlh); CTX.stroke();
+      }
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 枪口火光在附近墙面的短促反光 */
+  if (CFG.visualFx.enabled && CFG.visualFx.muzzleWall && W.flashes && W.flashes.length) {
+    CTX.globalCompositeOperation = "lighter";
+    for (i = 0; i < wallList.length; i++) {
+      var mw = wallList[i];
+      if (mw.destructible) continue;
+      var mwx = w2sx(mw.x), mwy = w2sy(mw.y), mww = mw.w * z, mwh = mw.h * z;
+      if (!vis(mwx + mww / 2, mwy + mwh / 2, Math.max(mww, mwh))) continue;
+      var mbest = null, mbd = 230 * 230;
+      for (var mfi = 0; mfi < W.flashes.length; mfi++) {
+        var mf = W.flashes[mfi];
+        if (!(mf.life > 0)) continue;
+        var mfx = w2sx(mf.x), mfy = w2sy(mf.y), mdx = mfx - (mwx + mww / 2), mdy = mfy - (mwy + mwh / 2);
+        var md2 = mdx * mdx + mdy * mdy;
+        if (md2 < mbd) { mbd = md2; mbest = mf; }
+      }
+      if (!mbest) continue;
+      var mba = (1 - Math.sqrt(mbd) / 230) * clamp(mbest.life / mbest.max, 0, 1) * 0.45;
+      if (mba < 0.015) continue;
+      CTX.strokeStyle = "rgba(255,200,120," + mba.toFixed(3) + ")";
+      CTX.lineWidth = Math.max(1, 2 * z);
+      if (!wallEdgeJoined(mw, "t")) {
+        CTX.beginPath(); CTX.moveTo(mwx, mwy + 0.5); CTX.lineTo(mwx + mww, mwy + 0.5); CTX.stroke();
+      }
+      if (!wallEdgeJoined(mw, "l")) {
+        CTX.beginPath(); CTX.moveTo(mwx + 0.5, mwy); CTX.lineTo(mwx + 0.5, mwy + mwh); CTX.stroke();
+      }
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 可破坏墙血条与裂纹 */
+  for (i = 0; i < wallList.length; i++) {
+    var dwo = wallList[i];
+    if (!dwo.destructible) continue;
+    var dox = w2sx(dwo.x), doy = w2sy(dwo.y), dow = dwo.w * z, doh = dwo.h * z;
+    if (dwo.hp < dwo.maxHp) {
+      var hbw2 = Math.min(dow - 4, 46), hbx2 = dox + (dow - hbw2) / 2, hby2 = doy - 6;
+      CTX.fillStyle = "rgba(0,0,0,.55)"; CTX.fillRect(hbx2, hby2, hbw2, 3);
+      CTX.fillStyle = dwo.hp / dwo.maxHp > 0.35 ? "#d9a441" : "#e06a5a";
+      CTX.fillRect(hbx2, hby2, hbw2 * Math.max(0, dwo.hp / dwo.maxHp), 3);
+    }
+  }
+  drawWallArt(z);
+  /* 自定义地块：最底层，画在区域与血迹之前 */
+  if (W.tiles) {
+    for (i = 0; i < W.tiles.length; i++) {
+      var tl = W.tiles[i];
+      var tx = w2sx(tl.x), ty = w2sy(tl.y), tw = tl.w * z, th = tl.h * z;
+      if (!vis(tx + tw / 2, ty + th / 2, Math.max(tw, th))) continue;
+      CTX.globalAlpha = tl.alpha || 0.5;
+      CTX.fillStyle = tl.color || "#3a4a56";
+      CTX.fillRect(tx, ty, tw, th);
+      CTX.globalAlpha = 1;
+      if (tl.pattern === "stripe" || tl.pattern === "grid") {
+        CTX.save();
+        CTX.beginPath(); CTX.rect(tx, ty, tw, th); CTX.clip();
+        CTX.strokeStyle = "rgba(255,255,255,.16)"; CTX.lineWidth = 1;
+        if (tl.pattern === "stripe") {
+          for (var sxx = tx - th; sxx < tx + tw + th; sxx += 14) {
+            CTX.beginPath(); CTX.moveTo(sxx, ty); CTX.lineTo(sxx + th, ty + th); CTX.stroke();
+          }
+        } else {
+          for (var gyy = ty; gyy <= ty + th; gyy += 16) {
+            CTX.beginPath(); CTX.moveTo(tx, gyy); CTX.lineTo(tx + tw, gyy); CTX.stroke();
+          }
+          for (var gxx = tx; gxx <= tx + tw; gxx += 16) {
+            CTX.beginPath(); CTX.moveTo(gxx, ty); CTX.lineTo(gxx, ty + th); CTX.stroke();
+          }
+        }
+        CTX.restore();
+      }
+      CTX.strokeStyle = "rgba(255,255,255,.18)"; CTX.lineWidth = 1;
+      CTX.strokeRect(tx + .5, ty + .5, tw - 1, th - 1);
+      if (tl.hp > 0 && tl.maxHp > 0 && tl.hp < tl.maxHp) {
+        CTX.fillStyle = "rgba(0,0,0,.55)"; CTX.fillRect(tx, ty - 5, tw, 3);
+        CTX.fillStyle = "#d9a441"; CTX.fillRect(tx, ty - 5, tw * Math.max(0, tl.hp / tl.maxHp), 3);
+      }
+    }
+  }
+  /* 功能区域：铺在地面，画在单位与血迹之前 */
+  if (W.zones) {
+    for (i = 0; i < W.zones.length; i++) {
+      var zn = W.zones[i];
+      var zx = w2sx(zn.x), zy = w2sy(zn.y), zw = zn.w * z, zh = zn.h * z;
+      if (!vis(zx + zw / 2, zy + zh / 2, Math.max(zw, zh))) continue;
+      var burn = zn.type === "burn";
+      CTX.globalAlpha = 0.18;
+      CTX.fillStyle = burn ? "#e0663a" : "#5fa8d8";
+      CTX.fillRect(zx, zy, zw, zh);
+      CTX.globalAlpha = 1;
+      CTX.setLineDash([8, 5]);
+      CTX.strokeStyle = burn ? "rgba(224,102,58,.75)" : "rgba(95,168,216,.75)";
+      CTX.lineWidth = 1;
+      CTX.strokeRect(zx + 0.5, zy + 0.5, zw - 1, zh - 1);
+      CTX.setLineDash([]);
+      CTX.fillStyle = burn ? "rgba(255,190,150,.9)" : "rgba(180,220,245,.9)";
+      CTX.font = "11px system-ui,sans-serif";
+      CTX.fillText(burn ? "灼烧" : "缓速", zx + 5, zy + 14);
+    }
+  }
+  /* 据点 */
+  if (W.holds) {
+    for (i = 0; i < W.holds.length; i++) {
+      var hd = W.holds[i];
+      var hcx = w2sx(hd.x + hd.w / 2), hcy = w2sy(hd.y + hd.h / 2), hr = (hd.r || 80) * z;
+      if (!vis(hcx, hcy, hr * 2)) continue;
+      var col = hd.owner === "human" ? "rgba(217,164,65," : (hd.owner === "zombie" ? "rgba(224,74,74," : "rgba(150,170,185,");
+      CTX.globalAlpha = 0.12; CTX.fillStyle = col + "1)";
+      CTX.beginPath(); CTX.arc(hcx, hcy, hr, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+      CTX.setLineDash([7, 5]); CTX.strokeStyle = col + ".85)"; CTX.lineWidth = 1.5;
+      CTX.beginPath(); CTX.arc(hcx, hcy, hr, 0, TAU); CTX.stroke(); CTX.setLineDash([]);
+      CTX.fillStyle = col + ".95)"; CTX.font = "11px system-ui,sans-serif"; CTX.textAlign = "center";
+      CTX.fillText("据点 · " + (hd.owner === "human" ? "人类" : hd.owner === "zombie" ? "丧尸" : "中立"), hcx, hcy - 6);
+      CTX.textAlign = "left";
+    }
+  }
+  /* 刷怪点 */
+  if (W.spawners) {
+    for (i = 0; i < W.spawners.length; i++) {
+      var sp = W.spawners[i];
+      var spx = w2sx(sp.x), spy = w2sy(sp.y), spw = sp.w * z, sph = sp.h * z;
+      if (!vis(spx + spw / 2, spy + sph / 2, Math.max(spw, sph))) continue;
+      CTX.globalAlpha = 0.16; CTX.fillStyle = "#e04a4a"; CTX.fillRect(spx, spy, spw, sph);
+      CTX.globalAlpha = 1;
+      CTX.setLineDash([5, 4]); CTX.strokeStyle = "rgba(224,74,74,.8)"; CTX.lineWidth = 1;
+      CTX.strokeRect(spx + .5, spy + .5, spw - 1, sph - 1); CTX.setLineDash([]);
+      CTX.fillStyle = "rgba(255,180,170,.95)"; CTX.font = "11px system-ui,sans-serif";
+      CTX.fillText("刷怪 " + (sp.count || 0) + (sp.limit ? "/" + sp.limit : ""), spx + 5, spy + 14);
+    }
+  }
+  /* 航弹永久弹坑：贴地绘制，不随时间消失 */
+  if (W.craters && W.craters.length) {
+    for (i = 0; i < W.craters.length; i++) {
+      var cr = W.craters[i], cxs = w2sx(cr.x), cys = w2sy(cr.y);
+      var ca = (cr.age || 0) < 7 ? 1 : Math.max(0, 1 - ((cr.age || 0) - 7));
+      if (ca <= 0 || !vis(cxs, cys, 160)) continue;
+      CTX.globalAlpha = ca;
+      CTX.fillStyle = "rgba(0,0,0,.55)";
+      CTX.beginPath(); CTX.ellipse(cxs, cys, 62 * z, 24 * z, 0, 0, TAU); CTX.fill();
+      CTX.strokeStyle = "rgba(92,72,54,.8)"; CTX.lineWidth = 2;
+      CTX.beginPath(); CTX.ellipse(cxs, cys, 70 * z, 29 * z, 0, 0, TAU); CTX.stroke();
+      CTX.fillStyle = "rgba(52,44,34,.65)";
+      CTX.beginPath(); CTX.ellipse(cxs - 8 * z, cys - 3 * z, 22 * z, 8 * z, 0, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+    }
+  }
+  /* 血迹：贴在地面上，画在任何单位之前 */
+  var bss = W.bloodstains;
+  for (i = 0; i < bss.length; i++) {
+    var bs = bss[i];
+    var bxs = w2sx(bs.x), bys = w2sy(bs.y);
+    if (!vis(bxs, bys, 40)) continue;
+    var bp0 = bs.pts[0];
+    CTX.fillStyle = "hsla(352,70%," + bs.lit + "%," + CFG.blood.alpha + ")";
+    CTX.beginPath();
+    CTX.moveTo(bxs + bp0.x * z, bys + bp0.y * z);
+    for (var bi = 1; bi < bs.pts.length; bi++) {
+      var bp = bs.pts[bi];
+      CTX.lineTo(bxs + bp.x * z, bys + bp.y * z);
+    }
+    CTX.closePath();
+    CTX.fill();
+    /* 极细的一圈描边压住边缘，避免看着像色块 */
+    CTX.strokeStyle = "hsla(352,70%," + Math.max(10, bs.lit - 12) + "%," + (CFG.blood.alpha * 0.85) + ")";
+    CTX.lineWidth = Math.max(0.5, 1.1 * z);
+    CTX.stroke();
+  }
+  /* 落地后的弹壳：薄薄一片躺在地上，和血迹一起构成战场残留 */
+  for (i = 0; i < W.casings.length; i++) {
+    var cs = W.casings[i];
+    var cxs = w2sx(cs.x), cys = w2sy(cs.y);
+    if (!vis(cxs, cys, 16)) continue;
+    var cw = cs.size * z * 2.6, chh = cs.size * z * 0.9;
+    CTX.save();
+    CTX.translate(cxs, cys);
+    CTX.rotate(cs.rot);
+    CTX.globalAlpha = 0.8;
+    CTX.fillStyle = cs.color || CFG.shell.color;
+    CTX.fillRect(-cw / 2, -chh / 2, cw, chh);
+    if (cs.color) {
+      CTX.fillStyle = "rgba(20,24,30,0.55)";
+      CTX.fillRect(-cw / 2, -chh * 0.16, cw, chh * 0.32);
+    }
+    CTX.restore();
+    CTX.globalAlpha = 1;
+  }
+  /* 门：浅色块填充，用三线段勾出轮廓 */
+  var drs = W.doors;
+  for (i = 0; i < drs.length; i++) {
+    var d = drs[i];
+    var dx = w2sx(d.x), dy = w2sy(d.y), dw = d.w * z, dh = d.h * z;
+    if (!vis(dx + dw / 2, dy + dh / 2, Math.max(dw, dh))) continue;
+    if (d.prison) {
+      /* 护送模式的封锁大门：未解锁是红色封锁线，解锁后转绿 */
+      var open = !!W.doorOpen;
+      CTX.fillStyle = open ? "rgba(120,240,150,0.22)" : "rgba(255,90,90,0.26)";
+      CTX.fillRect(dx, dy, dw, dh);
+      CTX.strokeStyle = open ? "rgba(120,240,150,0.95)" : "rgba(255,90,90,0.95)";
+      CTX.lineWidth = 3;
+      CTX.strokeRect(dx, dy, dw, dh);
+      if (!open) {
+        CTX.lineWidth = 1.5;
+        CTX.beginPath();
+        for (var q3 = 0; q3 < 4; q3++) {
+          var yy3 = dy + dh * (q3 + 0.5) / 4;
+          CTX.moveTo(dx, yy3); CTX.lineTo(dx + dw, yy3);
+        }
+        CTX.stroke();
+      } else {
+        CTX.fillStyle = "rgba(120,240,150,0.95)";
+        CTX.font = "12px sans-serif";
+        CTX.fillText("已解锁", dx + 4, dy - 6);
+      }
+      continue;
+    }
+    CTX.fillStyle = "rgba(206,220,240,0.24)";
+    CTX.fillRect(dx, dy, dw, dh);
+    CTX.strokeStyle = "rgba(214,228,250,0.72)";
+    CTX.lineWidth = 1;
+    CTX.beginPath();
+    if (d.vertical) {
+      CTX.moveTo(dx, dy); CTX.lineTo(dx + dw, dy);
+      CTX.moveTo(dx, dy + dh); CTX.lineTo(dx + dw, dy + dh);
+      CTX.moveTo(dx + dw * 0.5, dy); CTX.lineTo(dx + dw * 0.5, dy + dh);
+    } else {
+      CTX.moveTo(dx, dy); CTX.lineTo(dx, dy + dh);
+      CTX.moveTo(dx + dw, dy); CTX.lineTo(dx + dw, dy + dh);
+      CTX.moveTo(dx, dy + dh * 0.5); CTX.lineTo(dx + dw, dy + dh * 0.5);
+    }
+    CTX.stroke();
+  }
+  /* 岗位（调试） */
+  if (dbgOn("post")) {
+    CTX.strokeStyle = "rgba(120,190,255,0.5)"; CTX.lineWidth = 1;
+    for (i = 0; i < W.posts.length; i++) {
+      var p = W.posts[i], px = w2sx(p.x), py = w2sy(p.y);
+      if (!vis(px, py, 20)) continue;
+      CTX.beginPath(); CTX.arc(px, py, 5, 0, TAU); CTX.stroke();
+    }
+  }
+  /* 冲击波圆环：护盾碎裂与盾兵自爆共用 */
+  var sks = W.shocks;
+  if (sks && sks.length) {
+    CTX.globalCompositeOperation = "lighter";
+    for (i = 0; i < sks.length; i++) {
+      var sk = sks[i];
+      var pr = clamp(1 - sk.life / sk.max, 0, 1);
+      var al = clamp(sk.life / sk.max, 0, 1);
+      var sxk = w2sx(sk.x), syk = w2sy(sk.y);
+      if (!vis(sxk, syk, sk.r * z + 60)) continue;
+      var base = sk.col.slice(0, sk.col.lastIndexOf(",") + 1);
+      CTX.strokeStyle = base + (al * 0.9).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(2, 5 * z * al);
+      CTX.beginPath(); CTX.arc(sxk, syk, Math.max(1, sk.r * pr * z), 0, TAU); CTX.stroke();
+      CTX.strokeStyle = base + (al * 0.32).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(1, 2.4 * z * al);
+      CTX.beginPath(); CTX.arc(sxk, syk, Math.max(1, sk.r * pr * 0.8 * z), 0, TAU); CTX.stroke();
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 护送模式：撤离点标记 */
+  if (W.mode === "escort") {
+    var EV2 = curEvac();
+    var ex2 = w2sx(EV2.x), ey2 = w2sy(EV2.y), er2 = CFG.escort.evacR * z;
+    if (vis(ex2, ey2, er2 + 60)) {
+      var evOn = (W.phase === "retreat");
+      CTX.strokeStyle = evOn ? "rgba(120,240,150,0.9)" : "rgba(120,180,255,0.45)";
+      CTX.lineWidth = 2;
+      CTX.setLineDash([8, 6]);
+      CTX.beginPath(); CTX.arc(ex2, ey2, er2, 0, TAU); CTX.stroke();
+      CTX.setLineDash([]);
+      CTX.fillStyle = evOn ? "rgba(120,240,150,0.12)" : "rgba(120,180,255,0.07)";
+      CTX.beginPath(); CTX.arc(ex2, ey2, er2, 0, TAU); CTX.fill();
+      CTX.fillStyle = evOn ? "rgba(150,250,180,0.95)" : "rgba(160,200,255,0.8)";
+      CTX.font = "13px sans-serif";
+      CTX.fillText(evOn ? "撤离点 · 启用" : "撤离点", ex2 - 38, ey2 - er2 - 8);
+    }
+  }
+  /* 1.3.3 新兵种的地面层：寒冷圈与火墙贴地画，压在单位下面 */
+  drawCryoFields(z);
+  drawFirePatches(z);
+  drawTyrantPreview(z);
+  /* 单位 */
+  var units = W.units;
+  var showCircles = UI.debug;
+  var showRange = dbgOn("range"), showPath = dbgOn("path"),
+      showTarget = dbgOn("target"), showGuard = dbgOn("guard");
+  drawLaserHitTrails(z);
+  /* 火焰喷射画在单位之前：喷口光晕不会盖住士兵本体 */
+  drawFlameJets(z);
+  drawFlameParts(z);
+  /* 被掀飞的单位先在地面上画各自的影子。这一轮必须跑在所有单位之前，
+     影子属于地面层，要能被压在别的单位下面 */
+  for (i = 0; i < units.length; i++) {
+    var ua = units[i];
+    if (ua.dead) continue;
+    var uaFly = flyHeightOf(ua);
+    var uaAir = (ua.airH || 0) + uaFly;
+    if (uaAir <= 0.4) continue;
+    var sax = w2sx(ua.x), say = w2sy(ua.y);
+    if (!vis(sax, say, 60)) continue;
+    var sk = clamp(1 - uaAir / (CFG.air.peak * 1.15), 0.22, 1);
+    CTX.fillStyle = "rgba(0,0,0," + (0.34 * sk) + ")";
+    CTX.beginPath();
+    CTX.ellipse(sax, say, ua.r * z * (0.62 + 0.42 * sk), ua.r * z * (0.34 + 0.24 * sk), 0, 0, TAU);
+    CTX.fill();
+  }
+  drawWetReflections(z);
+  for (i = 0; i < units.length; i++) {
+    var u = units[i];
+    /* 飞在空中时整个人按高度往上抬，影子留在地面上 */
+    var uFly = flyHeightOf(u);
+    var ux = w2sx(u.x), uy = w2sy(u.y) - ((u.airH || 0) + uFly) * z, ur = Math.max(1.3, u.r * z);
+    /* 自爆丧尸蓄爆：越到后面闪得越快、胀得越大。指数曲线，前一秒里几乎看不出动，
+       最后几帧才猛地鼓到两倍，然后炸开 */
+    var armP = (u.armT > 0) ? clamp(1 - u.armT / CFG.bomber.armT, 0, 1) : 0;
+    if (armP > 0) ur *= 1 + (CFG.bomber.bloat - 1) * armP * armP;
+    if (!vis(ux, uy, ur + 40)) continue;
+    var fill;
+    if (isHuman(u)) fill = u.infectLocked ? infectColorHex(u) : CFG.unit[u.kind].color;
+    else fill = CFG.unit[u.kind].color;
+    if (u.kind === "tesla") fill = "#6f747b";   /* 磁爆兵以灰为主，红色只留外圈 */
+    if (u.elite) fill = "#e05a5a";
+    if (armP > 0 && Math.sin(W.t * (14 + 190 * armP * armP)) > 0) fill = "#ffffff";
+    if (u.hitFlash > 0) fill = "#ffffff";
+    /* 磁爆麻痹：黄白超高频闪烁，频率远高于普通受击白闪 */
+    if (u.paralyzeT > 0) fill = (Math.sin(W.t * 150 + u.id * 1.7) > 0) ? "#fff7a8" : "#ffffff";
+    if (showCircles) {
+      var senseR = 0;
+      if (isZombie(u)) senseR = 0;
+      else if (isArmed(u)) senseR = CFG.far.r;
+      else senseR = fearRadiusOf(u);
+      if (senseR > 0 && showRange) {
+        CTX.strokeStyle = isArmed(u) ? "rgba(90,220,140,0.20)" : "rgba(200,200,120,0.25)";
+        CTX.beginPath(); CTX.arc(ux, uy, senseR * z, 0, TAU); CTX.stroke();
+        if (isArmed(u)) {
+          CTX.strokeStyle = "rgba(255,150,90,0.28)";
+          CTX.beginPath(); CTX.arc(ux, uy, CFG.near.r * z, 0, TAU); CTX.stroke();
+        }
+        if (u.defend && dbgOn("post")) {
+          CTX.strokeStyle = u.retaking ? "rgba(255,180,90,0.6)" : "rgba(120,220,255,0.4)";
+          CTX.lineWidth = 1;
+          CTX.beginPath(); CTX.moveTo(ux, uy);
+          CTX.lineTo(w2sx(u.defend.x), w2sy(u.defend.y)); CTX.stroke();
+          CTX.beginPath(); CTX.arc(w2sx(u.defend.x), w2sy(u.defend.y), 5, 0, TAU); CTX.stroke();
+        }
+      }
+      if (showPath && isZombie(u) && u.path && u.path.length) {
+        CTX.strokeStyle = "rgba(190,120,255,0.30)"; CTX.lineWidth = 1;
+        CTX.beginPath(); CTX.moveTo(ux, uy);
+        for (var q = 0; q < u.path.length; q++) CTX.lineTo(w2sx(u.path[q].x), w2sy(u.path[q].y));
+        CTX.stroke();
+      }
+      if (isZombie(u) && u.herdHit) {
+        CTX.strokeStyle = "rgba(255,220,90,0.55)"; CTX.lineWidth = 1;
+        CTX.beginPath(); CTX.moveTo(ux, uy);
+        CTX.lineTo(w2sx(u.x + u.vx * 2), w2sy(u.y + u.vy * 2)); CTX.stroke();
+      }
+      /* 锁敌连线：这只丧尸此刻在追谁。拍剧情时最有用的一条信息，
+         能一眼看出"它为什么往那边跑""它为什么不追那个引怪的人" */
+      if (showTarget && isZombie(u) && u.target && !u.target.dead) {
+        CTX.strokeStyle = "rgba(255,110,110,0.30)";
+        CTX.lineWidth = 1;
+        CTX.beginPath(); CTX.moveTo(ux, uy);
+        CTX.lineTo(w2sx(u.target.x), w2sy(u.target.y)); CTX.stroke();
+      }
+      /* 已经判定"够不着"的目标：画一条虚线加一个叉，解释它为什么站着不动 */
+      if (showTarget && u.giveUpTo && !u.giveUpTo.dead) {
+        var gx2 = w2sx(u.giveUpTo.x), gy2 = w2sy(u.giveUpTo.y);
+        CTX.strokeStyle = "rgba(255,150,40,0.45)";
+        CTX.lineWidth = 1;
+        CTX.setLineDash([5, 5]);
+        CTX.beginPath(); CTX.moveTo(ux, uy); CTX.lineTo(gx2, gy2); CTX.stroke();
+        CTX.setLineDash([]);
+        CTX.beginPath();
+        CTX.moveTo(gx2 - 5, gy2 - 5); CTX.lineTo(gx2 + 5, gy2 + 5);
+        CTX.moveTo(gx2 + 5, gy2 - 5); CTX.lineTo(gx2 - 5, gy2 + 5);
+        CTX.stroke();
+      }
+      /* 护卫关系：这条线表示平民跟着谁走 */
+      if (showGuard && u.guardOf && !u.guardOf.dead) {
+        CTX.strokeStyle = "rgba(140,220,255,0.32)";
+        CTX.lineWidth = 1;
+        CTX.beginPath(); CTX.moveTo(ux, uy);
+        CTX.lineTo(w2sx(u.guardOf.x), w2sy(u.guardOf.y)); CTX.stroke();
+      }
+      /* 这只武装单位在保护几个平民 */
+      if (showGuard && u.guards && u.guards.length) {
+        for (var gg = 0; gg < u.guards.length; gg++) {
+          var gv = u.guards[gg];
+          if (!gv || gv.dead) continue;
+          CTX.strokeStyle = "rgba(120,255,170,0.22)";
+          CTX.lineWidth = 1;
+          CTX.beginPath(); CTX.moveTo(ux, uy);
+          CTX.lineTo(w2sx(gv.x), w2sy(gv.y)); CTX.stroke();
+        }
+      }
+      if (u.kind === "licker") {
+      /* 读条圈：进度画在身边一圈，快满了才醒目 */
+      if (u.state === "lickerAim" && u.tongueT > 0) {
+        var pr = (u.tongueT / CFG.licker.windup);
+        if (pr > 1) pr = 1;
+        CTX.strokeStyle = "rgba(232,109,109,0.35)";
+        CTX.lineWidth = 2;
+        CTX.beginPath(); CTX.arc(ux, uy, ur + 7, 0, TAU); CTX.stroke();
+        CTX.strokeStyle = "rgba(255,150,150,0.95)";
+        CTX.lineWidth = 3;
+        CTX.beginPath();
+        CTX.arc(ux, uy, ur + 7, -Math.PI / 2, -Math.PI / 2 + TAU * pr);
+        CTX.stroke();
+      }
+    }
+    if (u.state === "pounce") {
+        CTX.strokeStyle = "rgba(255,70,70,0.85)"; CTX.lineWidth = 2;
+        CTX.beginPath(); CTX.arc(ux, uy, ur + 3, 0, TAU); CTX.stroke();
+      }
+    }
+    /* 战争迷雾：看不见的敌人干脆不画，加一层半透明阴影是挡不住的，
+       玩家还是能透过阴影看出轮廓，那就一点紧张感都没有了。建筑照常显示。 */
+    if (CFG.fog.on && isZombieSide(u) && !u.fogVis) continue;
+    var fogA = (CFG.fog.on && isZombieSide(u) && u.fogFade < 1) ? u.fogFade : 1;
+    if (fogA < 1) CTX.globalAlpha = fogA;
+    if (u.kind === "tyrant") { drawTyrantUnit(u, ux, uy, ur, z); continue; }
+    if (u.kind === "plagueNest") { drawPlagueNestUnit(u, ux, uy, ur, z); continue; }
+    if (u.kind === "nestEgg") { drawNestEggUnit(u, ux, uy, ur, z); continue; }
+    if (u.kind === "flame") drawFlameTanks(ux, uy, ur, z, u);
+    else drawGenericWeaponBack(u, ux, uy, ur, z);
+    CTX.fillStyle = fill;
+    CTX.beginPath(); CTX.arc(ux, uy, ur, 0, TAU); CTX.fill();
+    if (u.elite) {
+      CTX.strokeStyle = "rgba(255,155,95,.9)";
+      CTX.lineWidth = Math.max(1.2, 2 * z);
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 3, 0, TAU); CTX.stroke();
+    }
+    if (u.tempHp > 0) {
+      CTX.strokeStyle = "rgba(190,255,150,.85)";
+      CTX.lineWidth = Math.max(1, 1.5 * z);
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 3, 0, TAU); CTX.stroke();
+    }
+    /* 1.3.3：磁爆兵是"外圈深红 + 内部深灰"的双层球；
+       冰冻与点燃都是叠加在身上的状态滤镜，白闪（hitFlash）之后仍然看得见 */
+    if (u.kind === "tesla" && ur > 2.2) {
+      CTX.fillStyle = CFG.tesla.core;
+      CTX.beginPath(); CTX.arc(ux, uy, ur * 0.58, 0, TAU); CTX.fill();
+      /* 外圈红色改细：灰色球体 + 一圈细红线 */
+      CTX.strokeStyle = CFG.tesla.color;
+      CTX.lineWidth = Math.max(1, ur * 0.16);
+      CTX.beginPath(); CTX.arc(ux, uy, ur * 0.94, 0, TAU); CTX.stroke();
+    }
+    if ((u.cryoSlow || 1) < 0.999 || u.frozen) drawCryoShell(ux, uy, ur, u);
+    if (u.burnT > 0) drawBurnOverlay(ux, uy, ur, u);
+    if (u.zapT > 0 && Math.sin(W.t * 60) > 0) {
+      CTX.strokeStyle = "rgba(160,200,255,0.85)";
+      CTX.lineWidth = Math.max(1, 1.6 * CAM.zoom);
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 2, 0, TAU); CTX.stroke();
+    }
+    /* 医疗兵：白底正中间压一个绿色十字 */
+    if (u.kind === "medic" && ur > 2.2) {
+      var cs = ur * 0.66, ct = Math.max(0.9, cs * 0.34);
+      CTX.fillStyle = "#2fbf60";
+      CTX.fillRect(ux - ct / 2, uy - cs, ct, cs * 2);
+      CTX.fillRect(ux - cs, uy - ct / 2, cs * 2, ct);
+    }
+    if (fogA < 1) CTX.globalAlpha = 1;
+    /* 面朝方向：右手边靠着的一把深灰武器，加上一对几乎看不见的小眼睛 */
+    if (ur > 2.5) {
+      var fxa = Math.cos(u.faceAng), fya = Math.sin(u.faceAng);
+      /* 单位的右手边：俯视图里就是朝向顺时针转 90° */
+      var hxa = -fya, hya = fxa;
+      if (u.kind === "tesla") drawTeslaCoil(ux, uy, ur, z, u, fxa, fya, hxa, hya);
+      else if (u.kind === "cryo") drawCryoBottle(ux, uy, ur, z, u, fxa, fya, hxa, hya);
+      else if (u.kind === "laser") drawLaserRig(ux, uy, ur, z, u, fxa, fya, hxa, hya);
+      else if (u.kind === "flame") drawFlameRig(ux, uy, ur, z, u, fxa, fya, hxa, hya);
+      /* 眼睛小到要盯着看才认得出来，免得一堆单位挤在一起时满屏黑点。
+         0.55px 是屏幕像素下限：默认视角下单位半径只有三四个像素，
+         纯按比例算会小到连一个点都画不出来 */
+      if (ur > 3) {
+        var erx = Math.max(0.55, ur * 0.13), ery = Math.max(0.40, ur * 0.085);
+        var eahead = ur * 0.46, eside = ur * 0.26;
+        CTX.fillStyle = "#0b0d12";
+        CTX.beginPath();
+        CTX.ellipse(ux + fxa * eahead + hxa * eside, uy + fya * eahead + hya * eside, erx, ery, u.faceAng, 0, TAU);
+        CTX.fill();
+        CTX.beginPath();
+        CTX.ellipse(ux + fxa * eahead - hxa * eside, uy + fya * eahead - hya * eside, erx, ery, u.faceAng, 0, TAU);
+        CTX.fill();
+      }
+    }
+    /* 光源侧弧形反光面：外圆减内圆形成月牙，再叠加方向渐变 */
+    if (CFG.visualFx.enabled && CFG.visualFx.projectileLight) {
+      var pl = nearestLightSource(ux, uy, ur + 170);
+      if (pl) {
+        var plA = (1 - pl.d / (ur + 170)) * 0.72;
+        if (plA > 0.025) {
+          var plx = (pl.x - ux) / Math.max(1, pl.d), ply = (pl.y - uy) / Math.max(1, pl.d);
+          var outR = ur + Math.max(1.2, 2 * z), inR = ur * 0.93, off = ur * 0.38;
+          var cg = CTX.createLinearGradient(ux + plx * outR, uy + ply * outR, ux - plx * outR, uy - ply * outR);
+          cg.addColorStop(0, glowColorAlpha(pl.color, plA.toFixed(3)));
+          cg.addColorStop(0.45, glowColorAlpha(pl.color, (plA * 0.32).toFixed(3)));
+          cg.addColorStop(1, glowColorAlpha(pl.color, 0));
+          CTX.save();
+          CTX.globalCompositeOperation = "lighter";
+          CTX.fillStyle = cg;
+          CTX.beginPath();
+          CTX.arc(ux, uy, outR, 0, TAU);
+          CTX.arc(ux - plx * off, uy - ply * off, inR, 0, TAU, true);
+          CTX.fill("evenodd");
+          /* 背光侧保留一层很淡的包裹光，避免只有单边括号 */
+          var cg2 = CTX.createLinearGradient(ux - plx * outR, uy - ply * outR, ux + plx * outR, uy + ply * outR);
+          cg2.addColorStop(0, glowColorAlpha(pl.color, (plA * 0.16).toFixed(3)));
+          cg2.addColorStop(1, glowColorAlpha(pl.color, 0));
+          CTX.fillStyle = cg2;
+          CTX.beginPath();
+          CTX.arc(ux, uy, outR, 0, TAU);
+          CTX.arc(ux + plx * off, uy + ply * off, inR, 0, TAU, true);
+          CTX.fill("evenodd");
+          CTX.restore();
+        }
+      }
+    }
+    /* 英雄：罩一层淡淡金光，外圈再套一道亮边 */
+    if (u.hero) {
+      CTX.globalAlpha = 0.22;
+      CTX.fillStyle = "hsl(45,100%,62%)";
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 3, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+      CTX.strokeStyle = "rgba(255,215,90,0.9)";
+      CTX.lineWidth = 2;
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 3, 0, TAU); CTX.stroke();
+    }
+    /* 弹匣打空、正在换弹：头顶挂一个红色禁止符号 */
+    if (u.reloading) {
+      var nr2 = ur * 0.85;
+      var ny2 = uy - ur - nr2 - 3;
+      CTX.strokeStyle = "rgba(232,64,64,0.60)";
+      CTX.lineWidth = 2;
+      CTX.beginPath(); CTX.arc(ux, ny2, nr2, 0, TAU); CTX.stroke();
+      CTX.beginPath();
+      CTX.moveTo(ux - nr2 * 0.71, ny2 - nr2 * 0.71);
+      CTX.lineTo(ux + nr2 * 0.71, ny2 + nr2 * 0.71);
+      CTX.stroke();
+    }
+    /* 盾兵英雄的能量防护罩：只放人类进出的那层球壳 */
+    if (u.domeOn && u.domeHp > 0) {
+      /* 收集起来统一画：重叠区不叠加、只留并集外轮廓 */
+      AURA_CIRCLES.push({ x: ux, y: uy, r: CFG.fearRCivilian * z, k: u.domeHp / CFG.shield.domeHp, dome: true });
+    }
+    /* 平民英雄的光环：半透明金色圈，圈里的所有单位无限弹药。
+       一群平民英雄同时在场时，几十个半透明圆叠在一起会把整块屏幕刷成黄的，
+       所以这里按"在场人数"自动降级：人少时给足氛围，人一多就只剩细描边，不再填充 */
+    if ((u.hero === "civilian" || u.hero === "militia")) {
+      AURA_CIRCLES.push({ x: ux, y: uy, r: fearRadiusOf(u) * CFG.hero.auraR * z, k: 1, dome: false });
+    }
+    if (u.kind === "mother" && u.energyShieldHp > 0) {
+      MOTHER_SHIELDS.push({ x: ux, y: uy, r: u.r * 4 * z, k: Math.max(0, u.energyShieldHp / Math.max(1, u.energyShieldMax)) });
+    }
+    if (isZombie(u) && u.kind === "mother") {
+      CTX.strokeStyle = "rgba(255,255,255,0.55)"; CTX.lineWidth = 1.5;
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 2, 0, TAU); CTX.stroke();
+    }
+    if (isHuman(u) && u.infectLocked && u.incubT >= CFG.infect.incubation) {
+      CTX.strokeStyle = "rgba(255,255,255,0.7)"; CTX.lineWidth = 1;
+      CTX.beginPath(); CTX.arc(ux, uy, ur + 2, (u.fadeT / CFG.infect.fade) * TAU - Math.PI / 2, TAU - Math.PI / 2); CTX.stroke();
+    }
+    if (isZombie(u) && u.hp < u.maxHp) {
+      var frac = u.hp / u.maxHp;
+      CTX.fillStyle = "rgba(0,0,0,0.55)";
+      CTX.fillRect(ux - ur, uy - ur - 6, ur * 2, 3);
+      CTX.fillStyle = "#ff5b5b";
+      CTX.fillRect(ux - ur, uy - ur - 6, ur * 2 * frac, 3);
+    }
+    /* 盾兵护盾：半透明白色膜 + 耐久弧；破裂后改为显示恢复进度 */
+    if (u.kind === "shield") {
+      var sr = ur + 5;
+      if (!u.shieldBroken) {
+        CTX.fillStyle = "rgba(255,255,255,0.16)";
+        CTX.beginPath(); CTX.arc(ux, uy, sr, 0, TAU); CTX.fill();
+        CTX.strokeStyle = "rgba(255,255,255,0.7)";
+        CTX.lineWidth = 1.5;
+        CTX.beginPath(); CTX.arc(ux, uy, sr, 0, TAU); CTX.stroke();
+        CTX.strokeStyle = "rgba(150,205,255,0.95)";
+        CTX.lineWidth = 2.5;
+        CTX.beginPath();
+        CTX.arc(ux, uy, sr, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(u.shieldHp / CFG.shield.hp, 0, 1));
+        CTX.stroke();
+      } else {
+        CTX.strokeStyle = "rgba(150,160,190,0.4)";
+        CTX.lineWidth = 1.5;
+        CTX.beginPath();
+        CTX.arc(ux, uy, sr, -Math.PI / 2, -Math.PI / 2 + TAU * clamp(u.shieldT / CFG.shield.regen, 0, 1));
+        CTX.stroke();
+      }
+    }
+    /* 换弹进度：环形 UI 嵌套在单位上，始终可见 */
+    if (u.reloading) {
+      var rtime = reloadTimeOf(u);
+      var prog = clamp(1 - u.reloadT / rtime, 0, 1);
+      var rr = ur + 6;
+      CTX.strokeStyle = "rgba(10,14,22,0.75)";
+      CTX.lineWidth = 3.5;
+      CTX.beginPath(); CTX.arc(ux, uy, rr, 0, TAU); CTX.stroke();
+      CTX.strokeStyle = u.kind === "mg" ? "rgba(255,206,90,0.95)" : "rgba(140,215,255,0.95)";
+      CTX.lineWidth = 3;
+      CTX.beginPath(); CTX.arc(ux, uy, rr, -Math.PI / 2, -Math.PI / 2 + TAU * prog); CTX.stroke();
+    }
+  }
+  /* 1.3.3 新兵种的空中与覆盖层：罐子飞在半空、火焰束、闪电、激光柱 */
+  drawCryoPots(z);
+  drawTeslaArcs(z);
+  drawLaserHitParticles(z);
+  drawLaserBeams(z);
+  drawSniperSight(z);
+  /* 子弹：长度固定的发射光条（速度极高，不可能按整段位移绘制） */
+  /* 狙击弹尾迹：一秒内由亮到暗渐变消散 */
+  var trs = W.trails;
+  if (trs && trs.length) {
+    CTX.globalCompositeOperation = "lighter";
+    for (i = 0; i < trs.length; i++) {
+      var tq = trs[i];
+      var ta = tq.life / tq.max;
+      if (ta <= 0) continue;
+      var tx1 = w2sx(tq.x1), ty1 = w2sy(tq.y1);
+      if (!vis(tx1, ty1, 140)) continue;
+      var tx0 = w2sx(tq.x0), ty0 = w2sy(tq.y0);
+      CTX.strokeStyle = "rgba(140,210,255," + (ta * 0.40).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(1, CFG.bullet.width * z * CFG.sniper.trailMul * ta * 1.5);
+      CTX.beginPath(); CTX.moveTo(tx0, ty0); CTX.lineTo(tx1, ty1); CTX.stroke();
+      CTX.strokeStyle = "rgba(228,246,255," + (ta * 0.72).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(0.6, CFG.bullet.width * z * ta);
+      CTX.beginPath(); CTX.moveTo(tx0, ty0); CTX.lineTo(tx1, ty1); CTX.stroke();
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 子弹：极细的实线，本身不发光（发光只留给枪口光晕） */
+  var bl = W.bullets;
+  var blen = CFG.bullet.len;
+  CTX.lineCap = "butt";
+  for (i = 0; i < bl.length; i++) {
+    var b = bl[i];
+    var bx1 = w2sx(b.x), by1 = w2sy(b.y);
+    if (!vis(bx1, by1, 80)) continue;
+    var ca = Math.cos(b.ang), sa = Math.sin(b.ang);
+    /* 曳光长度不超过枪口到弹头的实际距离；狙击弹用更长的拖尾 */
+    var maxLen = b.snipe ? CFG.sniper.len : blen;
+    var flown = (b.ox === undefined) ? maxLen
+      : Math.sqrt((b.x - b.ox) * (b.x - b.ox) + (b.y - b.oy) * (b.y - b.oy));
+    var segLen = flown < maxLen ? flown : maxLen;
+    var bx0 = w2sx(b.x - ca * segLen), by0 = w2sy(b.y - sa * segLen);
+    var wm = b.wmul || 1;
+    if (b.snipe) {
+      /* 狙击弹带光效，并且比普通弹粗得多 */
+      CTX.globalCompositeOperation = "lighter";
+      CTX.strokeStyle = "rgba(140,215,255,0.4)";
+      CTX.lineWidth = Math.max(3.5, CFG.bullet.width * z * wm * 2.4);
+      CTX.beginPath(); CTX.moveTo(bx0, by0); CTX.lineTo(bx1, by1); CTX.stroke();
+      CTX.strokeStyle = "rgba(232,248,255,0.98)";
+      CTX.lineWidth = Math.max(1.4, CFG.bullet.width * z * wm);
+      CTX.beginPath(); CTX.moveTo(bx0, by0); CTX.lineTo(bx1, by1); CTX.stroke();
+      CTX.globalCompositeOperation = "source-over";
+    } else {
+      var fp = visualFxBulletPalette(b);
+      if (CFG.visualFx.enabled && CFG.visualFx.tracers) {
+        CTX.globalCompositeOperation = "lighter";
+        CTX.strokeStyle = fp.trail;
+        CTX.lineWidth = Math.max(1, CFG.bullet.width * z * wm * 1.6);
+        CTX.beginPath(); CTX.moveTo(bx0, by0); CTX.lineTo(bx1, by1); CTX.stroke();
+        CTX.globalCompositeOperation = "source-over";
+      }
+      CTX.strokeStyle = fp.core;
+      CTX.lineWidth = Math.max(0.5, CFG.bullet.width * z * wm);
+      CTX.beginPath(); CTX.moveTo(bx0, by0); CTX.lineTo(bx1, by1); CTX.stroke();
+    }
+  }
+  /* 枪口光晕：全画面唯一发光的部分 */
+  CTX.globalCompositeOperation = "lighter";
+  var fls = W.flashes;
+  for (i = 0; i < fls.length; i++) {
+    var f = fls[i];
+    var fa = clamp(f.life / f.max, 0, 1);
+    var fx1 = w2sx(f.x + Math.cos(f.ang) * f.len), fy1 = w2sy(f.y + Math.sin(f.ang) * f.len);
+    if (!vis(fx1, fy1, 90)) continue;
+    var fx0 = w2sx(f.x), fy0 = w2sy(f.y);
+    var nx = -Math.sin(f.ang) * f.wid * 0.5 * z;
+    var ny = Math.cos(f.ang) * f.wid * 0.5 * z;
+    if (f.snipe) {
+      /* 狙击枪口：三层渐变更亮的光锥 */
+      CTX.globalAlpha = 0.30 * fa;
+      CTX.fillStyle = "#7fd4ff";
+      CTX.beginPath(); CTX.moveTo(fx0 + nx * 1.6, fy0 + ny * 1.6); CTX.lineTo(fx0 - nx * 1.6, fy0 - ny * 1.6);
+      CTX.lineTo(fx1, fy1); CTX.closePath(); CTX.fill();
+      CTX.globalAlpha = 0.6 * fa;
+      CTX.fillStyle = "#bfe9ff";
+      CTX.beginPath(); CTX.moveTo(fx0 + nx * 0.9, fy0 + ny * 0.9); CTX.lineTo(fx0 - nx * 0.9, fy0 - ny * 0.9);
+      CTX.lineTo(fx1, fy1); CTX.closePath(); CTX.fill();
+      CTX.globalAlpha = 0.98 * fa;
+      CTX.fillStyle = "#f2fbff";
+      CTX.beginPath(); CTX.moveTo(fx0 + nx * 0.32, fy0 + ny * 0.32); CTX.lineTo(fx0 - nx * 0.32, fy0 - ny * 0.32);
+      CTX.lineTo(fx1, fy1); CTX.closePath(); CTX.fill();
+      continue;
+    }
+    CTX.globalAlpha = 0.34 * fa;
+    CTX.fillStyle = "#ffb347";
+    CTX.beginPath(); CTX.moveTo(fx0 + nx, fy0 + ny); CTX.lineTo(fx0 - nx, fy0 - ny); CTX.lineTo(fx1, fy1); CTX.closePath(); CTX.fill();
+    CTX.globalAlpha = 0.9 * fa;
+    CTX.fillStyle = "#fff3c4";
+    CTX.beginPath(); CTX.moveTo(fx0 + nx * 0.38, fy0 + ny * 0.38); CTX.lineTo(fx0 - nx * 0.38, fy0 - ny * 0.38); CTX.lineTo(fx1, fy1); CTX.closePath(); CTX.fill();
+  }
+  CTX.globalAlpha = 1;
+  CTX.globalCompositeOperation = "source-over";
+  /* 战争迷雾压在战场之上，必须在所有 UI 之前，
+     否则兵种占比条这类界面元素也会被一起压暗 */
+  drawBloodOrbs(z);
+  drawGlowLayer(z);
+  drawFog(z);
+  drawFxGrade();
+  /* 画面亮度：压在世界层之上、界面之下，所以文字和按钮不会被一起调暗 */
+  if (CFG.brightness && Math.abs(CFG.brightness - 1) > 0.01) {
+    CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+    CTX.globalAlpha = 1;
+    if (CFG.brightness < 1) {
+      CTX.fillStyle = "rgba(0,0,0," + ((1 - CFG.brightness) * 0.88).toFixed(3) + ")";
+      CTX.fillRect(0, 0, VW, VH);
+    } else {
+      CTX.globalCompositeOperation = "lighter";
+      CTX.fillStyle = "rgba(110,112,120," + ((CFG.brightness - 1) * 0.55).toFixed(3) + ")";
+      CTX.fillRect(0, 0, VW, VH);
+      CTX.globalCompositeOperation = "source-over";
+    }
+  }
+  /* 底部：阵营兵种占比条 */
+  drawRatioBar();
+  drawBossBar();
+  drawBossFx(z);
+  /* 地形编辑预览 */
+  if (EDIT.active) drawEditOverlay(z);
+  /* 放置预览 */
+  if (!EDIT.active && UI.selected && UI.pointer.in) {
+    var wx = s2wx(UI.pointer.x), wy = s2wy(UI.pointer.y);
+    var nWant = batchCount() * squadSizeOf(UI.selected);
+    var okPlace = canPlace(UI.selected, wx, wy) && W.resources >= unitCostOf(UI.selected);
+    if (UI.selected === "sandbag") {
+      CTX.globalAlpha = 0.75;
+      CTX.fillStyle = okPlace ? "rgba(120,230,150,0.45)" : "rgba(230,90,90,0.45)";
+      CTX.fillRect(w2sx(wx - 30), w2sy(wy - 20), 60 * z, 40 * z);
+      CTX.globalAlpha = 1;
+    } else {
+      /* 批量投放：用一个范围圈示意这一次会铺开的规模 */
+      var rad = 12 + Math.sqrt(nWant) * 15;
+      CTX.globalAlpha = 0.35;
+      CTX.fillStyle = okPlace ? "rgba(120,230,150,0.5)" : "rgba(230,90,90,0.5)";
+      CTX.beginPath(); CTX.arc(w2sx(wx), w2sy(wy), rad * z, 0, TAU); CTX.fill();
+      CTX.globalAlpha = 1;
+      CTX.strokeStyle = okPlace ? "rgba(150,240,180,0.9)" : "rgba(240,120,120,0.9)";
+      CTX.lineWidth = 1.5;
+      CTX.beginPath(); CTX.arc(w2sx(wx), w2sy(wy), rad * z, 0, TAU); CTX.stroke();
+    }
+  }
+  /* 飞行中的弹壳：用 y - z 把高度投影到屏幕上，形成伪 3D 抛物线 */
+  for (i = 0; i < W.shells.length; i++) {
+    var sh2 = W.shells[i];
+    var sxs = w2sx(sh2.x), sys = w2sy(sh2.y) - sh2.z * z;
+    if (!vis(sxs, sys, 20)) continue;
+    var sw = sh2.size * z * 3.2, shh = sh2.size * z * 1.1;
+    CTX.save();
+    CTX.translate(sxs, sys);
+    CTX.rotate(sh2.rot);
+    CTX.fillStyle = sh2.color || CFG.shell.color;
+    CTX.fillRect(-sw / 2, -shh / 2, sw, shh);
+    if (sh2.big) {   /* 大号电池匣：中间压一道深色槽，一眼区分于普通弹壳 */
+      CTX.fillStyle = "rgba(30,34,40,0.7)";
+      CTX.fillRect(-sw / 2, -shh * 0.16, sw, shh * 0.32);
+    }
+    CTX.restore();
+  }
+  /* 医疗兵的治疗弹：一条翠绿的光钉，会一路拐弯追着目标走 */
+  if (W.heals && W.heals.length) {
+    CTX.globalCompositeOperation = "lighter";
+    for (i = 0; i < W.heals.length; i++) {
+      var hb = W.heals[i];
+      var hx1 = w2sx(hb.x), hy1 = w2sy(hb.y);
+      if (!vis(hx1, hy1, 60)) continue;
+      var hx0 = w2sx(hb.x - Math.cos(hb.ang) * hb.len);
+      var hy0 = w2sy(hb.y - Math.sin(hb.ang) * hb.len);
+      var nw = CFG.bullet.width * CFG.medic.widthMul * z;
+      CTX.strokeStyle = CFG.medic.color;
+      CTX.lineWidth = Math.max(1, nw);
+      CTX.lineCap = "round";
+      CTX.beginPath(); CTX.moveTo(hx0, hy0); CTX.lineTo(hx1, hy1); CTX.stroke();
+      CTX.strokeStyle = "rgba(230,255,200,0.96)";
+      CTX.lineWidth = Math.max(0.6, nw * 0.45);
+      CTX.beginPath(); CTX.moveTo(hx0, hy0); CTX.lineTo(hx1, hy1); CTX.stroke();
+      CTX.lineCap = "butt";
+    }
+    CTX.globalCompositeOperation = "source-over";
+  }
+  /* 舔舐者的舌头：从本体延伸出去的一条深红细带，被打断会断成两截 */
+  if (W.tongues && W.tongues.length) {
+    for (i = 0; i < W.tongues.length; i++) {
+      var tq = W.tongues[i];
+      if (tq.dead || !tq.owner) continue;
+      var tux = w2sx(tq.owner.x), tuy = w2sy(tq.owner.y);
+      var tex = w2sx(tq.owner.x + Math.cos(tq.ang) * tq.len);
+      var tey = w2sy(tq.owner.y + Math.sin(tq.ang) * tq.len);
+      CTX.strokeStyle = CFG.licker.color;
+      CTX.lineWidth = CFG.licker.tongueW * z;
+      CTX.lineCap = "round";
+      CTX.beginPath();
+      CTX.moveTo(tux, tuy);
+      CTX.lineTo(tex, tey);
+      CTX.stroke();
+      /* 舌尖一小坨，看得清"抓住谁了" */
+      CTX.fillStyle = CFG.licker.color;
+      CTX.beginPath();
+      CTX.arc(tex, tey, CFG.licker.tongueW * z * 0.85, 0, TAU);
+      CTX.fill();
+      /* 血量条：只有挨过打才显示 */
+      if (tq.hp < tq.maxHp) {
+        var tmx = (tux + tex) / 2, tmy = (tuy + tey) / 2;
+        CTX.fillStyle = "rgba(0,0,0,0.55)";
+        CTX.fillRect(tmx - 16, tmy - 9, 32, 4);
+        CTX.fillStyle = "#e86d6d";
+        CTX.fillRect(tmx - 16, tmy - 9, 32 * Math.max(0, tq.hp / tq.maxHp), 4);
+      }
+    }
+    CTX.lineCap = "butt";
+  }
+  /* 被治愈的己方头顶飘起的绿色十字 */
+  if (W.healPops && W.healPops.length) {
+    var MHP = CFG.medic;
+    for (i = 0; i < W.healPops.length; i++) {
+      var hpz = W.healPops[i];
+      if (hpz.delay > 0) continue;
+      var hpP = clamp(1 - hpz.t / MHP.popLife, 0, 1);
+      var hpx2 = w2sx(hpz.x), hpy2 = w2sy(hpz.y) - hpP * hpz.rise * z;
+      if (!vis(hpx2, hpy2, 40)) continue;
+      var hpa = clamp(hpz.t / (MHP.popLife * 0.55), 0, 1);
+      var hcs = Math.max(2.2, 4.2 * z * (1 + 0.25 * Math.sin(hpP * Math.PI)));
+      var hct = Math.max(0.9, hcs * 0.34);
+      CTX.globalAlpha = hpa;
+      CTX.fillStyle = "#3de07a";
+      CTX.fillRect(hpx2 - hct / 2, hpy2 - hcs, hct, hcs * 2);
+      CTX.fillRect(hpx2 - hcs, hpy2 - hct / 2, hcs * 2, hct);
+      CTX.globalAlpha = 1;
+    }
+  }
+  /* 医疗兵锁定的目标：外套一个很细的绿色菱形角标，一眼看出在锁谁 */
+  for (i = 0; i < units.length; i++) {
+    var mu = units[i];
+    if (mu.dead || mu.kind !== "medic" || !mu.lockList || !mu.lockList.length) continue;
+    for (var li = 0; li < mu.lockList.length; li++) {
+      var lt = mu.lockList[li];
+      if (!lt || lt.dead) continue;
+      var lx = w2sx(lt.x), ly = w2sy(lt.y), lr = lt.r * z + 7;
+      if (!vis(lx, ly, lr + 20)) continue;
+      CTX.strokeStyle = "rgba(120,245,160,0.92)";
+      CTX.lineWidth = Math.max(0.8, 1.2 * z);
+      CTX.beginPath();
+      CTX.moveTo(lx, ly - lr); CTX.lineTo(lx + lr * 0.72, ly);
+      CTX.lineTo(lx, ly + lr); CTX.lineTo(lx - lr * 0.72, ly);
+      CTX.closePath(); CTX.stroke();
+    }
+  }
+  /* 医疗兵的锁定读条：画在角色脚下，一条翠绿的小进度条 */
+  for (i = 0; i < units.length; i++) {
+    var md = units[i];
+    if (md.dead || md.kind !== "medic" || !(md.lockT > 0)) continue;
+    var mdx2 = w2sx(md.x), mdy2 = w2sy(md.y) + md.r * z + 7;
+    if (!vis(mdx2, mdy2, 40)) continue;
+    var mp = clamp(md.lockT / CFG.medic.windup, 0, 1);
+    var mw = 22 * z;
+    CTX.fillStyle = "rgba(0,0,0,0.55)";
+    CTX.fillRect(mdx2 - mw / 2, mdy2, mw, Math.max(2, 3 * z));
+    CTX.fillStyle = CFG.medic.color;
+    CTX.fillRect(mdx2 - mw / 2, mdy2, mw * mp, Math.max(2, 3 * z));
+  }
+  /* 所有光环与护盾统一在这里画：并集，重叠区不叠加、只留最外轮廓 */
+  drawAuraCircles();
+  drawMotherShields();
+  /* 边缘闪光画在屏幕坐标系里，不跟着抖动走 */
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  if (W.glowG > 0) drawEdgeGlow(CFG.glow.green, CFG.glow.greenPeak * Math.pow(W.glowG / CFG.glow.greenLife, 2));
+  if (W.glowP > 0) drawEdgeGlow(CFG.glow.purple, CFG.glow.purplePeak * Math.pow(W.glowP / CFG.glow.purpleLife, 2));
+  /* 玩家操控：被接管的角色画双圈标记，触屏时再画出两个摇杆 */
+  if (PLAYER.on) {
+    if (playerUnitValid()) {
+      var pkx = w2sx(PLAYER.unit.x), pky = w2sy(PLAYER.unit.y);
+      CTX.strokeStyle = "rgba(255,225,120,0.95)";
+      CTX.lineWidth = 2;
+      CTX.beginPath(); CTX.arc(pkx, pky, (PLAYER.unit.r + 7) * z, 0, TAU); CTX.stroke();
+      CTX.beginPath(); CTX.arc(pkx, pky, (PLAYER.unit.r + 12) * z, 0, TAU); CTX.stroke();
+    }
+    if (PLAYER.stickL) drawStick(PLAYER.stickL, "rgba(140,230,160,");
+    if (PLAYER.stickR) drawStick(PLAYER.stickR, "rgba(255,170,120,");
+  }
+  /* 混沌模式的开场倒计时：屏幕正中的大数字。
+     最后三秒转红、放大、并且精确到毫秒 */
+  if (W.countdown > 0) {
+    var cd = W.countdown;
+    var hot = cd <= 4.0;
+    var cdTxt = hot ? cd.toFixed(3) : String(Math.ceil(cd));
+    var cdSize = hot ? 96 : 72;
+    CTX.textAlign = "center";
+    CTX.textBaseline = "middle";
+    CTX.font = "bold " + cdSize + "px sans-serif";
+    CTX.fillStyle = hot ? "rgba(255,70,60,0.96)" : "rgba(240,246,255,0.92)";
+    if (hot) {
+      CTX.shadowColor = "rgba(255,60,50,0.85)";
+      CTX.shadowBlur = 22;
+    }
+    CTX.fillText(cdTxt, VW / 2, VH / 2);
+    CTX.shadowBlur = 0;
+    CTX.font = "bold 16px sans-serif";
+    CTX.fillStyle = hot ? "rgba(255,150,140,0.9)" : "rgba(180,200,230,0.8)";
+    CTX.fillText(hot ? "准备……" : "战斗即将开始", VW / 2, VH / 2 + cdSize * 0.85);
+    CTX.textAlign = "start";
+    CTX.textBaseline = "alphabetic";
+  }
+  /* 换弹完成：头顶冒出一排金色小弹壳，往上飘一点就散 */
+  for (var rpj = 0; rpj < W.reloadPops.length; rpj++) {
+    var rp = W.reloadPops[rpj];
+    if (!rp.u || rp.u.dead) continue;
+    var rk = 1 - rp.t / rp.max;
+    var rpx = w2sx(rp.u.x);
+    var rpy = w2sy(rp.u.y) - (rp.u.r + 14) * z - rk * CFG.reloadPop.rise * z;
+    var ra = Math.min(1, rp.t / 0.35);
+    if (ra <= 0.01) continue;
+    CTX.globalAlpha = ra;
+    CTX.fillStyle = "#ffd75a";
+    var cw2 = CFG.reloadPop.width * z, ch2 = CFG.reloadPop.h * z, cg2 = CFG.reloadPop.gap * z;
+    for (var cj = 0; cj < 5; cj++) {
+      CTX.fillRect(rpx + (cj - 2) * cg2 - cw2 / 2, rpy - ch2 / 2, cw2, ch2);
+    }
+    CTX.globalAlpha = 1;
+  }
+  /* 英雄头顶的大金字：带一道横向滚过的金光，十秒后消散 */
+  for (var hti2 = 0; hti2 < W.heroTexts.length; hti2++) {
+    var ht = W.heroTexts[hti2];
+    if (!ht.u || ht.u.dead) continue;
+    var hx2 = w2sx(ht.u.x), hy2 = w2sy(ht.u.y) - (ht.u.r + 26) * z;
+    var lifeK = ht.t / ht.max;
+    /* 前 15% 淡入，最后 25% 淡出 */
+    var ta = lifeK > 0.85 ? (1 - lifeK) / 0.15 : Math.min(1, lifeK / 0.25);
+    if (ta > 0.01) {
+      CTX.font = "bold 22px sans-serif";
+      CTX.textAlign = "center";
+      CTX.textBaseline = "middle";
+      var half = CTX.measureText ? 0 : 0;
+      var tw = 22 * ht.text.length * 0.55;
+      var g2 = CTX.createLinearGradient(hx2 - tw, 0, hx2 + tw, 0);
+      var ph = (W.t * 0.35) % 1;
+      var lo = Math.max(0, ph - 0.18), hi2 = Math.min(1, ph + 0.18);
+      g2.addColorStop(0, "rgba(186,132,18," + ta + ")");
+      g2.addColorStop(lo, "rgba(255,232,140," + ta + ")");
+      g2.addColorStop(ph, "rgba(255,255,240," + ta + ")");
+      g2.addColorStop(hi2, "rgba(255,232,140," + ta + ")");
+      g2.addColorStop(1, "rgba(186,132,18," + ta + ")");
+      CTX.fillStyle = g2;
+      CTX.fillText(ht.text, hx2, hy2);
+      CTX.textAlign = "start";
+      CTX.textBaseline = "alphabetic";
+    }
+  }
+  drawSayBubbles();
+  drawDirectorOverlay(z);
+  drawReinforceFx();
+  drawSupportOps(CAM.zoom);
+  drawEndFx();
+  /* 遮幅盖住的是"战场"，不该盖住屏幕上的剧情信息：
+     顺序必须是 战场 → 遮幅 → 倒计时 / 剧情提示 / 鼠标。
+     对话气泡属于场景物件，留在遮幅之下（角色走到画面外时气泡被黑边切掉，正是电影该有的样子） */
+  drawReplayOverlay(z);
+  if (!RENDER_NO_HUD) {
+    drawCmdOverlay();
+    drawPops();
+    drawKillFeed();
+    drawPlayerAimAndHud();
+    drawCinemaBars();
+    drawCursor();
+    drawReinforceTimer();
+    drawWaveTimer();
+    drawStoryLines();
+  }
+}
+
+/* pointer: the system cursor is hidden, so we paint a small white dot instead */
+function drawCursor() {
+  if (HIDE_UI) return;
+  if (!UI.pointer.in || !UI.pointer.mouse) return;
+  if (overlayEl && overlayEl.className === "show") return;
+  if (typeof document.elementFromPoint !== "function") return;
+  var cr = CANVAS.getBoundingClientRect ? CANVAS.getBoundingClientRect() : { left: 0, top: 0 };
+  var hit = document.elementFromPoint(cr.left + UI.pointer.x, cr.top + UI.pointer.y);
+  if (hit !== CANVAS) return;
+  var x = UI.pointer.x, y = UI.pointer.y;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  /* 装了瞄具就换准星样式：红点瞄具是十字，快速瞄具是四段括号，中心都换成红点 */
+  var sight = (playerUnitValid() && PLAYER.unit.gearStats) ? PLAYER.unit.gearStats.sight : "";
+  if (sight === "cross" || sight === "bracket") {
+    var cr = sight === "cross" ? 9 : 11;
+    CTX.strokeStyle = "rgba(255,255,255,0.92)";
+    CTX.lineWidth = 2;
+    CTX.lineCap = "round";
+    CTX.beginPath();
+    if (sight === "cross") {
+      CTX.moveTo(x - cr, y); CTX.lineTo(x - 3, y);
+      CTX.moveTo(x + 3, y); CTX.lineTo(x + cr, y);
+      CTX.moveTo(x, y - cr); CTX.lineTo(x, y - 3);
+      CTX.moveTo(x, y + 3); CTX.lineTo(x, y + cr);
+    } else {
+      CTX.moveTo(x - cr, y - cr); CTX.lineTo(x - cr + 4, y - cr); CTX.lineTo(x - cr, y - cr + 4);
+      CTX.moveTo(x + cr, y - cr); CTX.lineTo(x + cr - 4, y - cr); CTX.lineTo(x + cr, y - cr + 4);
+      CTX.moveTo(x - cr, y + cr); CTX.lineTo(x - cr + 4, y + cr); CTX.lineTo(x - cr, y + cr - 4);
+      CTX.moveTo(x + cr, y + cr); CTX.lineTo(x + cr - 4, y + cr); CTX.lineTo(x + cr, y + cr - 4);
+    }
+    CTX.stroke();
+    CTX.beginPath(); CTX.arc(x, y, 2.6, 0, TAU);
+    CTX.fillStyle = "rgba(255,70,70,0.98)";
+    CTX.fill();
+    return;
+  }
+  var gl = CTX.createRadialGradient(x, y, 0, x, y, 10);
+  gl.addColorStop(0, "rgba(255,255,255,0.28)");
+  gl.addColorStop(0.55, "rgba(200,225,255,0.09)");
+  gl.addColorStop(1, "rgba(200,225,255,0)");
+  CTX.fillStyle = gl;
+  CTX.beginPath(); CTX.arc(x, y, 10, 0, TAU); CTX.fill();
+  CTX.beginPath(); CTX.arc(x, y, 4.3, 0, TAU);
+  CTX.fillStyle = "rgba(8,10,16,0.55)";
+  CTX.fill();
+  CTX.beginPath(); CTX.arc(x, y, 3.2, 0, TAU);
+  CTX.fillStyle = "#ffffff";
+  CTX.fill();
+}
+/* 头顶对话气泡：剧本 say 指令的台词直接长在演员头上 */
+function drawSayBubbles() {
+  var i, u, any = false;
+  for (i = 0; i < W.units.length; i++) { if (!W.units[i].dead && W.units[i].sayT > 0) { any = true; break; } }
+  if (!any) return;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || u.sayT <= 0 || !u.sayText) continue;
+    var sx = w2sx(u.x), sy = w2sy(u.y) - u.r * CAM.zoom - 18;
+    CTX.globalAlpha = u.sayT < 0.45 ? u.sayT / 0.45 : 1;
+    CTX.font = "600 13px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    var tw = 40;
+    if (CTX.measureText) { var mt = CTX.measureText(u.sayText); if (mt && isFinite(mt.width)) tw = mt.width; }
+    var bw = tw + 16, bh = 22, bx = sx - bw / 2, by = sy - bh;
+    var rr = 6;
+    CTX.beginPath();
+    CTX.moveTo(bx + rr, by);
+    CTX.lineTo(bx + bw - rr, by); CTX.quadraticCurveTo(bx + bw, by, bx + bw, by + rr);
+    CTX.lineTo(bx + bw, by + bh - rr); CTX.quadraticCurveTo(bx + bw, by + bh, bx + bw - rr, by + bh);
+    CTX.lineTo(bx + rr, by + bh); CTX.quadraticCurveTo(bx, by + bh, bx, by + bh - rr);
+    CTX.lineTo(bx, by + rr); CTX.quadraticCurveTo(bx, by, bx + rr, by);
+    CTX.closePath();
+    CTX.fillStyle = "rgba(14,18,30,0.90)";
+    CTX.fill();
+    CTX.strokeStyle = "rgba(255,220,150,0.85)";
+    CTX.lineWidth = 1;
+    CTX.stroke();
+    /* 小尾巴指向说话的人 */
+    CTX.beginPath();
+    CTX.moveTo(sx - 5, by + bh); CTX.lineTo(sx, by + bh + 6); CTX.lineTo(sx + 5, by + bh);
+    CTX.closePath();
+    CTX.fillStyle = "rgba(14,18,30,0.90)";
+    CTX.fill();
+    CTX.fillStyle = "rgb(255,240,200)";
+    CTX.textAlign = "center";
+    CTX.textBaseline = "middle";
+    CTX.fillText(u.sayText, sx, by + bh / 2 + 1);
+    CTX.textAlign = "start";
+    CTX.textBaseline = "alphabetic";
+  }
+  CTX.globalAlpha = 1;
+}
+
+/* 剧情模式的可视化：选中圈、指令目标虚线、队列标记 */
+function drawDirectorOverlay(z) {
+  if (!DIRECTOR.on) return;
+  var i, u;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead) continue;
+    /* 坚守圈：指令一落下就被消化成姿态了，所以这里不能跟着 cue 一起跳过 */
+    if (u.gar) {
+      var gcx = w2sx(u.gar.x), gcy = w2sy(u.gar.y), grz = u.gar.r * z;
+      CTX.strokeStyle = "rgba(" + CFG.garrison.rgb + ",0.5)";
+      CTX.lineWidth = 1.6;
+      CTX.setLineDash([6, 8]);
+      CTX.beginPath(); CTX.arc(gcx, gcy, grz, 0, TAU); CTX.stroke();
+      CTX.setLineDash([]);
+      CTX.fillStyle = "rgba(" + CFG.garrison.rgb + ",0.85)";
+      CTX.beginPath(); CTX.arc(gcx, gcy, 3.5, 0, TAU); CTX.fill();
+    }
+    if (!u.cue) continue;
+    var ux = w2sx(u.x), uy = w2sy(u.y);
+    var c = u.cue;
+    if (c.act === "moveTo" && c.x !== null) {
+      CTX.strokeStyle = "rgba(255,212,120,0.55)";
+      CTX.lineWidth = 1.4;
+      CTX.setLineDash([7, 6]);
+      CTX.beginPath(); CTX.moveTo(ux, uy);
+      CTX.lineTo(w2sx(c.x), w2sy(c.y)); CTX.stroke();
+      CTX.setLineDash([]);
+      CTX.strokeStyle = "rgba(255,212,120,0.9)";
+      CTX.beginPath(); CTX.arc(w2sx(c.x), w2sy(c.y), 6, 0, TAU); CTX.stroke();
+    } else if (c.act === "follow" && c.unitId !== null) {
+      var f2 = cueUnitById(c.unitId);
+      if (f2 && !f2.dead) {
+        CTX.strokeStyle = "rgba(140,220,255,0.45)";
+        CTX.lineWidth = 1.2;
+        CTX.setLineDash([4, 7]);
+        CTX.beginPath(); CTX.moveTo(ux, uy);
+        CTX.lineTo(w2sx(f2.x), w2sy(f2.y)); CTX.stroke();
+        CTX.setLineDash([]);
+      }
+    }
+    /* 队列长度角标 */
+    if (u.cueQ.length > 1) {
+      CTX.fillStyle = "rgba(255,212,120,0.95)";
+      CTX.font = "700 12px system-ui,sans-serif";
+      CTX.textAlign = "center";
+      CTX.fillText(String(u.cueQ.length), ux, uy - u.r * z - 8);
+      CTX.textAlign = "start";
+    }
+  }
+  /* 选中单位：白色双圈 */
+  var sel = DIRECTOR.sel;
+  if (sel && !sel.dead) {
+    var sx2 = w2sx(sel.x), sy2 = w2sy(sel.y), rr = sel.r * z + 7;
+    CTX.strokeStyle = "rgba(255,255,255,0.95)";
+    CTX.lineWidth = 2;
+    CTX.beginPath(); CTX.arc(sx2, sy2, rr, 0, TAU); CTX.stroke();
+    CTX.strokeStyle = "rgba(255,180,60,0.7)";
+    CTX.lineWidth = 1;
+    CTX.beginPath(); CTX.arc(sx2, sy2, rr + 4, 0, TAU); CTX.stroke();
+  }
+}
+
+
+/* ===== 新支援降临演出：索降 / 运输机空降 / 轨道舱 ===== */
+function drawSupportOps(z) {
+  var ops = W.supportOps || [];
+  if (!ops.length) return;
+  CTX.save();
+  for (var oi = 0; oi < ops.length; oi++) {
+    var op = ops[oi], t = op.t, sx = w2sx(op.x), sy = w2sy(op.y);
+    CTX.globalAlpha = 1;
+    if (op.key === "squad") {
+      /* 阴影就是屏幕外直升机的投影，位置由状态机直接给出 */
+      if (op.state !== "HelicopterDeparting" || op.shadowX > -120) {
+        var shA = op.state === "HelicopterDeparting" ? Math.max(0, 1 - op.stateT / 1.0) : 0.34;
+        CTX.fillStyle = "rgba(0,0,0," + shA.toFixed(3) + ")";
+        CTX.beginPath(); CTX.ellipse(w2sx(op.shadowWorldX), w2sy(op.shadowWorldY), 88 * z, 19 * z, 0, 0, TAU); CTX.fill();
+      }
+      /* 四根带螺旋花纹的棕色麻绳：从屏幕顶端垂到真实士兵身上 */
+      if (!(op.state === "HelicopterDeparting" && !op.unsafe)) {
+        var defS = supportDefOf("squad");
+        var retractK = op.state === "RopeRetracting" ? Math.min(1, op.stateT / defS.retractDur) : 0;
+        for (var ri2 = 0; ri2 < op.units.length; ri2++) {
+          var ru = op.units[ri2];
+          if (!ru || ru.dead) continue;
+          var ux2 = w2sx(ru.x), uy2 = w2sy(ru.y);
+          var topWX = (op.topWorldX && op.topWorldX[ri2] !== undefined) ? op.topWorldX[ri2] : (op.x + (ri2 - 1.5) * 38);
+          var anchorX2 = w2sx(topWX);
+          var topY2 = (op.topWorldY !== undefined) ? w2sy(op.topWorldY) : 0;
+          var endY2 = (sy + 2) - retractK * (sy + 240);
+          if (endY2 < -24) endY2 = -24;
+          var sway2 = (op.ropeSway[ri2] || 0);
+          CTX.strokeStyle = "rgba(92,60,36,.98)";
+          CTX.lineWidth = Math.max(1.0, 1.25 * z);
+          CTX.lineCap = "round";
+          /* 上段：锚点 → 士兵，弯曲集中在士兵附近，表现人的重量 */
+          CTX.beginPath();
+          CTX.moveTo(anchorX2, topY2);
+          CTX.bezierCurveTo(
+            anchorX2 + (ux2 - anchorX2) * 0.26 + sway2 * 0.12,
+            topY2 + (uy2 - topY2) * 0.38,
+            anchorX2 + (ux2 - anchorX2) * 0.72 + sway2 * 0.86,
+            topY2 + (uy2 - topY2) * 0.91,
+            ux2, uy2
+          );
+          CTX.stroke();
+          /* 下段：士兵脚下垂到地面，尾段摆动更小 */
+          if (endY2 > uy2 + 1) {
+            CTX.beginPath();
+            CTX.moveTo(ux2, uy2);
+            CTX.quadraticCurveTo(ux2 + sway2 * 0.22, (uy2 + endY2) * 0.52, ux2, endY2);
+            CTX.stroke();
+          }
+        }
+      }
+      /* 手榴弹：从四名士兵身上抛向阴影区域 */
+      if (op.grenades && op.grenades.length) {
+        for (var gi = 0; gi < op.grenades.length; gi++) {
+          var gg = op.grenades[gi];
+          var gx = w2sx(gg.x), gy = w2sy(gg.y) - gg.z * z;
+          CTX.strokeStyle = "rgba(255,220,120,.55)"; CTX.lineWidth = 1.2;
+          CTX.beginPath(); CTX.moveTo(gx - 10, gy - 12); CTX.lineTo(gx, gy - 4); CTX.stroke();
+          if (!gg.exploded) {
+            CTX.save();
+            CTX.translate(gx, gy);
+            CTX.rotate(gg.spin || 0);
+            CTX.fillStyle = "rgba(90,150,60,.95)";
+            CTX.beginPath(); CTX.ellipse(0, 0, 8 * z, 5 * z, 0, 0, TAU); CTX.fill();
+            CTX.fillStyle = "rgba(160,210,110,.75)";
+            CTX.beginPath(); CTX.ellipse(-2 * z, -1.5 * z, 3.2 * z, 1.7 * z, -0.4, 0, TAU); CTX.fill();
+            CTX.fillStyle = "#3d4245";
+            CTX.fillRect(3 * z, -3.2 * z, 5 * z, 3.2 * z);
+            CTX.fillStyle = "#6a7075";
+            CTX.fillRect(3 * z, -3.2 * z, 5 * z, 1.1 * z);
+            CTX.strokeStyle = "#c9b06a"; CTX.lineWidth = 1;
+            CTX.beginPath(); CTX.arc(8.5 * z, -5 * z, 2.2 * z, 0, TAU); CTX.stroke();
+            CTX.restore();
+            CTX.fillStyle = "#ffd866";
+            CTX.beginPath(); CTX.arc(gx + 6 * z, gy - 8 * z, 1.5, 0, TAU); CTX.fill();
+          } else {
+            CTX.fillStyle = "rgba(255,150,60,.8)";
+            CTX.beginPath(); CTX.arc(gx, gy, 5 * z, 0, TAU); CTX.fill();
+          }
+        }
+      }
+    } else if (op.key === "special") {
+      var defSp = supportDefOf("special");
+      /* T0：战斗机模糊剪影从右上到左下，极短时间掠过 */
+      if (op.t < (defSp.fighterDur || 0.22) + 0.08) {
+        var fk = Math.min(1, op.t / (defSp.fighterDur || 0.22));
+        var fx = VW + 180 + (-VW - 360) * fk;
+        var fy = -100 + (VH + 200) * fk;
+        CTX.save();
+        CTX.globalAlpha = 0.55;
+        for (var mb = 0; mb < 3; mb++) {
+          CTX.fillStyle = mb === 0 ? "rgba(20,26,34,.92)" : "rgba(80,90,100,.18)";
+          CTX.beginPath();
+          CTX.moveTo(fx - mb * 26, fy - mb * 10);
+          CTX.lineTo(fx - 46 - mb * 26, fy + 18 - mb * 10);
+          CTX.lineTo(fx + 18 - mb * 26, fy + 6 - mb * 10);
+          CTX.closePath(); CTX.fill();
+        }
+        CTX.restore();
+      }
+      /* 航弹半插入地面：不画下落过程，只画已插进土里的弹体 */
+      if (op.bomb && op.bomb.visible && !op.bomb.exploded) {
+        var bx = w2sx(op.bomb.x), by = w2sy(op.bomb.y);
+        CTX.fillStyle = "rgba(0,0,0,.35)";
+        CTX.beginPath(); CTX.ellipse(bx, by + 4, 30 * z, 9 * z, 0, 0, TAU); CTX.fill();
+        CTX.save();
+        CTX.translate(bx, by);
+        CTX.rotate(-0.68);   /* 顺着右上→左下飞行方向斜插，弹头指向左下 */
+        CTX.fillStyle = "#3d444a";
+        CTX.fillRect(-10 * z, -24 * z, 20 * z, 34 * z);
+        CTX.fillStyle = "#e0b33c";
+        CTX.fillRect(-10 * z, -14 * z, 20 * z, 4 * z);
+        CTX.fillStyle = "#4c5359";
+        CTX.beginPath();
+        CTX.moveTo(-10 * z, -24 * z); CTX.lineTo(-22 * z, -34 * z);
+        CTX.lineTo(-16 * z, -18 * z); CTX.closePath(); CTX.fill();
+        CTX.beginPath();
+        CTX.moveTo(10 * z, -24 * z); CTX.lineTo(22 * z, -34 * z);
+        CTX.lineTo(16 * z, -18 * z); CTX.closePath(); CTX.fill();
+        CTX.fillStyle = "#262b2f";
+        CTX.beginPath(); CTX.arc(0, 14 * z, 10 * z, 0, Math.PI); CTX.fill();
+        CTX.restore();
+        CTX.fillStyle = "rgba(180,160,130,.35)";
+        CTX.beginPath(); CTX.ellipse(bx, by + 2, 34 * z, 9 * z, 0, 0, TAU); CTX.fill();
+      }
+      /* 爆炸：火球、冲击环、碎片 */
+      if (op.bomb && op.bomb.exploded && op.explosionT < 0.75) {
+        var ek = 1 - op.explosionT / 0.75;
+        var er = (40 + op.explosionT * 620) * z;
+        CTX.globalAlpha = 0.55 * ek;
+        CTX.fillStyle = "#ff8a32";
+        CTX.beginPath(); CTX.arc(w2sx(op.x), w2sy(op.y), er * 0.45, 0, TAU); CTX.fill();
+        CTX.strokeStyle = "rgba(255,220,150," + (0.8 * ek).toFixed(3) + ")";
+        CTX.lineWidth = 8 * ek;
+        CTX.beginPath(); CTX.arc(w2sx(op.x), w2sy(op.y), er, 0, TAU); CTX.stroke();
+        for (var di = 0; di < 14; di++) {
+          var da = TAU * di / 14 + op.fighterSeed;
+          var dd = er * (0.7 + 0.3 * Math.sin(di));
+          CTX.fillStyle = "rgba(70,72,76," + (0.7 * ek).toFixed(3) + ")";
+          CTX.fillRect(w2sx(op.x) + Math.cos(da) * dd, w2sy(op.y) + Math.sin(da) * dd * 0.55, 4 * z, 4 * z);
+        }
+        CTX.globalAlpha = 1;
+      }
+      /* 运输机阴影：约地图 2/3 大，固定从地图左侧向右侧穿过 */
+      if (op.transportOn && (op.t - defSp.bombDelay) < (defSp.transportDur || 0.55)) {
+        var tp = Math.min(1, (op.t - defSp.bombDelay) / (defSp.transportDur || 0.55));
+        var mapW = CFG.world.w, sxt = -mapW * 0.45 + tp * mapW * 1.9;
+        var tAlpha = 0.24 * Math.max(0, 1 - Math.max(0, (tp - 0.82) / 0.18));
+        if (tp >= 1.0) tAlpha = 0;
+        var tcx = w2sx(sxt), tcy = w2sy(CFG.world.h / 2);
+        var bodyW = mapW * 0.40 * z, bodyH = mapW * 0.16 * z;
+        CTX.fillStyle = "rgba(0,0,0," + (tAlpha * 0.7).toFixed(3) + ")";
+        CTX.beginPath(); CTX.ellipse(tcx, tcy, bodyW * 1.28, bodyH * 1.35, 0, 0, TAU); CTX.fill();
+        CTX.fillStyle = "rgba(0,0,0," + tAlpha.toFixed(3) + ")";
+        CTX.beginPath(); CTX.ellipse(tcx, tcy, bodyW, bodyH, 0, 0, TAU); CTX.fill();
+        CTX.fillStyle = "rgba(0,0,0," + (tAlpha * 0.7).toFixed(3) + ")";
+        CTX.beginPath(); CTX.ellipse(tcx - bodyW * 0.57, tcy, bodyW * 0.55, bodyH * 0.42, 0, 0, TAU); CTX.fill();
+        CTX.beginPath(); CTX.ellipse(tcx + bodyW * 0.57, tcy, bodyW * 0.55, bodyH * 0.42, 0, 0, TAU); CTX.fill();
+        CTX.fillStyle = "rgba(0,0,0," + (tAlpha * 0.45).toFixed(3) + ")";
+        CTX.beginPath(); CTX.ellipse(tcx - bodyW * 0.78, tcy + bodyH * 0.1, bodyW * 0.32, bodyH * 0.24, 0.12, 0, TAU); CTX.fill();
+        CTX.beginPath(); CTX.ellipse(tcx + bodyW * 0.78, tcy + bodyH * 0.1, bodyW * 0.32, bodyH * 0.24, -0.12, 0, TAU); CTX.fill();
+      }
+      /* 伞兵与降落伞 */
+      if (op.paraSlots) {
+        for (var pi = 0; pi < op.paraSlots.length; pi++) {
+          var pu = op.paraSlots[pi].u;
+          if (!pu || pu.dead || !pu.para) continue;
+          if (!pu.para.landed) {
+            var px = w2sx(pu.x), py = w2sy(pu.y);
+            var cr = Math.max(24, pu.r * z * 5);
+            CTX.strokeStyle = "rgba(46,107,67,.95)"; CTX.lineWidth = 1.4;
+            CTX.beginPath(); CTX.moveTo(px - cr * 0.55, py - cr * 0.6); CTX.lineTo(px, py); CTX.stroke();
+            CTX.beginPath(); CTX.moveTo(px + cr * 0.55, py - cr * 0.6); CTX.lineTo(px, py); CTX.stroke();
+            CTX.fillStyle = "rgba(178,226,176,.86)";
+            CTX.beginPath(); CTX.arc(px, py - cr * 0.6, cr, Math.PI, TAU); CTX.closePath(); CTX.fill();
+            CTX.strokeStyle = "rgba(46,107,67,.9)";
+            CTX.beginPath(); CTX.arc(px, py - cr * 0.6, cr, Math.PI, TAU); CTX.stroke();
+          }
+        }
+      }
+      /* 战斗机放在最上层重绘一遍：航弹、爆炸、运输机阴影都不得遮住剪影 */
+      if (op.t < (defSp.fighterDur || 0.3) + 0.10) {
+        var fk2 = Math.min(1, op.t / (defSp.fighterDur || 0.3));
+        var fx2 = VW + 180 + (-VW - 360) * fk2;
+        var fy2 = -100 + (VH + 200) * fk2;
+        CTX.save();
+        CTX.globalAlpha = 0.82;
+        for (var mb2 = 0; mb2 < 4; mb2++) {
+          CTX.fillStyle = mb2 === 0 ? "rgba(26,32,40,.95)" : "rgba(170,190,205," + (0.10 - mb2 * 0.02) + ")";
+          CTX.beginPath();
+          CTX.moveTo(fx2 - mb2 * 34, fy2 - mb2 * 12);
+          CTX.lineTo(fx2 - 58 - mb2 * 34, fy2 + 22 - mb2 * 12);
+          CTX.lineTo(fx2 + 24 - mb2 * 34, fy2 + 8 - mb2 * 12);
+          CTX.closePath(); CTX.fill();
+        }
+        CTX.strokeStyle = "rgba(210,230,245,.55)";
+        CTX.lineWidth = 1.2;
+        CTX.beginPath(); CTX.moveTo(fx2 - 50, fy2 + 18); CTX.lineTo(fx2 + 18, fy2 + 4); CTX.stroke();
+        CTX.restore();
+      }
+      /* 落地后降落伞上下压成一条线 */
+      if (op.paraPops) {
+        for (var ppi = 0; ppi < op.paraPops.length; ppi++) {
+          var pp = op.paraPops[ppi];
+          var pk = Math.min(1, pp.t / (defSp.paraLandPop || 0.3));
+          var ppx = w2sx(pp.x), ppy = w2sy(pp.y);
+          CTX.strokeStyle = "rgba(46,107,67," + (0.8 * (1 - pk)).toFixed(3) + ")";
+          CTX.lineWidth = 2;
+          CTX.beginPath(); CTX.moveTo(ppx - 30 * (1 - pk), ppy - 8); CTX.lineTo(ppx + 30 * (1 - pk), ppy - 8); CTX.stroke();
+        }
+      }
+    } else if (op.key === "legion") {
+      var defL = supportDefOf("legion");
+      /* 绿色电焊信标：从触发一直持续到空降舱砸落 */
+      if (t < defL.beaconDur) {
+        var flash = 0.52 + 0.48 * Math.abs(Math.sin(W.t * 34 + op.fighterSeed));
+        var beamH = CFG.world.w * 1.08 * z;
+        /* 冲天绿色光柱：很细、超过场地宽度、高频闪烁 */
+        var bg2 = CTX.createLinearGradient(sx, sy, sx, sy - beamH);
+        bg2.addColorStop(0, "rgba(120,255,160," + (0.55 * flash).toFixed(3) + ")");
+        bg2.addColorStop(0.45, "rgba(100,255,150," + (0.22 * flash).toFixed(3) + ")");
+        bg2.addColorStop(1, "rgba(80,255,140,0)");
+        CTX.fillStyle = bg2;
+        CTX.fillRect(sx - 2.2 * z, sy - beamH, 4.4 * z, beamH);
+        CTX.fillStyle = "rgba(190,255,210," + (0.65 * flash).toFixed(3) + ")";
+        CTX.fillRect(sx - 0.7 * z, sy - beamH, 1.4 * z, beamH);
+        /* 点状信标本体：光晕 + 白绿核心，照激光枪口十字光效的点形版本 */
+        var pglow = CTX.createRadialGradient(sx, sy, 0, sx, sy, 34 * z);
+        pglow.addColorStop(0, "rgba(190,255,205," + (0.92 * flash).toFixed(3) + ")");
+        pglow.addColorStop(0.25, "rgba(100,255,150," + (0.55 * flash).toFixed(3) + ")");
+        pglow.addColorStop(1, "rgba(50,220,120,0)");
+        CTX.fillStyle = pglow;
+        CTX.beginPath(); CTX.arc(sx, sy, 34 * z, 0, TAU); CTX.fill();
+        CTX.fillStyle = "rgba(225,255,235," + (0.95 * flash).toFixed(3) + ")";
+        CTX.beginPath(); CTX.arc(sx, sy, 3.4 * z, 0, TAU); CTX.fill();
+        CTX.strokeStyle = "rgba(130,255,170," + (0.8 * flash).toFixed(3) + ")";
+        CTX.lineWidth = 1.3;
+        CTX.beginPath(); CTX.arc(sx, sy, 53 * z, 0, TAU); CTX.stroke();
+        CTX.fillStyle = "rgba(120,255,160,.25)";
+        CTX.beginPath(); CTX.ellipse(sx, sy, 38 * z, 11 * z, 0, 0, TAU); CTX.fill();
+      }
+      /* 空降舱下落：只在最后 0.55 秒从高空出现，砸落后停在落点 */
+      var podDropK = Math.min(1, Math.max(0, (t - (defL.beaconDur - 0.55)) / 0.55));
+      var podScreenY = op.shockDone ? sy : sy - 760 * (1 - podDropK);
+      if (t >= defL.beaconDur - 0.55 && !op.exploded) {
+        var bw = 58 * z, bh = 82 * z;
+        CTX.save();
+        CTX.translate(sx, podScreenY);
+        CTX.fillStyle = "#2f353b";
+        CTX.beginPath();
+        CTX.moveTo(-bw * 0.5, -bh * 0.5); CTX.lineTo(bw * 0.42, -bh * 0.55);
+        CTX.lineTo(bw * 0.58, -bh * 0.1); CTX.lineTo(bw * 0.42, bh * 0.5);
+        CTX.lineTo(-bw * 0.5, bh * 0.46); CTX.lineTo(-bw * 0.62, 0); CTX.closePath();
+        CTX.fill();
+        CTX.fillStyle = "#454d55";
+        CTX.fillRect(-bw * 0.42, -bh * 0.4, bw * 0.78, bh * 0.2);
+        CTX.fillStyle = "#6f7a84";
+        CTX.fillRect(-bw * 0.5, -bh * 0.46, bw * 0.88, 4 * z);
+        CTX.fillStyle = "#8fcbe8";
+        CTX.fillRect(-bw * 0.18, -bh * 0.16, bw * 0.36, bh * 0.24);
+        CTX.fillStyle = "rgba(255,255,255,.6)";
+        CTX.beginPath(); CTX.moveTo(-bw * 0.15, -bh * 0.13); CTX.lineTo(bw * 0.02, bh * 0.06); CTX.lineTo(bw * 0.12, bh * 0.06); CTX.lineTo(-bw * 0.05, -bh * 0.13); CTX.closePath(); CTX.fill();
+        CTX.strokeStyle = "#1b2025"; CTX.lineWidth = 2;
+        CTX.strokeRect(-bw * 0.18, -bh * 0.16, bw * 0.36, bh * 0.24);
+        CTX.fillStyle = "#22282d";
+        CTX.fillRect(-bw * 0.55, bh * 0.3, bw * 1.1, 11 * z);
+        CTX.restore();
+      }
+      /* 蓝色大型能量护盾 */
+      if (op.dome && op.dome.on) {
+        var dk2 = Math.min(1, (op.dome.deployT || 0) / (defL.shieldExpand || 0.45));
+        var dr = op.dome.R * z * dk2, dhp = Math.max(0, op.dome.hp / op.dome.max);
+        CTX.fillStyle = "rgba(90,190,255,.07)";
+        CTX.beginPath(); CTX.arc(sx, sy, dr, 0, TAU); CTX.fill();
+        CTX.strokeStyle = "rgba(110,210,255,.55)"; CTX.lineWidth = 2.5;
+        CTX.beginPath(); CTX.arc(sx, sy, dr, 0, TAU); CTX.stroke();
+        CTX.strokeStyle = "rgba(180,235,255,.28)"; CTX.lineWidth = 1;
+        CTX.beginPath(); CTX.arc(sx, sy, dr * 0.94, 0, TAU); CTX.stroke();
+        CTX.strokeStyle = dhp > 0.35 ? "rgba(130,225,255,.9)" : "rgba(255,140,90,.95)";
+        CTX.lineWidth = 5;
+        CTX.beginPath(); CTX.arc(sx, sy, dr + 5, -Math.PI / 2, -Math.PI / 2 + TAU * dhp); CTX.stroke();
+        if (dk2 < 1) { CTX.strokeStyle = "rgba(160,235,255,.55)"; CTX.lineWidth = 2; CTX.beginPath(); CTX.arc(sx, sy, dr + 16, 0, TAU); CTX.stroke(); }
+      }
+      /* 砸落烟雾、扬尘与冲击环 */
+      var impactAge = op.shockDone ? (t - defL.beaconDur) : -1;
+      if (impactAge >= 0 && impactAge < 1.1) {
+        var ik = 1 - impactAge / 1.1;
+        CTX.strokeStyle = "rgba(255,210,150," + (0.7 * ik).toFixed(3) + ")";
+        CTX.lineWidth = 9 * ik;
+        CTX.beginPath(); CTX.arc(sx, sy, 40 + impactAge * 380, 0, TAU); CTX.stroke();
+        CTX.fillStyle = "rgba(150,142,128," + (0.28 * ik).toFixed(3) + ")";
+        CTX.beginPath(); CTX.arc(sx, sy, 110 + impactAge * 240, 0, TAU); CTX.fill();
+      }
+      /* 最终爆炸 */
+      if (op.exploded) {
+        var ea2 = op.explosionT || 0;
+        if (ea2 < 1.0) {
+          var ek2 = 1 - ea2;
+          CTX.fillStyle = "rgba(255,110,35," + (0.55 * ek2).toFixed(3) + ")";
+          CTX.beginPath(); CTX.arc(sx, sy, 40 + ea2 * 420, 0, TAU); CTX.fill();
+          CTX.fillStyle = "rgba(255,220,150," + (0.5 * ek2).toFixed(3) + ")";
+          CTX.beginPath(); CTX.arc(sx, sy, 16 + ea2 * 150, 0, TAU); CTX.fill();
+          for (var di2 = 0; di2 < 14; di2++) {
+            var da2 = TAU * di2 / 14 + op.fighterSeed;
+            var dd2 = 50 + 260 * ea2;
+            CTX.fillStyle = "rgba(70,72,76," + (0.65 * ek2).toFixed(3) + ")";
+            CTX.fillRect(sx + Math.cos(da2) * dd2, sy + Math.sin(da2) * dd2 * 0.55, 6, 6);
+          }
+        }
+      }
+    }
+  }
+  CTX.restore();
+}
+
+/* 支援部队的现场特效：金光冲击波、冲天光柱、向上喷发的粒子（全部做 z 轴伪 3D） */
+function drawReinforceFx() {
+  var r = W.reinf;
+  if (!r || r.phase < 4) return;
+  var z = CAM.zoom;
+  var cx = w2sx(r.cx), cy = w2sy(r.cy);
+  var i, p, px, py, a;
+
+  /* ---- 金光冲击波：一圈缓慢推开的金色环带，没有伤害也没有击退 ---- */
+  if (r.waveT >= 0 && r.waveR > 0) {
+    var wa = 1 - r.waveT / r.waveDur;
+    if (wa < 0) wa = 0;
+    var wr = r.waveR * z;
+    if (wr > 0 && wr < 7000) {
+      CTX.globalAlpha = 1;
+      CTX.strokeStyle = "rgba(255,204,92," + (0.62 * wa) + ")";
+      CTX.lineWidth = (52 + 150 * wa) * z;
+      CTX.beginPath(); CTX.arc(cx, cy, wr, 0, TAU); CTX.stroke();
+      CTX.strokeStyle = "rgba(255,242,196," + (0.46 * wa) + ")";
+      CTX.lineWidth = (18 + 46 * wa) * z;
+      CTX.beginPath(); CTX.arc(cx, cy, wr, 0, TAU); CTX.stroke();
+    }
+  }
+
+  /* ---- 通天光柱：外层淡金 + 内层浓金，上下等宽的笔直光柱 ---- */
+  if (r.pillT > 0) {
+    var fade = r.pillT / r.pillMax;
+    if (fade > 1) fade = 1;
+    var soft = fade < 0.35 ? fade / 0.35 : 1;
+    var baseY = cy;
+    /* 通天彻地：从落点一直顶到画布最上沿 */
+    var h = baseY;
+    /* 直径 = 三分之一场地宽度 */
+    var halfW = (CFG.world.w / 3) * 0.5 * z;
+
+    if (h > 2) {
+    /* 地面上的光斑 */
+    var spotR = halfW * 1.06;
+    var spot = CTX.createRadialGradient(cx, baseY, 0, cx, baseY, spotR);
+    spot.addColorStop(0, "rgba(255,244,196," + (0.80 * soft) + ")");
+    spot.addColorStop(0.45, "rgba(255,212,104," + (0.34 * soft) + ")");
+    spot.addColorStop(1, "rgba(255,196,80,0)");
+    CTX.globalAlpha = 1;
+    CTX.fillStyle = spot;
+    CTX.beginPath();
+    CTX.ellipse ? CTX.ellipse(cx, baseY, spotR, spotR * 0.42, 0, 0, TAU) : CTX.arc(cx, baseY, spotR, 0, TAU);
+    CTX.fill();
+
+    /* 外层金光：上下等宽的笔直光柱 */
+    var lg = CTX.createLinearGradient(cx, baseY, cx, baseY - h);
+    lg.addColorStop(0, "rgba(255,214,110," + (0.15 * soft) + ")");
+    lg.addColorStop(0.5, "rgba(255,204,88," + (0.09 * soft) + ")");
+    lg.addColorStop(1, "rgba(255,198,76,0)");
+    CTX.fillStyle = lg;
+    CTX.fillRect(cx - halfW, baseY - h, halfW * 2, h);
+
+    /* 内层金光：同样上下笔直，只是更窄更浓 */
+    var n1 = halfW * 0.4333;
+    var lg2 = CTX.createLinearGradient(cx, baseY, cx, baseY - h);
+    lg2.addColorStop(0, "rgba(255,252,228," + (0.52 * soft) + ")");
+    lg2.addColorStop(0.62, "rgba(255,238,168," + (0.30 * soft) + ")");
+    lg2.addColorStop(1, "rgba(255,230,150,0)");
+    CTX.fillStyle = lg2;
+    CTX.fillRect(cx - n1, baseY - h, n1 * 2, h);
+    }
+  }
+
+  /* ---- 粒子：从落点向四面八方迸发，同时沿 z 轴向上喷 ---- */
+  for (i = 0; i < r.parts.length; i++) {
+    p = r.parts[i];
+    px = w2sx(p.x);
+    py = w2sy(p.y) - p.z * z * 0.80;
+    a = p.life / p.max;
+    if (a <= 0) continue;
+    CTX.globalAlpha = a * p.br;
+    CTX.fillStyle = a > 0.65 ? "#fff6d2" : "#ffcf6a";
+    var s2 = p.w * z;
+    CTX.fillRect(px - s2 * 0.5, py - s2 * 0.5, s2, s2);
+  }
+  CTX.globalAlpha = 1;
+}
+
+/* 右上角的增援倒计时：白 → 蓝 → 金（金色带炫光） */
+/* 波次进度与倒计时：贴在左上角，和右上角的增援倒计时分居两侧互不遮挡。
+   本波被清光时 stepWaves 会把 t 归零，数字会瞬间跳到下一波，和实际行为一致 */
+function drawWaveTimer() {
+  var w = W.waves;
+  if (!w || w.left <= 0) return;
+  /* 纯净模式照常显示：波次倒计时是战况的一部分，不是操作界面 */
+  if (overlayEl && overlayEl.className === "show") return;
+  if (W.over) return;
+  var total = (START.waveCount | 0) || 1;
+  var done = w.idx < 0 ? 0 : w.idx;
+  var next = Math.min(done + 1, total);
+  var txt = "第 " + next + " / " + total + " 波";
+  var sub = "下一波 " + (w.t > 0 ? w.t : 0).toFixed(1) + "s";
+
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  CTX.textAlign = "left";
+  CTX.textBaseline = "top";
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  var ms = touch ? hudUiScale() : 1;
+  var lx = touch ? 14 : 30;
+  var ly = (TOPBAR_H || 0) + (touch ? 8 : 20);
+  var tSize = Math.round(Math.max(15, Math.min(21, VW * 0.022)) * ms);
+  var sSize = Math.round(Math.max(26, Math.min(38, VW * 0.038)) * ms);
+  CTX.font = tSize + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillStyle = "rgba(255,150,150,0.92)";
+  CTX.fillText(txt, lx, ly);
+  CTX.font = "700 " + sSize + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillStyle = "rgb(255,198,198)";
+  CTX.fillText(sub, lx, ly + Math.round(tSize * 1.25));
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+function hudUiScale() {
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  if (!touch) return 1;
+  return Math.max(0.72, Math.min(1, VW / 520));
+}
+function drawReinforceTimer() {
+  var r = W.reinf;
+  if (!r || r.phase < 1 || r.phase > 3) return;
+  var txt, col, glow;
+  if (r.phase === 1) { txt = "支援小队抵达倒计时"; col = "255,255,255"; glow = false; }
+  else if (r.phase === 2) { txt = "特化部队增援抵达倒计时"; col = "112,186,255"; glow = false; }
+  else { txt = (START.emperor ? "帝皇特使降临倒计时" : "军团主力赶到倒计时"); col = "255,210,74"; glow = true; }
+  var sec = r.t > 0 ? r.t : 0;
+  var str = sec.toFixed(3);
+
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  CTX.textAlign = "right";
+  CTX.textBaseline = "top";
+  /* 避开顶部工具栏，别让标题被盖住。往下多让出一点空间，
+     免得它和左上角的波次倒计时挤在同一行上 */
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  var ms = touch ? hudUiScale() : 1;
+  var rx = VW - (touch ? 14 : 30);
+  var ry = (TOPBAR_H || 0) + (touch ? 10 : 56);
+
+  /* 字号跟着屏幕宽度走：小屏也不至于溢出，宽屏则尽量大 */
+  var titleSize = Math.round(Math.max(20, Math.min(31, VW * 0.032)) * ms);
+  var secSize = Math.round(Math.max(40, Math.min(62, VW * 0.062)) * ms);
+
+  if (glow) {
+    CTX.shadowColor = "rgba(255,206,60,0.95)";
+    CTX.shadowBlur = 24;
+  }
+  CTX.font = titleSize + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillStyle = "rgba(" + col + ",0.94)";
+  CTX.fillText(txt, rx, ry);
+
+  var secY = ry + Math.round(titleSize * 1.18);
+  CTX.font = "700 " + secSize + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillStyle = "rgb(" + col + ")";
+  CTX.fillText(str, rx, secY);
+  if (glow) {
+    CTX.shadowBlur = 52;
+    CTX.fillStyle = "rgba(255,246,206,0.52)";
+    CTX.fillText(str, rx, secY);
+  }
+  CTX.shadowBlur = 0;
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+
+/* 地形编辑预览：虚线矩形 + 尺寸标注，与已有墙体冲突时转红 */
+function genBudget() {
+  var d = EDIT.genDifficulty || "normal";
+  if (d === "easy") return { rooms: 4, walls: 8, interval: 5, limit: 40, depth: 2 };
+  if (d === "hard") return { rooms: 6, walls: 16, interval: 3, limit: 80, depth: 4 };
+  return { rooms: 5, walls: 12, interval: 4, limit: 0, depth: 3 };
+}
+function buildTerrainOnce(seed) {
+  seed = seed || ((Date.now() & 0x7fffffff) >>> 0);
+  var oldRng = RNG.s;
+  RNG.seed(seed);
+  W.obstacles = []; W.doors = []; W.zones = []; W.spawners = []; W.holds = [];
+  var gc = genBudget();
+  var placed = 0, tries = 0, rooms = [];
+  while (placed < gc.rooms && tries < 80) {
+    tries++;
+    var rw = RNG.range(220, 400), rh = RNG.range(180, 340);
+    var rx = RNG.range(110, CFG.world.w - 110 - rw);
+    var ry = RNG.range(110, CFG.world.h - 110 - rh);
+    var bad = false;
+    for (var ri = 0; ri < rooms.length; ri++) {
+      var rr = rooms[ri];
+      if (rx < rr.x + rr.w + 50 && rx + rw + 50 > rr.x && ry < rr.y + rr.h + 50 && ry + rh + 50 > rr.y) { bad = true; break; }
+    }
+    if (bad) continue;
+    if (addBuilding(rx, ry, rw, rh, 2, true)) { rooms.push({ x: rx, y: ry, w: rw, h: rh }); placed++; }
+  }
+  /* 矮墙掩体：只放在空地上，避免和房屋重叠 */
+  for (var ci = 0, cn = 0; ci < 40 && cn < gc.walls; ci++) {
+    var cw = RNG.range(64, 180), ch = 26;
+    var cx = RNG.range(80, CFG.world.w - 80 - cw), cy = RNG.range(80, CFG.world.h - 80 - ch);
+    if (rectBlocked(cx, cy, cw, ch, 30)) continue;
+    W.obstacles.push(makeObstacle(cx, cy, cw, ch, "low")); cn++;
+  }
+  W.spawners.push({ x: 48, y: CFG.world.h / 2 - 60, w: 80, h: 120, kind: "zombie",
+    interval: gc.interval, limit: gc.limit, count: 0, t: 0 });
+  var hx = CFG.world.w / 2 - 90, hy = CFG.world.h / 2 - 90;
+  W.holds.push({ x: hx, y: hy, w: 180, h: 180, r: 90, owner: null, prog: 0 });
+  NAV.build(CFG.world, W.obstacles, 9);
+  analyzeTerrain(true);
+  var sealed = 0, es0 = TERRAIN.enclaves || [];
+  for (var ei = 0; ei < es0.length; ei++) if (!es0[ei].openN) sealed++;
+  var totalCells = NAV.cols * NAV.rows;
+  var mainPct = totalCells > 0 ? (TERRAIN.mainSize || 0) / totalCells : 0;
+  var score = mapScore();
+  RNG.s = oldRng;
+  return { seed: seed, rooms: placed, obstacles: W.obstacles.length,
+    mainPct: mainPct, sealed: sealed, score: score.total };
+}
+function cutEnclaveOpening(e) {
+  var tile = NAV.tile;
+  var cx = (e.cx + 0.5) * tile, cy = (e.cy + 0.5) * tile;
+  var dirs = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  for (var di = 0; di < dirs.length; di++) {
+    var dx = dirs[di][0], dy = dirs[di][1];
+    var hit = null;
+    for (var step = 4; step < Math.max(CFG.world.w, CFG.world.h); step += 8) {
+      var px = cx + dx * step, py = cy + dy * step;
+      if (px < 0 || py < 0 || px > CFG.world.w || py > CFG.world.h) break;
+      for (var oi = 0; oi < W.obstacles.length; oi++) {
+        var o = W.obstacles[oi];
+        if (o.prison) continue;
+        if (px >= o.x && px <= o.x + o.w && py >= o.y && py <= o.y + o.h) { hit = { x: px, y: py }; break; }
+      }
+      if (hit) break;
+    }
+    if (!hit) continue;
+    var hole = 88, rx = hit.x - hole / 2, ry = hit.y - hole / 2;
+    var keep = [], cut = 0;
+    for (var i = 0; i < W.obstacles.length; i++) {
+      var ob = W.obstacles[i];
+      if (ob.prison) { keep.push(ob); continue; }
+      var overlap = !(ob.x + ob.w < rx || ob.x > rx + hole || ob.y + ob.h < ry || ob.y > ry + hole);
+      if (overlap) { cut++; continue; }
+      keep.push(ob);
+    }
+    if (!cut) continue;
+    W.obstacles = keep;
+    NAV.build(CFG.world, W.obstacles, 9);
+    analyzeTerrain(true);
+    return true;
+  }
+  return false;
+}
+function repairSealedRooms() {
+  var repaired = 0;
+  for (var pass = 0; pass < 3; pass++) {
+    analyzeTerrain(true);
+    var es = (TERRAIN.enclaves || []).slice();
+    var sealed = [];
+    for (var i = 0; i < es.length; i++) if (!es[i].openN) sealed.push(es[i]);
+    if (!sealed.length) break;
+    for (var j = 0; j < sealed.length; j++) {
+      if (cutEnclaveOpening(sealed[j])) repaired++;
+    }
+    NAV.build(CFG.world, W.obstacles, 9);
+    analyzeTerrain(true);
+  }
+  return repaired;
+}
+function bspSplit(x, y, w, h, depth, out) {
+  if (depth <= 0 || (w < 440 && h < 380)) { out.push({ x: x, y: y, w: w, h: h }); return; }
+  if (w >= h) {
+    var cut = Math.round(w * RNG.range(0.42, 0.58));
+    if (cut < 260 || w - cut < 260) { out.push({ x: x, y: y, w: w, h: h }); return; }
+    bspSplit(x, y, cut, h, depth - 1, out);
+    bspSplit(x + cut, y, w - cut, h, depth - 1, out);
+  } else {
+    var cut2 = Math.round(h * RNG.range(0.42, 0.58));
+    if (cut2 < 240 || h - cut2 < 240) { out.push({ x: x, y: y, w: w, h: h }); return; }
+    bspSplit(x, y, w, cut2, depth - 1, out);
+    bspSplit(x, y + cut2, w, h - cut2, depth - 1, out);
+  }
+}
+function prefabIntoLeaf(lf) {
+  var pad = 40, rooms = 0;
+  var kind = RNG.int(0, 2);
+  if (kind === 1) {
+    var bw = Math.floor((lf.w - pad * 3) / 2), bh = Math.min(lf.h - pad * 2, 300);
+    if (bw >= 180 && bh >= 160) {
+      if (addBuilding(lf.x + pad, lf.y + (lf.h - bh) / 2, bw, bh, 1, true)) rooms++;
+      if (addBuilding(lf.x + pad * 2 + bw, lf.y + (lf.h - bh) / 2, bw, bh, 1, true)) rooms++;
+    }
+  } else if (kind === 2) {
+    var hw = Math.floor(lf.w * 0.52), hh = Math.min(lf.h - pad * 2, 320);
+    if (hw >= 200 && hh >= 180) {
+      if (addBuilding(lf.x + pad, lf.y + (lf.h - hh) / 2, hw, hh, 2, true)) rooms++;
+      var yx = lf.x + pad * 2 + hw, yw = lf.w - hw - pad * 3;
+      if (yw > 100) {
+        var ty = lf.y + (lf.h - hh) / 2;
+        W.obstacles.push(makeObstacle(yx, ty, yw, 24, "low"));
+        W.obstacles.push(makeObstacle(yx, ty + hh - 24, yw, 24, "low"));
+        W.obstacles.push(makeObstacle(yx + yw - 24, ty, 24, hh, "low"));
+      }
+    }
+  } else {
+    var cw = Math.min(lf.w - pad * 2, 340), ch = Math.min(lf.h - pad * 2, 280);
+    if (cw >= 200 && ch >= 160) {
+      if (addBuilding(lf.x + (lf.w - cw) / 2, lf.y + (lf.h - ch) / 2, cw, ch, 2, true)) rooms++;
+    }
+  }
+  return rooms;
+}
+function generateAndRepair(mode, seed) {
+  mode = mode || "rooms";
+  var info;
+  if (mode === "bsp") info = generateBspTerrain(seed);
+  else if (mode === "prefab") info = generatePrefabTerrain(seed);
+  else info = generateTerrain(seed);
+  analyzeTerrain(true);
+  var sealed = 0, es = TERRAIN.enclaves || [];
+  for (var i = 0; i < es.length; i++) if (!es[i].openN) sealed++;
+  var repaired = 0;
+  if (sealed > 0) {
+    repaired = repairSealedRooms();
+    analyzeTerrain(true);
+    sealed = 0;
+    es = TERRAIN.enclaves || [];
+    for (var j = 0; j < es.length; j++) if (!es[j].openN) sealed++;
+  }
+  var totalCells = NAV.cols * NAV.rows;
+  var mainPct = totalCells > 0 ? (TERRAIN.mainSize || 0) / totalCells : 0;
+  var score = mapScore();
+  info.sealed = sealed;
+  info.mainPct = mainPct;
+  info.score = score.total;
+  info.repaired = repaired;
+  info.mode = mode;
+  return info;
+}
+function generatePrefabTerrain(seed) {
+  seed = seed || ((Date.now() & 0x7fffffff) >>> 0);
+  var oldRng = RNG.s;
+  RNG.seed(seed);
+  W.obstacles = []; W.doors = []; W.zones = []; W.spawners = []; W.holds = [];
+  var leaves = [];
+  var gb = genBudget();
+  bspSplit(90, 90, CFG.world.w - 180, CFG.world.h - 180, gb.depth, leaves);
+  var rooms = 0;
+  for (var i = 0; i < leaves.length; i++) rooms += prefabIntoLeaf(leaves[i]);
+  W.spawners.push({ x: 48, y: CFG.world.h / 2 - 60, w: 80, h: 120, kind: "zombie",
+    interval: gb.interval, limit: gb.limit, count: 0, t: 0 });
+  W.holds.push({ x: CFG.world.w / 2 - 90, y: CFG.world.h / 2 - 90, w: 180, h: 180,
+    r: 90, owner: null, prog: 0 });
+  NAV.build(CFG.world, W.obstacles, 9);
+  analyzeTerrain(true);
+  var sealed = 0, es = TERRAIN.enclaves || [];
+  for (var ei = 0; ei < es.length; ei++) if (!es[ei].openN) sealed++;
+  var totalCells = NAV.cols * NAV.rows;
+  var mainPct = totalCells > 0 ? (TERRAIN.mainSize || 0) / totalCells : 0;
+  var score = mapScore();
+  RNG.s = oldRng;
+  return { seed: seed, rooms: rooms, obstacles: W.obstacles.length,
+    mainPct: mainPct, sealed: sealed, score: score.total, attempts: 1, prefab: true };
+}
+function generateBspTerrain(seed) {
+  seed = seed || ((Date.now() & 0x7fffffff) >>> 0);
+  var oldRng = RNG.s;
+  RNG.seed(seed);
+  W.obstacles = []; W.doors = []; W.zones = []; W.spawners = []; W.holds = [];
+  var leaves = [];
+  var gb = genBudget();
+  bspSplit(90, 90, CFG.world.w - 180, CFG.world.h - 180, gb.depth, leaves);
+  var placed = 0;
+  for (var i = 0; i < leaves.length; i++) {
+    var lf = leaves[i], pad = 42;
+    var rw = Math.min(lf.w - pad * 2, RNG.range(220, 380));
+    var rh = Math.min(lf.h - pad * 2, RNG.range(180, 320));
+    if (rw < 200 || rh < 160) continue;
+    var rx = lf.x + (lf.w - rw) / 2, ry = lf.y + (lf.h - rh) / 2;
+    if (addBuilding(rx, ry, rw, rh, 2, true)) placed++;
+  }
+  for (var ci = 0, cn = 0; ci < 30 && cn < gb.walls; ci++) {
+    var cw = RNG.range(70, 160), ch = 26;
+    var cx = RNG.range(80, CFG.world.w - 80 - cw), cy = RNG.range(80, CFG.world.h - 80 - ch);
+    if (rectBlocked(cx, cy, cw, ch, 30)) continue;
+    W.obstacles.push(makeObstacle(cx, cy, cw, ch, "low")); cn++;
+  }
+  W.spawners.push({ x: 48, y: CFG.world.h / 2 - 60, w: 80, h: 120, kind: "zombie",
+    interval: gb.interval, limit: gb.limit, count: 0, t: 0 });
+  W.holds.push({ x: CFG.world.w / 2 - 90, y: CFG.world.h / 2 - 90, w: 180, h: 180,
+    r: 90, owner: null, prog: 0 });
+  NAV.build(CFG.world, W.obstacles, 9);
+  analyzeTerrain(true);
+  var sealed = 0, es = TERRAIN.enclaves || [];
+  for (var ei = 0; ei < es.length; ei++) if (!es[ei].openN) sealed++;
+  var totalCells = NAV.cols * NAV.rows;
+  var mainPct = totalCells > 0 ? (TERRAIN.mainSize || 0) / totalCells : 0;
+  var score = mapScore();
+  RNG.s = oldRng;
+  return { seed: seed, rooms: placed, obstacles: W.obstacles.length,
+    mainPct: mainPct, sealed: sealed, score: score.total, attempts: 1, bsp: true };
+}
+function generateTerrain(seed) {
+  seed = seed || ((Date.now() & 0x7fffffff) >>> 0);
+  var best = null, bestSeed = seed, lastSeed = seed, bestAttempts = 1;
+  for (var attempt = 0; attempt < 4; attempt++) {
+    var s2 = seed + attempt;
+    lastSeed = s2;
+    var info = buildTerrainOnce(s2);
+    info.attempts = attempt + 1;
+    if (!best || info.score > best.score || (info.score === best.score && info.sealed < best.sealed)) {
+      best = info; bestSeed = s2; bestAttempts = attempt + 1;
+    }
+    if (info.sealed === 0 && info.mainPct >= 0.7) break;
+  }
+  if (bestSeed !== lastSeed) best = buildTerrainOnce(bestSeed);
+  best.attempts = bestAttempts;
+  return best;
+}
+function mapAnalysisStats() {
+  analyzeTerrain(true);
+  var total = NAV.cols * NAV.rows;
+  return {
+    main: TERRAIN.mainSize || 0,
+    total: total,
+    enclaves: (TERRAIN.enclaves || []).length,
+    lanes: (TERRAIN.lanes || []).length,
+    doors: (TERRAIN.doors || []).length,
+    posts: W.posts ? W.posts.length : 0,
+    threatX: TERRAIN.threatX,
+    threatY: TERRAIN.threatY
+  };
+}
+function suggestPosts() {
+  var old = W.posts;
+  var out = [];
+  try {
+    buildPosts();
+    out = W.posts.slice();
+  } finally {
+    W.posts = old;
+  }
+  return out;
+}
+function mapScore() {
+  analyzeTerrain(true);
+  var tile = NAV.tile, cols = NAV.cols, rows = NAV.rows;
+  var total = cols * rows;
+  var mainPct = total > 0 ? (TERRAIN.mainSize || 0) / total : 0;
+  var enclaveCells = 0, es = TERRAIN.enclaves || [];
+  for (var i = 0; i < es.length; i++) enclaveCells += es[i].area;
+  var enclavePct = total > 0 ? enclaveCells / total : 0;
+  var coverHit = 0, coverSamples = 0;
+  for (var gy = 1; gy < rows - 1; gy += 2) {
+    for (var gx = 1; gx < cols - 1; gx += 2) {
+      if (NAV.b(gx, gy)) continue;
+      coverSamples++;
+      if (nearCover(gx * tile + tile / 2, gy * tile + tile / 2, CFG.line.coverMax)) coverHit++;
+    }
+  }
+  var coverPct = coverSamples > 0 ? coverHit / coverSamples : 0;
+  var connect = Math.max(0, Math.min(100, mainPct / 0.85 * 100));
+  var cover = Math.max(0, Math.min(100, coverPct / 0.35 * 100));
+  var closed = Math.max(0, Math.min(100, (1 - enclavePct) * 100));
+  var laneN = (TERRAIN.lanes || []).length;
+  var lanes = Math.max(0, Math.min(100, 100 - Math.max(0, laneN - 6) * 4));
+  var totalScore = Math.round(connect * 0.45 + cover * 0.25 + closed * 0.20 + lanes * 0.10);
+  var advice = [];
+  if (mainPct < 0.7) advice.push("主连通区偏低：检查大片墙体是否把地图切断。");
+  if (coverPct < 0.18) advice.push("掩体偏少：可加矮墙或半高掩体，避免单位在空地上硬吃子弹。");
+  if (enclavePct > 0.12) advice.push("封闭区偏多：确认这些房间是否有门，避免刷出进不去的单位。");
+  var sealedN = 0;
+  for (var si2 = 0; si2 < es.length; si2++) if (!es[si2].openN) sealedN++;
+  if (sealedN > 0) advice.push("有 " + sealedN + " 个房间完全封闭，建议开门或改为实心掩体。");
+  if (laneN < 3) advice.push("通道偏少：地图过于开阔，远程火力会缺乏遮挡。");
+  if (!advice.length) advice.push("结构均衡：连通、掩体、封闭区与通道均在合理范围。");
+  return { total: totalScore, connect: Math.round(connect), cover: Math.round(cover),
+    closed: Math.round(closed), lanes: Math.round(lanes),
+    mainPct: mainPct, coverPct: coverPct, enclavePct: enclavePct, laneN: laneN, advice: advice };
+}
+function showMapAnalysis() {
+  var st = mapAnalysisStats();
+  var pct = st.total > 0 ? (st.main / st.total * 100).toFixed(1) : "0.0";
+  var list = "";
+  var es = TERRAIN.enclaves || [];
+  for (var i = 0; i < Math.min(6, es.length); i++) {
+    var e = es[i], tile = NAV.tile;
+    var openN = (e.openings || []).length;
+    list += "<li>封闭区 " + (i + 1) + "：中心 (" + Math.round(e.cx * tile) + ", " + Math.round(e.cy * tile) +
+      ")，面积 " + e.area + " 格，" + (openN ? "对外开口 " + openN + " 处" : "完全封闭") + "</li>";
+  }
+  var sc = mapScore();
+  panelEl.innerHTML =
+    "<h2>地图分析</h2>" +
+    "<div class='mapScore'><b>" + sc.total + "</b><span>地图评分 / 100</span></div>" +
+    "<div class='scoreBars'>" +
+      "<div><i style='width:" + sc.connect + "%'></i><em>连通 " + sc.connect + "</em></div>" +
+      "<div><i style='width:" + sc.cover + "%'></i><em>掩体 " + sc.cover + "</em></div>" +
+      "<div><i style='width:" + sc.closed + "%'></i><em>封闭 " + sc.closed + "</em></div>" +
+      "<div><i style='width:" + sc.lanes + "%'></i><em>通道 " + sc.lanes + "</em></div>" +
+    "</div>" +
+    "<p class='netTip'>" + sc.advice.join(" ") + "</p>" +
+    "<div class='statGrid'>" +
+      "<div class='statCell'><b>" + st.main + "</b><span>主连通区格数</span></div>" +
+      "<div class='statCell'><b>" + pct + "%</b><span>占全图</span></div>" +
+      "<div class='statCell'><b>" + st.enclaves + "</b><span>封闭区</span></div>" +
+      "<div class='statCell'><b>" + st.lanes + "</b><span>通道</span></div>" +
+      "<div class='statCell'><b>" + st.doors + "</b><span>出口</span></div>" +
+      "<div class='statCell'><b>" + st.posts + "</b><span>岗位</span></div>" +
+    "</div>" +
+    "<p class='netTip'>主连通区从地图中心洪泛得出；飞地、封死的房间不计入。威胁方向：" +
+      st.threatX.toFixed(2) + ", " + st.threatY.toFixed(2) + "。</p>" +
+    (list ? "<ul>" + list + "</ul>" : "<p class='netTip'>没有检测到封闭区。</p>") +
+    "<p class='netTip'>岗位建议按当前地形与人类质心重新计算，不会立刻覆盖现有岗位。</p>" +
+    "<p style='text-align:right'><button id='anRepair'>修复封闭区</button> " +
+      "<button id='anSuggest'>生成岗位建议</button> " +
+      "<button id='anApply'>应用建议</button> " +
+      "<button id='anMark'>" + (EDIT.showAnalysis ? "取消标出" : "在地图上标出") +
+      "</button> <button id='anClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var rp = $("anRepair");
+  if (rp) rp.addEventListener("click", function () {
+    editPushUndo();
+    var n = repairSealedRooms();
+    EDIT.touched = true;
+    editRebuild();
+    toast(n ? "已为 " + n + " 个封闭区开口" : "没有需要修复的封闭区");
+    showMapAnalysis();
+  });
+  var sg = $("anSuggest");
+  if (sg) sg.addEventListener("click", function () {
+    EDIT.suggestedPosts = suggestPosts();
+    EDIT.showSuggested = true;
+    EDIT.showAnalysis = true;
+    toast("已生成 " + EDIT.suggestedPosts.length + " 个岗位建议");
+    showMapAnalysis();
+  });
+  var ap = $("anApply");
+  if (ap) ap.addEventListener("click", function () {
+    if (!EDIT.suggestedPosts || !EDIT.suggestedPosts.length) { toast("请先生成岗位建议"); return; }
+    W.posts = EDIT.suggestedPosts.slice();
+    EDIT.touched = true;
+    toast("已应用 " + W.posts.length + " 个岗位");
+    closeOverlaySmart();
+  });
+  var mk = $("anMark");
+  if (mk) mk.addEventListener("click", function () {
+    EDIT.showAnalysis = !EDIT.showAnalysis;
+    showMapAnalysis();
+  });
+  var cl = $("anClose");
+  if (cl) cl.addEventListener("click", function () { closeOverlaySmart(); });
+}
+function drawAnalysisOverlay(z) {
+  var tile = NAV.tile, i;
+  if (EDIT.showSuggested && EDIT.suggestedPosts) {
+    for (i = 0; i < EDIT.suggestedPosts.length; i++) {
+      var p = EDIT.suggestedPosts[i];
+      var px = w2sx(p.x), py = w2sy(p.y);
+      CTX.strokeStyle = "rgba(90,220,140,.9)"; CTX.lineWidth = 1.5;
+      CTX.beginPath(); CTX.arc(px, py, 6, 0, TAU); CTX.stroke();
+      CTX.beginPath(); CTX.moveTo(px - 9, py); CTX.lineTo(px + 9, py);
+      CTX.moveTo(px, py - 9); CTX.lineTo(px, py + 9); CTX.stroke();
+    }
+  }
+  var es = TERRAIN.enclaves || [];
+  for (i = 0; i < es.length; i++) {
+    var e = es[i];
+    var x = w2sx(e.minX * tile), y = w2sy(e.minY * tile);
+    var w = (e.maxX - e.minX + 1) * tile * z, h = (e.maxY - e.minY + 1) * tile * z;
+    CTX.strokeStyle = "rgba(224,90,90,.8)"; CTX.lineWidth = 2; CTX.setLineDash([6, 4]);
+    CTX.strokeRect(x, y, w, h); CTX.setLineDash([]);
+    CTX.fillStyle = "rgba(255,170,150,.9)"; CTX.font = "11px system-ui,sans-serif";
+    CTX.fillText("封闭区 " + e.area + " 格 · 开口 " + (e.openN || 0), x + 4, y - 5);
+    var ops = e.openings || [];
+    for (var oi = 0; oi < ops.length; oi++) {
+      CTX.fillStyle = "rgba(255,214,120,.95)";
+      CTX.beginPath(); CTX.arc(w2sx(ops[oi].x), w2sy(ops[oi].y), 4, 0, TAU); CTX.fill();
+    }
+  }
+  var ls = TERRAIN.lanes || [];
+  for (i = 0; i < ls.length; i++) {
+    var l = ls[i];
+    var cx = w2sx(l.cx * tile), cy = w2sy(l.cy * tile);
+    CTX.fillStyle = "rgba(111,199,192,.6)";
+    CTX.beginPath(); CTX.arc(cx, cy, 4, 0, TAU); CTX.fill();
+  }
+  var ds = TERRAIN.doors || [];
+  for (i = 0; i < ds.length; i++) {
+    var d = ds[i];
+    CTX.strokeStyle = "rgba(217,164,65,.9)"; CTX.lineWidth = 1.5;
+    CTX.beginPath(); CTX.arc(w2sx(d.x), w2sy(d.y), 7, 0, TAU); CTX.stroke();
+  }
+}
+function drawEditHudLabel(text, x, y, danger) {
+  CTX.font = "12px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  var tw = CTX.measureText(text).width + 12;
+  CTX.fillStyle = "rgba(6,10,14,.86)";
+  CTX.fillRect(x, y - 13, tw, 19);
+  CTX.strokeStyle = danger ? "rgba(255,110,110,.85)" : "rgba(217,164,65,.55)";
+  CTX.lineWidth = 1;
+  CTX.strokeRect(x + 0.5, y - 12.5, tw - 1, 18);
+  CTX.fillStyle = danger ? "#ffb0b0" : "#ffe6b0";
+  CTX.textAlign = "left"; CTX.textBaseline = "alphabetic";
+  CTX.fillText(text, x + 6, y + 1);
+}
+function drawEditOverlay(z) {
+  var i2, u2;
+  /* 预制网格：半透明灰色虚线 + 吸附点，始终可见 */
+  var gstep = (EDIT.mode === "cell") ? Math.max(32, parseInt(EDIT.snapMode, 10) || 32) : ((EDIT.snapMode === "free") ? 32 : parseInt(EDIT.snapMode, 10) || 8);
+  if (gstep < 4) gstep = 4;
+  var gx0 = Math.floor(s2wx(0) / gstep) * gstep, gy0 = Math.floor(s2wy(0) / gstep) * gstep;
+  if (EDIT.mode === "cell") {
+    for (var cy0 = gy0; cy0 <= s2wy(VH); cy0 += gstep) {
+      for (var cx0 = gx0; cx0 <= s2wx(VW); cx0 += gstep) {
+        var odd = ((Math.round(cx0 / gstep)) + (Math.round(cy0 / gstep))) & 1;
+        CTX.fillStyle = odd ? "rgba(180,190,200,.035)" : "rgba(180,190,200,.012)";
+        CTX.fillRect(w2sx(cx0), w2sy(cy0), gstep * z, gstep * z);
+      }
+    }
+  }
+  CTX.save();
+  CTX.setLineDash([3, 5]);
+  CTX.strokeStyle = "rgba(175,185,195,.30)";
+  CTX.lineWidth = 1;
+  for (var gx = gx0; gx <= s2wx(VW); gx += gstep) {
+    CTX.beginPath(); CTX.moveTo(w2sx(gx), 0); CTX.lineTo(w2sx(gx), VH); CTX.stroke();
+  }
+  for (var gy = gy0; gy <= s2wy(VH); gy += gstep) {
+    CTX.beginPath(); CTX.moveTo(0, w2sy(gy)); CTX.lineTo(VW, w2sy(gy)); CTX.stroke();
+  }
+  CTX.setLineDash([]);
+  CTX.fillStyle = "rgba(210,220,230,.45)";
+  for (var px = gx0; px <= s2wx(VW); px += gstep) {
+    for (var py = gy0; py <= s2wy(VH); py += gstep) {
+      CTX.fillRect(w2sx(px) - 1, w2sy(py) - 1, 2, 2);
+    }
+  }
+  CTX.restore();
+  /* 丧尸出生区始终标出 */
+  var sz = EDIT.spawn || mapSpawnZone(CFG.mapPreset);
+  CTX.setLineDash([9, 6]);
+  CTX.strokeStyle = "rgba(200,120,255,0.8)";
+  CTX.lineWidth = 1.5;
+  CTX.strokeRect(w2sx(sz.x), w2sy(sz.y), sz.w * z, sz.h * z);
+  CTX.setLineDash([]);
+  CTX.fillStyle = "rgba(200,120,255,0.9)";
+  CTX.font = "12px sans-serif";
+  CTX.fillText("丧尸出生区", w2sx(sz.x) + 4, w2sy(sz.y) - 5);
+  /* 所有人类士兵的坚守点位 */
+  for (i2 = 0; i2 < W.units.length; i2++) {
+    u2 = W.units[i2];
+    if (u2.dead || !isHuman(u2) || !u2.defend) continue;
+    var dx2 = w2sx(u2.defend.x), dy2 = w2sy(u2.defend.y);
+    CTX.strokeStyle = (EDIT.selUnit === u2) ? "rgba(255,210,90,1)" : "rgba(120,220,255,0.75)";
+    CTX.lineWidth = 1.5;
+    CTX.beginPath(); CTX.arc(dx2, dy2, 6, 0, TAU); CTX.stroke();
+    CTX.beginPath(); CTX.moveTo(dx2 - 9, dy2); CTX.lineTo(dx2 - 3, dy2);
+    CTX.moveTo(dx2 + 3, dy2); CTX.lineTo(dx2 + 9, dy2);
+    CTX.moveTo(dx2, dy2 - 9); CTX.lineTo(dx2, dy2 - 3);
+    CTX.moveTo(dx2, dy2 + 3); CTX.lineTo(dx2, dy2 + 9);
+    CTX.stroke();
+    CTX.strokeStyle = "rgba(120,220,255,0.25)";
+    CTX.beginPath(); CTX.moveTo(w2sx(u2.x), w2sy(u2.y)); CTX.lineTo(dx2, dy2); CTX.stroke();
+  }
+  /* 护送关卡的各项要素 */
+  var LV = EDIT.level;
+  if (LV) {
+    var i3;
+    /* 波次生成区：左半场绿、右半场红、跨中线黄，一眼看出丧尸从哪边来 */
+    for (i3 = 0; i3 < (LV.zones || []).length; i3++) {
+      var zn2 = LV.zones[i3];
+      var zc = zn2.side < 0 ? "120,220,140" : (zn2.side > 0 ? "255,140,120" : "225,200,110");
+      CTX.fillStyle = "rgba(" + zc + ",0.15)";
+      CTX.fillRect(w2sx(zn2.x), w2sy(zn2.y), zn2.w * z, zn2.h * z);
+      CTX.strokeStyle = "rgba(" + zc + ",0.85)";
+      CTX.lineWidth = 1.5;
+      CTX.strokeRect(w2sx(zn2.x), w2sy(zn2.y), zn2.w * z, zn2.h * z);
+      CTX.fillStyle = "rgba(" + zc + ",1)";
+      CTX.font = "11px sans-serif";
+      CTX.fillText("波次区 " + (zn2.side < 0 ? "左" : (zn2.side > 0 ? "右" : "通用")), w2sx(zn2.x) + 3, w2sy(zn2.y) + 13);
+    }
+    /* 初始休眠尸群：圆圈就是丧尸初始散开的范围 */
+    for (i3 = 0; i3 < (LV.mounds || []).length; i3++) {
+      var md2 = LV.mounds[i3];
+      var mx2 = w2sx(md2.x), my2 = w2sy(md2.y);
+      CTX.strokeStyle = "rgba(180,120,255,0.85)";
+      CTX.lineWidth = 1.5;
+      CTX.beginPath(); CTX.arc(mx2, my2, 118 * z, 0, TAU); CTX.stroke();
+      CTX.fillStyle = "rgba(200,150,255,1)";
+      CTX.font = "11px sans-serif";
+      CTX.fillText("尸群 " + md2.n, mx2 - 14, my2 + 4);
+    }
+    /* 无敌区：里面的人不会被索敌，也不参与集群 */
+    for (i3 = 0; i3 < (LV.safeZones || []).length; i3++) {
+      var sz2 = LV.safeZones[i3];
+      CTX.fillStyle = "rgba(120,200,255,0.13)";
+      CTX.fillRect(w2sx(sz2.x), w2sy(sz2.y), sz2.w * z, sz2.h * z);
+      CTX.strokeStyle = "rgba(120,200,255,0.9)";
+      CTX.lineWidth = 2;
+      CTX.setLineDash([9, 5]);
+      CTX.strokeRect(w2sx(sz2.x), w2sy(sz2.y), sz2.w * z, sz2.h * z);
+      CTX.setLineDash([]);
+      CTX.fillStyle = "rgba(150,215,255,1)";
+      CTX.font = "12px sans-serif";
+      CTX.fillText("无敌区", w2sx(sz2.x) + 5, w2sy(sz2.y) + 16);
+    }
+    /* 平民牢房 */
+    if (LV.prison) {
+      CTX.setLineDash([7, 5]);
+      CTX.strokeStyle = "rgba(255,215,90,0.9)";
+      CTX.lineWidth = 2;
+      CTX.strokeRect(w2sx(LV.prison.x), w2sy(LV.prison.y), LV.prison.w * z, LV.prison.h * z);
+      CTX.setLineDash([]);
+      CTX.fillStyle = "rgba(255,215,90,1)";
+      CTX.font = "12px sans-serif";
+      CTX.fillText("平民牢房", w2sx(LV.prison.x) + 4, w2sy(LV.prison.y) - 5);
+    }
+    /* 玩家框出的解锁门位置（实际会贴到牢房最近的那面墙上） */
+    if (LV.prisonDoor) {
+      CTX.setLineDash([4, 4]);
+      CTX.strokeStyle = "rgba(255,130,130,0.95)";
+      CTX.lineWidth = 2;
+      CTX.strokeRect(w2sx(LV.prisonDoor.x), w2sy(LV.prisonDoor.y), LV.prisonDoor.w * z, LV.prisonDoor.h * z);
+      CTX.setLineDash([]);
+    }
+    drawLevelPoint(LV.squad, "小队出生点", "rgba(120,215,255,1)", z);
+    drawLevelPoint(LV.evac, "撤离点", "rgba(120,255,170,1)", z);
+    /* 行进路线：一条路线一种颜色，当前正在编辑的那条画实线并加粗 */
+    var rts2 = LV.routes || [];
+    for (i3 = 0; i3 < rts2.length; i3++) {
+      var rt2 = rts2[i3];
+      var isCur = (i3 === EDIT.routeCur);
+      if (isCur && rt2.rect) {
+        CTX.globalAlpha = 0.45;
+        CTX.fillStyle = rt2.color;
+        CTX.fillRect(w2sx(rt2.rect.x), w2sy(rt2.rect.y), rt2.rect.w * z, rt2.rect.h * z);
+        CTX.globalAlpha = 1;
+        CTX.strokeStyle = rt2.color;
+        CTX.lineWidth = 1.5;
+        CTX.setLineDash([5, 4]);
+        CTX.strokeRect(w2sx(rt2.rect.x), w2sy(rt2.rect.y), rt2.rect.w * z, rt2.rect.h * z);
+        CTX.setLineDash([]);
+      }
+      if (rt2.pts.length > 1) {
+        CTX.strokeStyle = rt2.color;
+        CTX.globalAlpha = isCur ? 1 : 0.65;
+        CTX.lineWidth = isCur ? 3 : 2;
+        CTX.setLineDash(isCur ? [] : [7, 5]);
+        CTX.beginPath();
+        CTX.moveTo(w2sx(rt2.pts[0].x), w2sy(rt2.pts[0].y));
+        for (var pi = 1; pi < rt2.pts.length; pi++) CTX.lineTo(w2sx(rt2.pts[pi].x), w2sy(rt2.pts[pi].y));
+        CTX.stroke();
+        CTX.setLineDash([]);
+        CTX.globalAlpha = 1;
+      }
+      for (var pi2 = 0; pi2 < rt2.pts.length; pi2++) {
+        var ptx = w2sx(rt2.pts[pi2].x), pty = w2sy(rt2.pts[pi2].y);
+        CTX.fillStyle = rt2.color;
+        CTX.beginPath(); CTX.arc(ptx, pty, 7, 0, TAU); CTX.fill();
+        CTX.fillStyle = "#0a0c13";
+        CTX.font = "bold 9px sans-serif";
+        CTX.fillText(String(pi2 + 1), ptx - 3, pty + 3);
+      }
+    }
+  }
+  if (!EDIT.hover) return;
+  if (EDIT.tool === "erase") {
+    var ex = w2sx(EDIT.curX), ey = w2sy(EDIT.curY);
+    CTX.strokeStyle = "rgba(255,96,96,0.95)";
+    CTX.lineWidth = 2;
+    CTX.beginPath(); CTX.arc(ex, ey, 18 * z, 0, TAU); CTX.stroke();
+    CTX.beginPath();
+    CTX.moveTo(ex - 8 * z, ey); CTX.lineTo(ex + 8 * z, ey);
+    CTX.moveTo(ex, ey - 8 * z); CTX.lineTo(ex, ey + 8 * z);
+    CTX.stroke();
+    return;
+  }
+  var r = editPendingRect();
+  if (!r) {
+    CTX.fillStyle = "rgba(255,255,255,0.4)";
+    CTX.beginPath(); CTX.arc(w2sx(EDIT.curX), w2sy(EDIT.curY), 4, 0, TAU); CTX.fill();
+    drawEditHudLabel("X " + Math.round(EDIT.curX) + "  Y " + Math.round(EDIT.curY) +
+      "  （格 " + (EDIT.curX / 32).toFixed(1) + " , " + (EDIT.curY / 32).toFixed(1) + "）",
+      w2sx(EDIT.curX) + 12, w2sy(EDIT.curY) - 6, false);
+    return;
+  }
+  var sx = w2sx(r.x), sy = w2sy(r.y), sw = r.w * z, sh = r.h * z;
+  var clash = rectBlocked(r.x, r.y, r.w, r.h, 0);
+  CTX.globalAlpha = 0.32;
+  CTX.fillStyle = clash ? "rgba(255,110,110,0.9)"
+    : (EDIT.tool === "low" ? "rgba(214,232,255,0.9)" : "rgba(110,230,150,0.85)");
+  CTX.fillRect(sx, sy, sw, sh);
+  CTX.globalAlpha = 1;
+  CTX.setLineDash([7, 5]);
+  CTX.strokeStyle = clash ? "rgba(255,110,110,1)" : "rgba(200,240,255,0.95)";
+  CTX.lineWidth = 1.5;
+  CTX.strokeRect(sx, sy, sw, sh);
+  CTX.setLineDash([]);
+  var label = Math.round(r.w) + " × " + Math.round(r.h) + " px   （" +
+    (r.w / 32).toFixed(1) + " × " + (r.h / 32).toFixed(1) + " 格）";
+  drawEditHudLabel(label, sx + 2, sy - 6, clash);
+}
+/* 操控角色时镜头跟着他走：朝准星方向带一点前瞻偏移，平滑追上去。
+   玩家自己拖过地图的话，先让手动操作生效一小会儿，别跟他抢镜头 */
+/* 玩家猛扑：朝当前移动方向（没在动就朝朝向）给一记速度脉冲 */
+function playerPounce() {
+  var u = PLAYER.unit;
+  if (!u || u.dead) return;
+  if (PLAYER.pounceT > 0) return;
+  var mx = PLAYER.moveX, my = PLAYER.moveY;
+  var m = Math.sqrt(mx * mx + my * my);
+  if (m < 0.15) { mx = Math.cos(u.faceAng); my = Math.sin(u.faceAng); m = 1; }
+  var push = CFG.playerDash.push;
+  u.vx += (mx / m) * push;
+  u.vy += (my / m) * push;
+  if (u.vmaxBoost < push) { u.vmaxBoost = push; u.boostT = CFG.playerDash.dur; }
+  PLAYER.pounceT = CFG.playerDash.cd;
+}
+/* 操控中的屏幕读数：右侧枪械名称与弹药，耗尽时变红并在屏幕下方提示换弹；
+   同时沿朝向画一条越远越淡的粗虚线瞄��线，长度不超过恐惧范围的 1.5 倍 */
+function gunNameOf(u) {
+  if (u.kind === "mg") return "机枪";
+  if (u.kind === "sniper") return "狙击枪";
+  if (u.kind === "shield") return "手枪";
+  if (u.kind === "medic") return "治疗枪";
+  if (u.kind === "rifle") return "步枪";
+  var c = CFG.unit[u.kind];
+  if (c && c.gun) return c.gun.name || "自定义枪械";
+  return "无武器";
+}
+function drawPlayerAimAndHud() {
+  if (HIDE_UI) return;
+  /* 操控中就画被接管的人；只点了「选中」就画那个人（AI 照常接管，我们只看状态） */
+  var u = playerUnitValid() ? PLAYER.unit : ((UI.peek && !UI.peek.dead) ? UI.peek : null);
+  if (!u) return;
+  var controlling = (playerUnitValid() && PLAYER.unit === u);
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  /* 瞄准线只在真正操控时画：查看状态不该假惺惺地给人一条射界 */
+  var len = controlling ? fearRadiusOf(u) * 1.5 : 0;
+  if (len > 40) {
+    var ax0 = w2sx(u.x), ay0 = w2sy(u.y);
+    var ax1 = w2sx(u.x + Math.cos(u.faceAng) * len);
+    var ay1 = w2sy(u.y + Math.sin(u.faceAng) * len);
+    var ag = CTX.createLinearGradient(ax0, ay0, ax1, ay1);
+    ag.addColorStop(0, "rgba(255,255,255,0.88)");
+    ag.addColorStop(0.55, "rgba(255,255,255,0.34)");
+    ag.addColorStop(1, "rgba(255,255,255,0)");
+    CTX.strokeStyle = ag;
+    CTX.lineWidth = 3.6;
+    CTX.lineCap = "round";
+    CTX.setLineDash([11, 7]);
+    CTX.beginPath();
+    CTX.moveTo(ax0, ay0);
+    CTX.lineTo(ax1, ay1);
+    CTX.stroke();
+    CTX.setLineDash([]);
+  }
+  /* 枪械读数：右侧、从下往上三分之一处 */
+  var dry = (u.magSize > 0) && !inf && (u.mag <= 0 || u.reloading);
+  var rx = VW - 34;
+  var ry = Math.round(VH * 2 / 3);
+  CTX.textAlign = "right";
+  CTX.textBaseline = "alphabetic";
+  CTX.fillStyle = dry ? "rgba(255,90,90,0.98)" : "rgba(232,240,255,0.9)";
+  CTX.font = Math.round(Math.max(16, Math.min(24, VW * 0.024))) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillText(gunNameOf(u), rx, ry);
+  /* 紧跟枪械名后面标出当前开火模式（V 切换） */
+  if (controlling && u.magSize > 0) {
+    var modeTxt = CFG.playerFire.modeName[PLAYER.fireMode];
+    CTX.font = Math.round(Math.max(12, Math.min(17, VW * 0.017))) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillStyle = PLAYER.fireMode === 1 ? "rgba(150,235,255,0.95)" : "rgba(255,206,120,0.95)";
+    CTX.fillText(modeTxt, rx, ry - Math.round(Math.max(16, Math.min(24, VW * 0.024))) - 2);
+  }
+  /* 只有笼罩在平民英雄的光环里才是真无限弹药，那时读表显示 ∞ */
+  var inf = !!u.aura && !auraNoAmmo(u.kind);
+  var ammo = (u.magSize > 0) ? ((inf ? "∞" : Math.max(0, u.mag)) + " / " + u.magSize) : "—";
+  CTX.font = "700 " + Math.round(Math.max(24, Math.min(40, VW * 0.042))) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  CTX.fillStyle = dry ? "rgb(255,80,80)" : "rgb(240,246,255)";
+  CTX.fillText(ammo, rx, ry + Math.round(Math.max(26, VW * 0.046)));
+  /* 弹药正下方：防护服等级 + 剩余抗感染时间百分比。
+     一级白、二级绿、三级蓝、抗毒血清金，一眼看出穿的是哪一档 */
+  if (controlling && u.gear && u.gear.suit) {
+    var suitIt = gearItemById(u.gear.suit);
+    if (suitIt) {
+      var suitCol = "255,255,255";
+      if (u.gear.suit === "suit2") suitCol = "120,235,150";
+      else if (u.gear.suit === "suit3") suitCol = "120,190,255";
+      else if (u.gear.suit === "antidote") suitCol = "255,214,90";
+      var suitMax = (u.gearStats && u.gearStats.suitTime) || 1;
+      var suitPct = u.suitBroken ? 0 : Math.max(0, Math.min(1, (u.suitHp || 0) / suitMax));
+      CTX.textAlign = "right";
+      CTX.font = Math.round(Math.max(12, Math.min(17, VW * 0.017))) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+      CTX.fillStyle = "rgba(" + suitCol + ",0.92)";
+      CTX.fillText(suitIt.name + "  " + Math.round(suitPct * 100) + "%", rx, ry + Math.round(Math.max(26, VW * 0.046)) + Math.round(Math.max(20, VW * 0.026)));
+    }
+  }
+  /* 换弹中：跟着角色头顶走。原来放在屏幕正下方，会和"场上占比条"叠在一起，
+     固定位置的 UI 已经占满了，这个提示跟着人走反而更醒目也不会冲突 */
+  if (u.reloading && u.magSize > 0) {
+    CTX.textAlign = "center";
+    CTX.textBaseline = "alphabetic";
+    CTX.font = "700 " + Math.round(Math.max(20, Math.min(34, VW * 0.034))) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillStyle = "rgb(255,92,92)";
+    CTX.shadowColor = "rgba(255,60,60,0.75)";
+    CTX.shadowBlur = 14;
+    /* 水平居中、贴近兵种占比条（它在 VH-152）的上方 */
+    CTX.fillText("换弹中", VW / 2, Math.round(VH - 212));
+    CTX.shadowBlur = 0;
+  }
+  /* 命中标记：准星上闪一个十字。普通命中是白色，击杀变成红色且更大 */
+  if (controlling && CFG.feedback.hitmark && (PLAYER.hitT > 0 || PLAYER.killT > 0)) {
+    var mx0 = UI.pointer.x, my0 = UI.pointer.y;
+    var killHit = PLAYER.killT > 0;
+    /* 战地那种斜叉：四条 45° 的短线。命中细一点，击杀更粗更长，但一直是白的，不变红 */
+    var gap = killHit ? 8 : 5;
+    var ln = killHit ? 14 : 9;
+    CTX.strokeStyle = "rgba(255,255,255," + (killHit ? 0.98 : 0.9) + ")";
+    CTX.lineWidth = killHit ? 3.4 : 2.2;
+    CTX.lineCap = "round";
+    CTX.beginPath();
+    CTX.moveTo(mx0 - gap - ln, my0 - gap - ln); CTX.lineTo(mx0 - gap, my0 - gap);
+    CTX.moveTo(mx0 + gap + ln, my0 - gap - ln); CTX.lineTo(mx0 + gap, my0 - gap);
+    CTX.moveTo(mx0 - gap - ln, my0 + gap + ln); CTX.lineTo(mx0 - gap, my0 + gap);
+    CTX.moveTo(mx0 + gap + ln, my0 + gap + ln); CTX.lineTo(mx0 + gap, my0 + gap);
+    CTX.stroke();
+  }
+  /* 只是查看（AI 还在管这个人）：画个选中圈 + 血条，和操控状态区分开 */
+  if (!controlling) {
+    var hx = w2sx(u.x), hy = w2sy(u.y), hr = u.r * CAM.zoom + 7;
+    CTX.beginPath(); CTX.arc(hx, hy, hr, 0, TAU);
+    CTX.strokeStyle = "rgba(140,220,255,0.95)";
+    CTX.lineWidth = 2;
+    CTX.stroke();
+    var bw = 56, bh = 5, bx0 = hx - bw / 2, by0 = hy - hr - 12;
+    CTX.fillStyle = "rgba(0,0,0,0.5)";
+    CTX.fillRect(bx0, by0, bw, bh);
+    var hpr = (u.maxHp > 0) ? clamp(u.hp / u.maxHp, 0, 1) : 0;
+    CTX.fillStyle = hpr > 0.5 ? "rgba(90,208,122,0.95)" : (hpr > 0.25 ? "rgba(255,190,80,0.95)" : "rgba(255,90,90,0.95)");
+    CTX.fillRect(bx0, by0, bw * hpr, bh);
+    CTX.textAlign = "center";
+    CTX.font = "12px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.fillStyle = "rgba(160,220,255,0.95)";
+    CTX.fillText("AI 接管中 · 状态查看", hx, by0 - 6);
+  }
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+function followPlayerCamera(dt) {
+  if (!playerUnitValid()) return;
+  if (PLAYER.camHoldT > 0) { PLAYER.camHoldT -= dt; return; }
+  var u = PLAYER.unit;
+  /* 前瞻方向必须取自"与镜头自身无关"的量，否则会形成正反馈：
+     镜头一偏移 -> 准星的世界坐标跟着变 -> 瞄准方向变了 -> 镜头再偏移，视角会一路漂走。
+     鼠标看的是它在屏幕上的方位，摇杆看的是摇杆方向，两者都不受镜头位移影响 */
+  var lx = 0, ly = 0;
+  if (PLAYER.stickR && PLAYER.stickR.mag > 0.22) {
+    lx = PLAYER.aimX * CFG.playerCam.lead;
+    ly = PLAYER.aimY * CFG.playerCam.lead;
+  } else {
+    var sox = UI.pointer.x - VW / 2, soy = UI.pointer.y - VH / 2;
+    var som = Math.sqrt(sox * sox + soy * soy);
+    if (som > 8) { lx = sox / som * CFG.playerCam.lead; ly = soy / som * CFG.playerCam.lead; }
+  }
+  var tx = clamp(u.x + lx, 0, CFG.world.w), ty = clamp(u.y + ly, 0, CFG.world.h);
+  var k = Math.min(1, dt * CFG.playerCam.smooth);
+  CAM.x += (tx - CAM.x) * k;
+  CAM.y += (ty - CAM.y) * k;
+  CAM.x = clamp(CAM.x, 0, CFG.world.w);
+  CAM.y = clamp(CAM.y, 0, CFG.world.h);
+}
+/* 把镜头平滑推到 (x, y)：缓入缓出，走完自动交还给跟随逻辑 */
+function focusCameraOn(x, y, dur) {
+  CAM_FOCUS = {
+    fx: CAM.x, fy: CAM.y,
+    tx: clamp(x, 0, CFG.world.w), ty: clamp(y, 0, CFG.world.h),
+    t: dur, dur: dur
+  };
+}
+function stepCameraFocus(dt) {
+  if (!CAM_FOCUS) return false;
+  var f = CAM_FOCUS;
+  f.t -= dt;
+  var k = f.t > 0 ? 1 - f.t / f.dur : 1;
+  if (k < 0) k = 0;
+  if (k > 1) k = 1;
+  /* easeInOutQuad：起步和收尾都慢，中间快 */
+  var e = k < 0.5 ? 2 * k * k : 1 - Math.pow(-2 * k + 2, 2) / 2;
+  CAM.x = f.fx + (f.tx - f.fx) * e;
+  CAM.y = f.fy + (f.ty - f.fy) * e;
+  if (f.t <= 0) {
+    CAM.x = f.tx; CAM.y = f.ty;
+    CAM_FOCUS = null;
+  }
+  return true;
+}
+/* ---------- 结算特效 ---------- */
+/* 胜利期间每隔半秒放一朵新的烟花；烟花用屏幕坐标，所以不随镜头滚动 */
+function spawnFirework() {
+  if (W.fireworks.length > 24) return;
+  var live = RNG.range(0, 1) < 0.35;        /* 只让一部分带声音，否则半秒一发太吵 */
+  W.fireworks.push({
+    x: RNG.range(VW * 0.12, VW * 0.88),
+    y: RNG.range(VH * 0.10, VH * 0.55),
+    t: 0, dur: CFG.fx.fwLife, hue: RNG.int(0, 359),
+    seed: RNG.range(0, TAU), rays: RNG.int(18, 30),
+    maxR: CFG.fx.fwMaxR * RNG.range(0.7, 1.15)
+  });
+  if (live) SFX.firework(0, 0);
+}
+function updateEndFx(dt) {
+  var i;
+  for (i = W.fireworks.length - 1; i >= 0; i--) {
+    W.fireworks[i].t += dt;
+    if (W.fireworks[i].t >= W.fireworks[i].dur) W.fireworks.splice(i, 1);
+  }
+  if (W.fxWin > 0) {
+    W.fxWin -= dt;
+    W.fwT -= dt;
+    if (W.fwT <= 0) { W.fwT = CFG.fx.fwInterval; spawnFirework(); }
+  }
+  if (W.fxLose > 0) W.fxLose -= dt;
+}
+/* 触屏摇杆：底盘 + 摇杆头 */
+function drawStick(st, col) {
+  CTX.strokeStyle = col + "0.30)";
+  CTX.lineWidth = 2;
+  CTX.beginPath(); CTX.arc(st.ox, st.oy, STICK_R, 0, TAU); CTX.stroke();
+  CTX.fillStyle = col + "0.22)";
+  CTX.beginPath(); CTX.arc(st.ox, st.oy, 6, 0, TAU); CTX.fill();
+  CTX.fillStyle = col + "0.45)";
+  CTX.beginPath(); CTX.arc(st.kx || st.ox, st.ky || st.oy, 26, 0, TAU); CTX.fill();
+}
+/* 烟花：一团向外炸开的射线，边扩散边变暗；失败时叠一层渐变的红光 */
+function drawEndFx() {
+  var i, j, f;
+  for (i = 0; i < W.fireworks.length; i++) {
+    f = W.fireworks[i];
+    var k = f.t / f.dur;
+    var a = Math.pow(1 - k, 1.5);
+    var R = f.maxR * (0.22 + 0.78 * Math.sqrt(k));
+    CTX.lineCap = "round";
+    for (j = 0; j < f.rays; j++) {
+      var ang = f.seed + j / f.rays * TAU;
+      var len = R * (0.72 + 0.28 * Math.sin(j * 2.399 + f.seed));
+      var x0 = f.x + Math.cos(ang) * R * 0.18, y0 = f.y + Math.sin(ang) * R * 0.18;
+      var x1 = f.x + Math.cos(ang) * len, y1 = f.y + Math.sin(ang) * len;
+      CTX.strokeStyle = "hsla(" + f.hue + ",100%," + Math.round(62 + 24 * (1 - k)) + "%," + (a * 0.85) + ")";
+      CTX.lineWidth = 2.4;
+      CTX.beginPath(); CTX.moveTo(x0, y0); CTX.lineTo(x1, y1); CTX.stroke();
+      CTX.fillStyle = "hsla(" + f.hue + ",100%,88%," + a + ")";
+      CTX.beginPath(); CTX.arc(x1, y1, 2.1, 0, TAU); CTX.fill();
+    }
+    CTX.globalAlpha = a * 0.55;
+    CTX.fillStyle = "hsl(" + f.hue + ",100%,80%)";
+    CTX.beginPath(); CTX.arc(f.x, f.y, R * 0.13 + 1, 0, TAU); CTX.fill();
+    CTX.globalAlpha = 1;
+  }
+  if (W.fxLose > 0) {
+    /* 先亮起来、再退掉，整屏泛红并压一圈边缘红光 */
+    var lk = 1 - W.fxLose / CFG.fx.loseDur;
+    var la = Math.sin(Math.PI * Math.pow(lk, 0.85)) * CFG.fx.losePeak;
+    if (la > 0.004) {
+      CTX.fillStyle = "rgba(214,40,40," + la + ")";
+      CTX.fillRect(0, 0, VW, VH);
+      drawEdgeGlow("255,64,64", Math.min(0.9, la * CFG.fx.loseEdge / CFG.fx.losePeak));
+    }
+  }
+}
+/* 关卡里的点位标记（出生点 / 撤离点） */
+function drawLevelPoint(p, label, col, z) {
+  if (!p) return;
+  var px = w2sx(p.x), py = w2sy(p.y);
+  CTX.strokeStyle = col;
+  CTX.lineWidth = 2;
+  CTX.beginPath(); CTX.arc(px, py, 14, 0, TAU); CTX.stroke();
+  CTX.beginPath(); CTX.arc(px, py, 4, 0, TAU); CTX.fillStyle = col; CTX.fill();
+  CTX.font = "12px sans-serif";
+  CTX.fillText(label, px + 18, py + 4);
+}
+/* 墙面/建筑上的矢量绘制：只显示在墙体轮廓内 */
+function drawWallArt(z) {
+  var art = W.wallArt;
+  if (!art || !art.length) return;
+  var obs = W.obstacles || [], i, hasWall = false;
+  CTX.save();
+  CTX.beginPath();
+  for (i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (o.tile || o.prison || (o.kind !== "wall" && o.kind !== "low")) continue;
+    hasWall = true;
+    CTX.rect(w2sx(o.x), w2sy(o.y), o.w * z, o.h * z);
+  }
+  if (!hasWall) { CTX.restore(); return; }
+  CTX.clip();
+  for (i = 0; i < art.length; i++) {
+    var a = art[i];
+    CTX.strokeStyle = a.color || "#e8d8b8";
+    CTX.fillStyle = a.color || "#e8d8b8";
+    CTX.lineWidth = Math.max(1, (a.width || 3) * z);
+    CTX.lineCap = "round"; CTX.lineJoin = "round";
+    if (a.type === "stroke" && a.pts && a.pts.length > 1) {
+      CTX.beginPath();
+      for (var pi = 0; pi < a.pts.length; pi++) {
+        var pp = a.pts[pi];
+        if (pi === 0) CTX.moveTo(w2sx(pp[0]), w2sy(pp[1]));
+        else CTX.lineTo(w2sx(pp[0]), w2sy(pp[1]));
+      }
+      CTX.stroke();
+    } else if (a.type === "line") {
+      CTX.beginPath(); CTX.moveTo(w2sx(a.x1), w2sy(a.y1)); CTX.lineTo(w2sx(a.x2), w2sy(a.y2)); CTX.stroke();
+    } else if (a.type === "curve") {
+      CTX.beginPath(); CTX.moveTo(w2sx(a.x1), w2sy(a.y1));
+      CTX.quadraticCurveTo(w2sx(a.cx), w2sy(a.cy), w2sx(a.x2), w2sy(a.y2)); CTX.stroke();
+    } else if (a.type === "fill") {
+      CTX.globalAlpha = a.alpha === undefined ? 0.85 : a.alpha;
+      CTX.fillRect(w2sx(a.x), w2sy(a.y), a.w * z, a.h * z);
+      CTX.globalAlpha = 1;
+    } else if (a.type === "text" && a.text) {
+      var fs2 = Math.max(7, (a.size || 18) * z);
+      CTX.font = "700 " + fs2 + "px system-ui,'Microsoft YaHei',sans-serif";
+      CTX.textAlign = "left"; CTX.textBaseline = "top";
+      var lines = String(a.text).split("\n");
+      for (var li = 0; li < lines.length; li++) CTX.fillText(lines[li], w2sx(a.x), w2sy(a.y) + li * fs2 * 1.2);
+    }
+  }
+  CTX.restore();
+}
+/* ===== 墙面/建筑矢量绘制窗口 ===== */
+var WA = { open: false, tool: "pen", color: "#e8d8b8", width: 3, pts: [], drawing: false,
+  start: null, ctrl: null, textPos: null, scale: 1, ox: 0, oy: 0, bound: false };
+function waResize() {
+  var st = document.getElementById("waStage"), cv = document.getElementById("waCanvas");
+  if (!st || !cv) return;
+  var w = Math.max(320, st.clientWidth || 800), h = Math.max(220, st.clientHeight || 500);
+  var dpr = Math.min(2, window.devicePixelRatio || 1);
+  cv.width = Math.floor(w * dpr); cv.height = Math.floor(h * dpr);
+  cv.style.width = w + "px"; cv.style.height = h + "px";
+  WA.scale = Math.min((w - 36) / CFG.world.w, (h - 36) / CFG.world.h);
+  WA.ox = (w - CFG.world.w * WA.scale) / 2;
+  WA.oy = (h - CFG.world.h * WA.scale) / 2;
+  waDraw();
+}
+function waWX(x) { return WA.ox + x * WA.scale; }
+function waWY(y) { return WA.oy + y * WA.scale; }
+function waFromEvent(e) {
+  var cv = document.getElementById("waCanvas");
+  var r = cv.getBoundingClientRect();
+  return { x: (e.clientX - r.left - WA.ox) / WA.scale, y: (e.clientY - r.top - WA.oy) / WA.scale };
+}
+function waDrawArt(g) {
+  var art = W.wallArt || [], i;
+  for (i = 0; i < art.length; i++) {
+    var a = art[i];
+    g.strokeStyle = a.color || "#e8d8b8";
+    g.fillStyle = a.color || "#e8d8b8";
+    g.lineWidth = Math.max(0.7, (a.width || 3) * WA.scale);
+    g.lineCap = "round"; g.lineJoin = "round";
+    if (a.type === "stroke" && a.pts && a.pts.length > 1) {
+      g.beginPath();
+      for (var pi = 0; pi < a.pts.length; pi++) {
+        if (pi === 0) g.moveTo(waWX(a.pts[pi][0]), waWY(a.pts[pi][1]));
+        else g.lineTo(waWX(a.pts[pi][0]), waWY(a.pts[pi][1]));
+      }
+      g.stroke();
+    } else if (a.type === "line") {
+      g.beginPath(); g.moveTo(waWX(a.x1), waWY(a.y1)); g.lineTo(waWX(a.x2), waWY(a.y2)); g.stroke();
+    } else if (a.type === "curve") {
+      g.beginPath(); g.moveTo(waWX(a.x1), waWY(a.y1));
+      g.quadraticCurveTo(waWX(a.cx), waWY(a.cy), waWX(a.x2), waWY(a.y2)); g.stroke();
+    } else if (a.type === "fill") {
+      g.globalAlpha = a.alpha === undefined ? 0.85 : a.alpha;
+      g.fillRect(waWX(a.x), waWY(a.y), a.w * WA.scale, a.h * WA.scale);
+      g.globalAlpha = 1;
+    } else if (a.type === "text" && a.text) {
+      g.font = "700 " + Math.max(6, (a.size || 18) * WA.scale) + "px system-ui,'Microsoft YaHei',sans-serif";
+      g.textAlign = "left"; g.textBaseline = "top";
+      var lines = String(a.text).split("\n"), fs2 = Math.max(6, (a.size || 18) * WA.scale);
+      for (var li = 0; li < lines.length; li++) g.fillText(lines[li], waWX(a.x), waWY(a.y) + li * fs2 * 1.2);
+    }
+  }
+}
+function waDraw() {
+  if (!WA.open) return;
+  var cv = document.getElementById("waCanvas");
+  if (!cv) return;
+  var g = cv.getContext("2d");
+  var dpr = Math.min(2, window.devicePixelRatio || 1);
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  var w = cv.width / dpr, h = cv.height / dpr;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = "#090d12"; g.fillRect(0, 0, w, h);
+  g.strokeStyle = "rgba(80,100,125,.2)"; g.lineWidth = 1;
+  for (var gx = 0; gx <= CFG.world.w; gx += 128) {
+    g.beginPath(); g.moveTo(waWX(gx), waWY(0)); g.lineTo(waWX(gx), waWY(CFG.world.h)); g.stroke();
+  }
+  for (var gy = 0; gy <= CFG.world.h; gy += 128) {
+    g.beginPath(); g.moveTo(waWX(0), waWY(gy)); g.lineTo(waWX(CFG.world.w), waWY(gy)); g.stroke();
+  }
+  var obs = W.obstacles || [], i;
+  for (i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (o.tile || o.prison || (o.kind !== "wall" && o.kind !== "low")) continue;
+    var low = o.kind === "low";
+    g.fillStyle = low ? "hsl(48,23%,68%)" : "hsl(44,28%,60%)";
+    g.globalAlpha = low ? 0.78 : 0.94;
+    g.fillRect(waWX(o.x), waWY(o.y), o.w * WA.scale, o.h * WA.scale);
+    g.globalAlpha = 1;
+    g.strokeStyle = "rgba(25,20,14,.5)"; g.strokeRect(waWX(o.x) + .5, waWY(o.y) + .5, o.w * WA.scale - 1, o.h * WA.scale - 1);
+  }
+  g.save();
+  g.beginPath();
+  for (i = 0; i < obs.length; i++) {
+    var wo2 = obs[i];
+    if (wo2.tile || wo2.prison || (wo2.kind !== "wall" && wo2.kind !== "low")) continue;
+    g.rect(waWX(wo2.x), waWY(wo2.y), wo2.w * WA.scale, wo2.h * WA.scale);
+  }
+  g.clip();
+  waDrawArt(g);
+  if (WA.drawing && WA.pts.length > 1) {
+    g.strokeStyle = WA.color; g.lineWidth = Math.max(1, WA.width * WA.scale); g.lineCap = "round";
+    g.beginPath();
+    for (i = 0; i < WA.pts.length; i++) {
+      if (i === 0) g.moveTo(waWX(WA.pts[i].x), waWY(WA.pts[i].y));
+      else g.lineTo(waWX(WA.pts[i].x), waWY(WA.pts[i].y));
+    }
+    g.stroke();
+  }
+  if (WA.start && (WA.tool === "line" || WA.tool === "curve")) {
+    g.strokeStyle = "rgba(255,220,140,.8)"; g.lineWidth = 1; g.setLineDash([5, 4]);
+    g.beginPath();
+    if (WA.tool === "line") {
+      var le = WA.hover || WA.start;
+      g.moveTo(waWX(WA.start.x), waWY(WA.start.y)); g.lineTo(waWX(le.x), waWY(le.y));
+    } else {
+      var ce = WA.hover || WA.start;
+      g.moveTo(waWX(WA.start.x), waWY(WA.start.y));
+      if (WA.ctrl) g.quadraticCurveTo(waWX(WA.ctrl.x), waWY(WA.ctrl.y), waWX(ce.x), waWY(ce.y));
+      else g.lineTo(waWX(ce.x), waWY(ce.y));
+    }
+    g.stroke(); g.setLineDash([]);
+  }
+  g.restore();
+  g.fillStyle = "rgba(200,214,240,.75)"; g.font = "12px system-ui,sans-serif";
+  g.fillText("只在墙体与建筑上显示 · 当前工具：" + ({ pen: "钢笔", brush: "笔刷", line: "直线", curve: "曲线", bucket: "油漆桶", text: "多行文字" }[WA.tool] || WA.tool), 14, h - 14);
+}
+function waCommitArt(a) {
+  if (!a) return;
+  editPushUndo();
+  if (!W.wallArt) W.wallArt = [];
+  W.wallArt.push(a);
+  EDIT.touched = true;
+  waDraw();
+}
+function waSetTool(t) {
+  WA.tool = t; WA.pts = []; WA.drawing = false; WA.start = null; WA.ctrl = null;
+  var btns = document.querySelectorAll("#waBar .waTool");
+  for (var i = 0; i < btns.length; i++) btns[i].className = "waTool" + (btns[i].getAttribute("data-watool") === t ? " on" : "");
+  waDraw();
+}
+function waOpen() {
+  var ov = document.getElementById("wallArtOverlay");
+  if (!ov) return;
+  WA.open = true; ov.className = "show"; WA.pts = []; WA.drawing = false; WA.start = null; WA.ctrl = null;
+  if (!WA.bound) waBind(); WA.bound = true;
+  setTimeout(waResize, 20); waDraw();
+}
+function waClose() {
+  WA.open = false; WA.drawing = false; WA.start = null; WA.ctrl = null;
+  var ov = document.getElementById("wallArtOverlay"); if (ov) ov.className = "";
+  var tp = document.getElementById("waTextPanel"); if (tp) tp.className = "";
+  editRebuild();
+}
+function waBind() {
+  var cv = document.getElementById("waCanvas");
+  if (!cv) return;
+  document.getElementById("waColor").addEventListener("input", function () { WA.color = this.value; });
+  document.getElementById("waWidth").addEventListener("input", function () { WA.width = parseInt(this.value, 10) || 3; });
+  var tb = document.querySelectorAll("#waBar .waTool");
+  for (var i = 0; i < tb.length; i++) {
+    (function (b) { b.addEventListener("click", function () { waSetTool(b.getAttribute("data-watool")); }); })(tb[i]);
+  }
+  document.getElementById("waUndo").addEventListener("click", function () { editUndo(); waDraw(); });
+  document.getElementById("waClear").addEventListener("click", function () {
+    editPushUndo(); W.wallArt = []; EDIT.touched = true; waDraw();
+  });
+  document.getElementById("waClose").addEventListener("click", waClose);
+  document.getElementById("waTextCancel").addEventListener("click", function () {
+    document.getElementById("waTextPanel").className = ""; WA.textPos = null;
+  });
+  document.getElementById("waTextOK").addEventListener("click", function () {
+    var txt = document.getElementById("waTextInput").value || "";
+    if (!txt.trim() || !WA.textPos) return;
+    waCommitArt({ type: "text", x: WA.textPos.x, y: WA.textPos.y, text: txt, color: WA.color, size: Math.max(10, WA.width * 6) });
+    document.getElementById("waTextPanel").className = ""; WA.textPos = null;
+  });
+  cv.addEventListener("pointerdown", function (e) {
+    e.preventDefault();
+    if (WA.tool === "text") {
+      WA.textPos = waFromEvent(e);
+      var tp = document.getElementById("waTextPanel");
+      tp.className = "show";
+      document.getElementById("waTextInput").focus();
+      return;
+    }
+    var p = waFromEvent(e);
+    if (WA.tool === "pen" || WA.tool === "brush") {
+      WA.drawing = true; WA.pts = [p];
+    } else if (WA.tool === "line") {
+      if (!WA.start) WA.start = p;
+      else { waCommitArt({ type: "line", x1: WA.start.x, y1: WA.start.y, x2: p.x, y2: p.y, color: WA.color, width: WA.width }); WA.start = null; }
+    } else if (WA.tool === "curve") {
+      if (!WA.start) WA.start = p;
+      else if (!WA.ctrl) WA.ctrl = p;
+      else { waCommitArt({ type: "curve", x1: WA.start.x, y1: WA.start.y, cx: WA.ctrl.x, cy: WA.ctrl.y, x2: p.x, y2: p.y, color: WA.color, width: WA.width }); WA.start = null; WA.ctrl = null; }
+    } else if (WA.tool === "bucket") {
+      var hit = null;
+      for (var oi = 0; oi < W.obstacles.length; oi++) {
+        var o = W.obstacles[oi];
+        if (o.tile || o.prison || (o.kind !== "wall" && o.kind !== "low")) continue;
+        if (p.x >= o.x && p.x <= o.x + o.w && p.y >= o.y && p.y <= o.y + o.h) { hit = o; break; }
+      }
+      if (hit) waCommitArt({ type: "fill", x: hit.x, y: hit.y, w: hit.w, h: hit.h, color: WA.color, alpha: 0.78 });
+      else toast("油漆桶要点在墙体或建筑上");
+    }
+    waDraw();
+  });
+  cv.addEventListener("pointermove", function (e) {
+    if (!WA.drawing && !WA.start) return;
+    var p = waFromEvent(e);
+    WA.hover = p;
+    if (WA.drawing) WA.pts.push(p);
+    waDraw();
+  });
+  cv.addEventListener("pointerup", function () {
+    if (WA.drawing) {
+      WA.drawing = false;
+      if (WA.pts.length > 1) waCommitArt({ type: "stroke", pts: WA.pts.slice(), color: WA.color, width: WA.width });
+      WA.pts = [];
+    }
+    waDraw();
+  });
+  cv.addEventListener("pointercancel", function () { WA.drawing = false; WA.pts = []; waDraw(); });
+  window.addEventListener("resize", function () { if (WA.open) waResize(); });
+}
+
+function nearestBulletLight(sx, sy, maxD) {
+  var list = W.bullets || [], best = null, bd = maxD * maxD;
+  for (var i = 0; i < list.length; i++) {
+    var b = list[i];
+    var bx = w2sx(b.x), by = w2sy(b.y);
+    var dx = bx - sx, dy = by - sy, d2 = dx * dx + dy * dy;
+    if (d2 < bd) { bd = d2; best = { b: b, x: bx, y: by, d: Math.sqrt(d2) }; }
+  }
+  return best;
+}
+function visualFxBulletPalette(b) {
+  if (b.snipe) return { core: "#e8f8ff", trail: "rgba(140,215,255,.45)", glow: "rgba(110,210,255,1)" };
+  var k = (b.owner && b.owner.kind) || "";
+  if (k === "mg") return { core: "#ffe0a0", trail: "rgba(255,170,80,.28)", glow: "rgba(255,150,60,1)" };
+  if (k === "militia") return { core: "#ffe6b0", trail: "rgba(255,195,110,.24)", glow: "rgba(255,180,95,1)" };
+  if (k === "shield") return { core: "#e8f4ff", trail: "rgba(160,215,255,.22)", glow: "rgba(130,200,255,1)" };
+  return { core: "#f4f0de", trail: "rgba(255,205,130,.22)", glow: "rgba(255,190,120,1)" };
+}
+function drawWetReflections(z) {
+  if (!CFG.visualFx.enabled || !CFG.visualFx.wetReflection) return;
+  var units = W.units || [], count = 0;
+  CTX.save();
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < units.length && count < 14; i++) {
+    var u = units[i];
+    if (u.dead) continue;
+    var k = u.kind;
+    if (!(u.hero || k === "laser" || k === "flame" || k === "sniper")) continue;
+    var sx = w2sx(u.x), sy = w2sy(u.y), rr = Math.max(2, u.r * z);
+    var col = k === "laser" ? "120,210,255" : (k === "flame" ? "255,150,70" : (u.hero ? "255,215,120" : "190,140,255"));
+    var g = CTX.createLinearGradient(sx, sy + rr * 0.2, sx, sy + rr * 3.2);
+    g.addColorStop(0, "rgba(" + col + ",.18)");
+    g.addColorStop(0.45, "rgba(" + col + ",.07)");
+    g.addColorStop(1, "rgba(" + col + ",0)");
+    CTX.fillStyle = g;
+    CTX.beginPath(); CTX.ellipse(sx, sy + rr * 1.25, rr * 0.7, rr * 1.7, 0, 0, TAU); CTX.fill();
+    count++;
+  }
+  CTX.restore();
+}
+function drawFxGrade() {
+  if (!CFG.visualFx.enabled || !CFG.visualFx.grade) return;
+  CTX.save();
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  var cx = VW * 0.5, cy = VH * 0.48;
+  var g = CTX.createRadialGradient(cx, cy, Math.min(VW, VH) * 0.24, cx, cy, Math.max(VW, VH) * 0.72);
+  g.addColorStop(0, "rgba(3,6,14,0)");
+  g.addColorStop(0.72, "rgba(3,6,14,.10)");
+  g.addColorStop(1, "rgba(2,4,10,.34)");
+  CTX.fillStyle = g;
+  CTX.fillRect(0, 0, VW, VH);
+  CTX.fillStyle = "rgba(120,160,255,.025)";
+  CTX.fillRect(0, 0, VW, VH);
+  CTX.restore();
+}
+function nearestLightSource(sx, sy, maxD) {
+  var best = null, bd = maxD * maxD;
+  var list = W.bullets || [], i;
+  for (i = 0; i < list.length; i++) {
+    var b = list[i];
+    var bx = w2sx(b.x), by = w2sy(b.y), dx = bx - sx, dy = by - sy, d2 = dx * dx + dy * dy;
+    if (d2 < bd) { bd = d2; best = { x: bx, y: by, d: Math.sqrt(d2), color: visualFxBulletPalette(b).glow, kind: "bullet" }; }
+  }
+  var fl = W.flashes || [];
+  for (i = 0; i < fl.length; i++) {
+    var f = fl[i];
+    if (!(f.life > 0)) continue;
+    var fx = w2sx(f.x), fy = w2sy(f.y), fdx = fx - sx, fdy = fy - sy, fd2 = fdx * fdx + fdy * fdy;
+    if (fd2 < bd) { bd = fd2; best = { x: fx, y: fy, d: Math.sqrt(fd2), color: f.snipe ? "rgba(110,210,255,1)" : "rgba(255,190,110,1)", kind: "flash" }; }
+  }
+  var us = W.units || [];
+  for (i = 0; i < us.length; i++) {
+    var u = us[i];
+    if (u.dead || u.kind !== "laser" || u.laserPhase !== 1) continue;
+    var spec = laserBeamSpec(u), len = (u.laserLen > 0) ? Math.min(u.laserLen, spec.len) : spec.len;
+    var ex = w2sx(u.x), ey = w2sy(u.y), tx = w2sx(u.x + Math.cos(u.laserAng) * len), ty = w2sy(u.y + Math.sin(u.laserAng) * len);
+    var vx = tx - ex, vy = ty - ey, vl = vx * vx + vy * vy || 1;
+    var t = ((sx - ex) * vx + (sy - ey) * vy) / vl; t = Math.max(0, Math.min(1, t));
+    var lx = ex + vx * t, ly = ey + vy * t, ldx = lx - sx, ldy = ly - sy, ld2 = ldx * ldx + ldy * ldy;
+    if (ld2 < bd) { bd = ld2; best = { x: lx, y: ly, d: Math.sqrt(ld2), color: "rgba(110,220,255,1)", kind: "laser" }; }
+  }
+  return best;
+}
+function drawTyrantPreview(z) {
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead || u.kind !== "tyrant" || u.tyState !== "charge") continue;
+    var D = CFG.tyrant;
+    var pr = clamp(1 - u.tyChargeT / D.chargeTime, 0, 1);
+    var len = u.tyDashLen || CFG.fearRCivilian;
+    var ca = Math.cos(u.tyAng), sa = Math.sin(u.tyAng);
+    var x1 = u.x + ca * u.r, y1 = u.y + sa * u.r;
+    var x2 = u.x + ca * len, y2 = u.y + sa * len;
+    var nx = -sa, ny = ca;
+    var half = Math.max(10, u.r * 0.9 * z);
+    var ax = w2sx(x1), ay = w2sy(y1), bx = w2sx(x2), by = w2sy(y2);
+    var hx = nx * half, hy = ny * half;
+    var g = CTX.createLinearGradient(ax, ay, bx, by);
+    g.addColorStop(0, "rgba(255,60,35," + (0.20 * pr).toFixed(3) + ")");
+    g.addColorStop(0.72, "rgba(255,120,55," + (0.30 * pr).toFixed(3) + ")");
+    g.addColorStop(1, "rgba(255,185,100," + (0.11 * pr).toFixed(3) + ")");
+    CTX.fillStyle = g;
+    CTX.beginPath();
+    CTX.moveTo(ax + hx, ay + hy); CTX.lineTo(bx + hx, by + hy);
+    CTX.lineTo(bx - hx, by - hy); CTX.lineTo(ax - hx, ay - hy);
+    CTX.closePath(); CTX.fill();
+    CTX.strokeStyle = "rgba(255,130,65," + (0.65 * pr).toFixed(3) + ")";
+    CTX.lineWidth = 1.4;
+    CTX.stroke();
+    /* 前端箭头，明确冲撞终点 */
+    var ex = bx, ey = by;
+    CTX.fillStyle = "rgba(255,190,110," + (0.72 * pr).toFixed(3) + ")";
+    CTX.beginPath();
+    CTX.moveTo(ex + ca * 16, ey + sa * 16);
+    CTX.lineTo(ex - ca * 10 + nx * 10, ey - sa * 10 + ny * 10);
+    CTX.lineTo(ex - ca * 10 - nx * 10, ey - sa * 10 - ny * 10);
+    CTX.closePath(); CTX.fill();
+  }
+}
+function drawBloodOrbs(z) {
+  var L = W.bloodOrbs;
+  if (!L || !L.length) return;
+  CTX.save();
+  CTX.globalCompositeOperation = "lighter";
+  for (var i = 0; i < L.length; i++) {
+    var o = L[i], ox = w2sx(o.x), oy = w2sy(o.y);
+    if (!vis(ox, oy, 80)) continue;
+    var tr = o.trail || [];
+    for (var j = 0; j < tr.length; j += 2) {
+      var tx = w2sx(tr[j]), ty = w2sy(tr[j + 1]);
+      var a = (j + 2) / Math.max(2, tr.length);
+      CTX.strokeStyle = "rgba(255," + Math.round(45 + 80 * a) + ",35," + (0.32 * a).toFixed(3) + ")";
+      CTX.lineWidth = Math.max(2, 9 * z * a);
+      CTX.beginPath(); CTX.moveTo(tx, ty); CTX.lineTo(ox, oy); CTX.stroke();
+    }
+    CTX.fillStyle = "rgba(255,45,45,.92)";
+    CTX.beginPath(); CTX.arc(ox, oy, Math.max(2.2, 7 * z), 0, TAU); CTX.fill();
+    CTX.fillStyle = "rgba(255,220,180,.95)";
+    CTX.beginPath(); CTX.arc(ox, oy, Math.max(1, 2.6 * z), 0, TAU); CTX.fill();
+  }
+  CTX.globalCompositeOperation = "source-over";
+  CTX.restore();
+}
+function drawTyrantUnit(u, ux, uy, ur, z) {
+  var D = CFG.tyrant;
+  var charging = u.tyState === "charge";
+  var dashing = u.tyState === "dash" || u.tyState === "backstep";
+  var p = charging ? clamp(1 - u.tyChargeT / D.chargeTime, 0, 1) : 0;
+  if (dashing) {
+    for (var ti = 1; ti <= 4; ti++) {
+      var tx = ux - Math.cos(u.tyAng) * ur * ti * 0.8;
+      var ty = uy - Math.sin(u.tyAng) * ur * ti * 0.8;
+      CTX.globalAlpha = 0.16 / ti;
+      CTX.fillStyle = "#d33a32";
+      CTX.beginPath(); CTX.arc(tx, ty, Math.max(1, ur * (1 - ti * 0.16)), 0, TAU); CTX.fill();
+    }
+    CTX.globalAlpha = 1;
+  }
+  if (charging) {
+    CTX.save();
+    CTX.globalCompositeOperation = "lighter";
+    var aura = ur * (1.35 + 0.35 * p);
+    CTX.strokeStyle = "rgba(255,75,45,.55)";
+    CTX.lineWidth = Math.max(2, 4 * z);
+    CTX.beginPath(); CTX.arc(ux, uy, aura, 0, TAU); CTX.stroke();
+    for (var ci = 0; ci < 8; ci++) {
+      var a = TAU * ci / 8 + W.t * 1.6;
+      var r1 = ur * (2.2 - 0.7 * p), r2 = ur * 1.05;
+      CTX.strokeStyle = "rgba(255,115,60," + (0.30 + 0.45 * p).toFixed(2) + ")";
+      CTX.lineWidth = Math.max(1, 2.2 * z);
+      CTX.beginPath();
+      CTX.moveTo(ux + Math.cos(a) * r1, uy + Math.sin(a) * r1);
+      CTX.lineTo(ux + Math.cos(a) * r2, uy + Math.sin(a) * r2);
+      CTX.stroke();
+    }
+    CTX.restore();
+  }
+  var body = u.hitFlash > 0 ? "#ffffff" : (CFG.unit.tyrant.color || "#d65a5a");
+  CTX.fillStyle = "rgba(35,10,12,.55)";
+  CTX.beginPath(); CTX.arc(ux + 3 * z, uy + 4 * z, ur * 1.02, 0, TAU); CTX.fill();
+  CTX.fillStyle = body;
+  CTX.beginPath(); CTX.arc(ux, uy, ur, 0, TAU); CTX.fill();
+  CTX.fillStyle = "rgba(80,18,24,.9)";
+  CTX.beginPath(); CTX.arc(ux, uy, ur * 0.62, 0, TAU); CTX.fill();
+  /* 四根骨刺 */
+  CTX.fillStyle = body;
+  for (var si = 0; si < 4; si++) {
+    var sa2 = TAU * si / 4 + Math.PI / 4;
+    CTX.save(); CTX.translate(ux, uy); CTX.rotate(sa2);
+    CTX.beginPath(); CTX.moveTo(ur * 0.82, -ur * 0.18);
+    CTX.lineTo(ur * 1.38, 0); CTX.lineTo(ur * 0.82, ur * 0.18);
+    CTX.closePath(); CTX.fill(); CTX.restore();
+  }
+  /* 浅色双眼 */
+  CTX.fillStyle = "rgba(255,235,190,.95)";
+  CTX.beginPath(); CTX.arc(ux - ur * 0.22, uy - ur * 0.12, Math.max(2, ur * 0.11), 0, TAU); CTX.fill();
+  CTX.beginPath(); CTX.arc(ux + ur * 0.22, uy - ur * 0.12, Math.max(2, ur * 0.11), 0, TAU); CTX.fill();
+  if (u.tyState === "reposition") {
+    CTX.save();
+    CTX.setLineDash([Math.max(4, 6 * z), Math.max(3, 4 * z)]);
+    CTX.strokeStyle = "rgba(255,196,90,.8)";
+    CTX.lineWidth = Math.max(1.5, 2.5 * z);
+    CTX.beginPath(); CTX.arc(ux, uy, ur + Math.max(8, 12 * z), 0, TAU); CTX.stroke();
+    CTX.setLineDash([]);
+    CTX.fillStyle = "rgba(255,224,160,.95)";
+    CTX.font = "bold " + Math.max(10, Math.round(12 * z)) + "px system-ui, sans-serif";
+    CTX.textAlign = "center";
+    CTX.textBaseline = "bottom";
+    CTX.fillText("绕行", ux, uy - ur - Math.max(8, 10 * z));
+    CTX.restore();
+  }
+  if (u.tyrantShieldHp > 0) {
+    CTX.strokeStyle = "rgba(255,100,45,.55)";
+    CTX.lineWidth = Math.max(1.5, 3 * z);
+    CTX.beginPath(); CTX.arc(ux, uy, ur + 4 * z, 0, TAU); CTX.stroke();
+  }
+  if (u.tyrantInvuln) {
+    CTX.strokeStyle = "rgba(255,235,190,.9)";
+    CTX.lineWidth = Math.max(2, 3.5 * z);
+    CTX.beginPath(); CTX.arc(ux, uy, ur + 8 * z, 0, TAU); CTX.stroke();
+    CTX.strokeStyle = "rgba(255,90,65,.45)";
+    CTX.lineWidth = 1.5;
+    CTX.beginPath(); CTX.arc(ux, uy, ur + 16 * z, 0, TAU); CTX.stroke();
+  }
+}
+function drawPlagueNestUnit(u, ux, uy, ur, z) {
+  CTX.save();
+  CTX.fillStyle = u.hitFlash > 0 ? "#ffffff" : (CFG.unit.plagueNest.color || "#7d4f9e");
+  CTX.beginPath(); CTX.arc(ux, uy, ur, 0, TAU); CTX.fill();
+  CTX.fillStyle = "rgba(48,22,66,.75)";
+  CTX.beginPath(); CTX.arc(ux, uy, ur * 0.72, 0, TAU); CTX.fill();
+  CTX.strokeStyle = "rgba(210,170,255,.65)";
+  CTX.lineWidth = Math.max(1, 2.4 * z);
+  CTX.beginPath(); CTX.arc(ux, uy, ur * 0.92, 0, TAU); CTX.stroke();
+  for (var i = 0; i < 10; i++) {
+    var a = TAU * i / 10 + W.t * 0.08;
+    var rr = ur * (0.62 + 0.08 * Math.sin(W.t * 2 + i));
+    CTX.fillStyle = "rgba(188,138,225,.65)";
+    CTX.beginPath(); CTX.arc(ux + Math.cos(a) * rr, uy + Math.sin(a) * rr, Math.max(2, ur * 0.055), 0, TAU); CTX.fill();
+  }
+  CTX.fillStyle = "#d9ffb8";
+  CTX.beginPath(); CTX.arc(ux - ur * 0.18, uy - ur * 0.08, Math.max(2, ur * 0.08), 0, TAU); CTX.arc(ux + ur * 0.18, uy - ur * 0.08, Math.max(2, ur * 0.08), 0, TAU); CTX.fill();
+  if (u.tempHp > 0) {
+    CTX.strokeStyle = "rgba(180,255,150,.9)"; CTX.lineWidth = Math.max(1, ur * 0.04);
+    CTX.beginPath(); CTX.arc(ux, uy, ur + 4, 0, TAU); CTX.stroke();
+  }
+  CTX.restore();
+}
+function drawNestEggUnit(u, ux, uy, ur, z) {
+  var pulse = 1 + 0.06 * Math.sin(W.t * 5 + u.id);
+  CTX.save();
+  CTX.fillStyle = u.hitFlash > 0 ? "#ffffff" : "rgba(150,210,120,.9)";
+  CTX.beginPath(); CTX.ellipse(ux, uy, ur * 1.05 * pulse, ur * 1.3 * pulse, 0, 0, TAU); CTX.fill();
+  CTX.strokeStyle = "rgba(55,110,65,.9)"; CTX.lineWidth = 1.5;
+  CTX.beginPath(); CTX.ellipse(ux, uy, ur * 1.05 * pulse, ur * 1.3 * pulse, 0, 0, TAU); CTX.stroke();
+  CTX.strokeStyle = "rgba(70,120,70,.55)"; CTX.lineWidth = 1;
+  CTX.beginPath(); CTX.moveTo(ux - ur * 0.45, uy - ur * 0.8); CTX.lineTo(ux - ur * 0.15, uy - ur * 0.1); CTX.lineTo(ux - ur * 0.5, uy + ur * 0.5); CTX.stroke();
+  var hp = u.eggHatch > 0 ? 1 - u.eggHatch / (CFG.plagueNest.eggHatch || 3) : 1;
+  CTX.strokeStyle = "rgba(220,255,180,.9)"; CTX.lineWidth = 2;
+  CTX.beginPath(); CTX.arc(ux, uy, ur + 5, -Math.PI / 2, -Math.PI / 2 + TAU * Math.min(1, hp)); CTX.stroke();
+  CTX.restore();
+}
+function drawBossBar() {
+  if (HIDE_UI || RENDER_NO_HUD) return;
+  var bosses = [];
+  for (var bi = 0; bi < W.units.length; bi++) {
+    var bu = W.units[bi];
+    if (!bu.dead && isBossUnit(bu)) bosses.push(bu);
+  }
+  if (!bosses.length) return;
+  var tb = document.getElementById("top");
+  var topH = (tb && tb.offsetHeight) ? tb.offsetHeight : 56;
+  var w = Math.min(640, VW - 40);
+  if (VW < 760) w = Math.max(220, VW - 28);
+  var h = 8, x = (VW - w) / 2;
+  CTX.save();
+  CTX.globalAlpha = 1;
+  CTX.globalCompositeOperation = "source-over";
+  for (var bi2 = 0; bi2 < bosses.length; bi2++) {
+    var b = bosses[bi2];
+    var y = topH + 42 + bi2 * 30;
+    CTX.fillStyle = "rgba(8,5,8,.82)";
+    CTX.fillRect(x - 2, y - 2, w + 4, h + 4);
+    CTX.fillStyle = "rgba(58,10,20,.95)";
+    CTX.fillRect(x, y, w, h);
+    var k = Math.max(0, Math.min(1, b.hp / b.maxHp));
+    /* 先画真实血量，护盾再覆盖在上面；护盾减少时血量自然露出来 */
+    CTX.fillStyle = "rgba(220,45,60,.98)";
+    CTX.fillRect(x, y, w * k, h);
+    var sh = Math.max(0, b.energyShieldHp || 0);
+    if (sh > 0) {
+      /* 护盾容量条按自身容量上限归一化：满盾时铺满，受伤后实时缩短；
+         不再等护盾彻底破碎才整条消失 */
+      var shk = Math.max(0, Math.min(1, sh / Math.max(1, b.energyShieldMax || sh)));
+      CTX.fillStyle = "rgba(150,235,105,.94)";
+      CTX.fillRect(x, y, w * shk, h);
+      CTX.fillStyle = "rgba(228,255,190,.78)";
+      CTX.fillRect(x, y, w * shk, Math.max(1, h * 0.34));
+    }
+    if (b.kind === "tyrant" && b.tyrantShieldHp > 0) {
+      var osk = Math.max(0, Math.min(1, b.tyrantShieldHp / Math.max(1, b.tyrantShieldMax || b.tyrantShieldHp)));
+      CTX.fillStyle = "rgba(255,105,45,.92)";
+      CTX.fillRect(x, y, w * osk, h);
+      CTX.fillStyle = "rgba(255,205,150,.78)";
+      CTX.fillRect(x, y, w * osk, Math.max(1, h * 0.34));
+    }
+    CTX.strokeStyle = "rgba(255,150,160,.8)"; CTX.lineWidth = 1;
+    CTX.strokeRect(x + .5, y + .5, w - 1, h - 1);
+    /* 四根细黑线：巢主用递减阶段宽度，其他首领仍均分五段 */
+    CTX.strokeStyle = "rgba(8,6,8,.9)"; CTX.lineWidth = 2;
+    if (b.kind === "plagueNest" && CFG.plagueNest.segPct) {
+      var sw = CFG.plagueNest.segPct.slice().reverse();
+      var cumW = 0;
+      for (var si2 = 0; si2 < 4; si2++) {
+        cumW += sw[si2] || 0;
+        var lx2 = x + w * cumW;
+        CTX.beginPath(); CTX.moveTo(lx2, y); CTX.lineTo(lx2, y + h); CTX.stroke();
+      }
+    } else {
+      for (var i = 1; i < 5; i++) {
+        var lx = x + w * i / 5;
+        CTX.beginPath(); CTX.moveTo(lx, y); CTX.lineTo(lx, y + h); CTX.stroke();
+      }
+    }
+    CTX.fillStyle = "rgba(255,225,230,.98)";
+    CTX.font = "700 12px system-ui,'Microsoft YaHei',sans-serif";
+    CTX.textAlign = "left"; CTX.textBaseline = "bottom";
+    CTX.fillText((CFG.unit[b.kind] && CFG.unit[b.kind].name) || "首领", x, y - 4);
+    CTX.textAlign = "right";
+    var hpTxt = Math.max(0, Math.ceil(b.hp)) + " / " + Math.round(b.maxHp);
+    CTX.fillText(hpTxt, x + w, y - 4);
+    /* 临时护盾数值贴在总血量左侧，颜色与覆盖血条的护盾条一致 */
+    var shVal = 0, shCol = "";
+    if (b.kind === "tyrant" && b.tyrantShieldHp > 0) {
+      shVal = b.tyrantShieldHp; shCol = "rgba(255,105,45,1)";
+    } else if ((b.energyShieldHp || 0) > 0) {
+      shVal = b.energyShieldHp; shCol = "rgba(150,235,105,1)";
+    }
+    if (shVal > 0) {
+      var hpW = CTX.measureText(hpTxt).width;
+      CTX.fillStyle = shCol;
+      CTX.fillText("(" + Math.ceil(shVal) + ")", x + w - hpW - 6, y - 4);
+    }
+  }
+  CTX.restore();
+}
+function drawBossFx(z) {
+  var list = W.bossFx || [];
+  for (var i = 0; i < list.length; i++) {
+    var f = list[i], k = Math.min(1, (f.t || 0) / (f.life || 1));
+    var sx2 = w2sx(f.x), sy2 = w2sy(f.y);
+    if (!vis(sx2, sy2, 500)) continue;
+    if (f.kind === "tyrantDeath") {
+      CTX.globalAlpha = Math.max(0, 1 - k);
+      CTX.fillStyle = "rgba(255,90,30,.34)";
+      CTX.beginPath(); CTX.arc(sx2, sy2, (120 + k * 700) * z, 0, TAU); CTX.fill();
+      CTX.fillStyle = "rgba(255,180,70,.22)";
+      CTX.beginPath(); CTX.arc(sx2, sy2, (70 + k * 460) * z, 0, TAU); CTX.fill();
+      for (var di4 = 0; di4 < 22; di4++) {
+        var da4 = TAU * di4 / 22 + 0.2;
+        var dd4 = (70 + k * 620) * z;
+        CTX.fillStyle = di4 % 3 === 0 ? "rgba(60,28,24,.82)" : "rgba(255,145,55,.72)";
+        CTX.fillRect(sx2 + Math.cos(da4) * dd4, sy2 + Math.sin(da4) * dd4 * 0.55, 7 * z, 7 * z);
+      }
+      CTX.globalAlpha = 1;
+    } else if (f.kind === "death") {
+      CTX.globalAlpha = Math.max(0, 1 - k);
+      CTX.fillStyle = "rgba(255,130,40,.38)";
+      CTX.beginPath(); CTX.arc(sx2, sy2, (80 + k * 420) * z, 0, TAU); CTX.fill();
+      CTX.fillStyle = "rgba(190,240,100,.28)";
+      CTX.beginPath(); CTX.arc(sx2, sy2, (50 + k * 300) * z, 0, TAU); CTX.fill();
+      for (var di3 = 0; di3 < 16; di3++) {
+        var da3 = TAU * di3 / 16 + 0.3;
+        var dd3 = (40 + k * 300) * z;
+        CTX.fillStyle = di3 % 3 === 0 ? "rgba(60,45,70,.8)" : "rgba(190,245,110,.65)";
+        CTX.fillRect(sx2 + Math.cos(da3) * dd3, sy2 + Math.sin(da3) * dd3 * 0.55, 5 * z, 5 * z);
+      }
+      CTX.globalAlpha = 1;
+    } else {
+      var vr = f.visualR || 260;
+      CTX.globalAlpha = Math.max(0, 1 - k) * 0.22;
+      CTX.fillStyle = f.kind === "eggBurst" ? "rgba(150,255,150,.8)" : "rgba(140,255,30,.9)";
+      CTX.beginPath(); CTX.arc(sx2, sy2, (f.kind === "eggBurst" ? 70 : vr) * k * z, 0, TAU); CTX.fill();
+      CTX.globalAlpha = Math.max(0, 1 - k) * 0.95;
+      CTX.strokeStyle = f.kind === "eggBurst" ? "rgba(190,255,180,.95)" : "rgba(170,255,50,1)";
+      CTX.lineWidth = 5;
+      CTX.beginPath(); CTX.arc(sx2, sy2, (30 + k * (f.kind === "eggBurst" ? 120 : vr)) * z, 0, TAU); CTX.stroke();
+      CTX.globalAlpha = 1;
+    }
+  }
+}
+function stepBossFx(dt) {
+  var list = W.bossFx;
+  if (!list || !list.length) return;
+  for (var i = list.length - 1; i >= 0; i--) {
+    list[i].t = (list[i].t || 0) + dt;
+    if (list[i].t > (list[i].life || 1)) list.splice(i, 1);
+  }
+}
+/* 屏幕中下方长条：按兵种颜色实时展示各兵种在场占比 */
+var RATIO_KINDS = ["zombie", "mother", "civilian", "rifle", "militia", "mg"];
+function drawRatioBar() {
+  if (HIDE_UI || RENDER_NO_HUD) return;
+  var mobile = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  var base = ["zombie", "runner", "licker", "bomber", "mother", "civilian",
+              "rifle", "mg", "sniper", "shield", "medic", "cryo", "flame", "tesla", "laser"];
+  var kinds = base.slice(), seen = {}, i, j;
+  for (i = 0; i < kinds.length; i++) seen[kinds[i]] = 1;
+  for (i = 0; i < W.units.length; i++) {
+    var k0 = W.units[i].kind;
+    if (!seen[k0] && CFG.unit[k0]) { seen[k0] = 1; kinds.push(k0); }
+  }
+  var counts = [], total = 0;
+  for (i = 0; i < kinds.length; i++) counts.push(0);
+  for (i = 0; i < W.units.length; i++) {
+    var k = W.units[i].kind, idx = kinds.indexOf(k);
+    if (idx >= 0) { counts[idx]++; total++; }
+  }
+  var bw = mobile ? Math.min(VW * 0.40, 320) : Math.min(VW * 0.62, 640);
+  var bh = mobile ? 10 : 20;
+  var bx = (VW - bw) / 2;
+  var by = VH - (BOTBAR_H || 90) - (mobile ? 14 : 28);
+  var zomN = counts[0] + counts[1] + counts[2] + counts[3] + counts[4];
+  var humanN = total - zomN;
+  if (CFG.minimalStats !== false) {
+    CTX.fillStyle = "rgba(8,10,18,0.55)";
+    CTX.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+    var zx = total > 0 ? bw * zomN / total : 0;
+    if (zx > 0) { CTX.fillStyle = "#9b6bd1"; CTX.fillRect(bx, by, zx, bh); }
+    if (zx < bw) { CTX.fillStyle = "#79b879"; CTX.fillRect(bx + zx, by, bw - zx, bh); }
+    /* 极简条内直接标出双方数量：占比之外还要能读到具体人头 */
+    CTX.font = "700 " + (mobile ? 10 : 11) + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+    CTX.textAlign = "center";
+    CTX.textBaseline = "middle";
+    CTX.fillStyle = "rgba(10,12,18,0.88)";
+    if (zx > 26 && zomN > 0) CTX.fillText(String(zomN), bx + zx / 2, by + bh / 2 + 0.5);
+    if (bw - zx > 26 && humanN > 0) CTX.fillText(String(humanN), bx + zx + (bw - zx) / 2, by + bh / 2 + 0.5);
+    CTX.strokeStyle = "rgba(120,140,180,0.45)";
+    CTX.lineWidth = 1;
+    CTX.strokeRect(bx, by, bw, bh);
+    CTX.fillStyle = "rgba(210,220,240,0.85)";
+    CTX.font = (mobile ? 9 : 11) + "px sans-serif";
+    CTX.textAlign = "right";
+    CTX.textBaseline = "middle";
+    var zp = total > 0 ? Math.round(zomN / total * 100) : 0;
+    CTX.fillText("丧尸 " + zp + "% · 人类 " + (total > 0 ? 100 - zp : 0) + "%", bx + bw, by - 7);
+    CTX.textAlign = "left";
+    CTX.textBaseline = "alphabetic";
+    return;
+  }
+  CTX.fillStyle = "rgba(8,10,18,0.55)";
+  CTX.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+  CTX.font = (mobile ? 10 : 11) + "px sans-serif";
+  CTX.textAlign = "center";
+  CTX.textBaseline = "middle";
+  var x = bx;
+  for (j = 0; j < kinds.length; j++) {
+    if (counts[j] === 0 || total === 0) continue;
+    var seg = bw * (counts[j] / total);
+    CTX.fillStyle = CFG.unit[kinds[j]] ? CFG.unit[kinds[j]].color : "#888";
+    CTX.fillRect(x, by, seg, bh);
+    if (seg > 22) {
+      CTX.fillStyle = "rgba(0,0,0,0.82)";
+      CTX.fillText(String(counts[j]), x + seg / 2, by + bh / 2 + 0.5);
+    }
+    x += seg;
+  }
+  CTX.strokeStyle = "rgba(120,140,180,0.45)";
+  CTX.lineWidth = 1;
+  CTX.strokeRect(bx, by, bw, bh);
+  CTX.fillStyle = "rgba(200,214,240,0.80)";
+  CTX.textAlign = "right";
+  /* 只保留总数与两侧汇总，细兵种用颜色区分，避免手机上再铺一排字 */
+  CTX.fillText("丧尸 " + zomN + " · 人类 " + (total - zomN) + " · 总计 " + total, bx + bw, by - 7);
+  CTX.textAlign = "left";
+  CTX.textBaseline = "alphabetic";
+}
+/* ------------------------------ 15. 存档 --------------------------------- */
+function serialize() {
+  var s = { v: 1, seed: W.seed, rng: RNG.s, t: W.t, res: W.resources, nid: W.nextId,
+    kills: W.kills, inf: W.infected, over: W.over, result: W.result,
+    cam: [CAM.x, CAM.y, CAM.zoom], obs: [], doors: [], units: [], bul: [], posts: [], zones: [], spawners: [], holds: [], tiles: [] };
+  var i, p;
+  for (i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    s.obs.push([o.x, o.y, o.w, o.h, o.hue, o.sat, o.lit, o.kind === "low" ? 1 : 0, o.destructible ? 1 : 0, o.hp || 0, o.tile ? 1 : 0]);
+  }
+  for (i = 0; i < W.doors.length; i++) {
+    var dr = W.doors[i];
+    s.doors.push([dr.x, dr.y, dr.w, dr.h, dr.vertical ? 1 : 0]);
+  }
+  for (i = 0; i < (W.zones || []).length; i++) {
+    var zn = W.zones[i];
+    s.zones.push([zn.x, zn.y, zn.w, zn.h, zn.type === "burn" ? 1 : 0, zn.slow || 0, zn.dps || 0]);
+  }
+  for (i = 0; i < (W.spawners || []).length; i++) {
+    var sp = W.spawners[i];
+    s.spawners.push([sp.x, sp.y, sp.w, sp.h, sp.kind || "zombie", sp.interval || 3, sp.limit || 0, sp.count || 0, sp.t || 0]);
+  }
+  for (i = 0; i < (W.holds || []).length; i++) {
+    var hd = W.holds[i];
+    s.holds.push([hd.x, hd.y, hd.w, hd.h, hd.r || 80, hd.owner || "", hd.prog || 0]);
+  }
+  for (i = 0; i < (W.tiles || []).length; i++) {
+    var tl = W.tiles[i];
+    s.tiles.push([tl.x, tl.y, tl.w, tl.h, tl.color || "#3a4a56", tl.alpha || 0.5, tl.slow || 0, tl.dps || 0, tl.solid ? 1 : 0, tl.pierce ? 1 : 0, tl.hp || 0, tl.maxHp || 0, tl.pattern || "solid", tl.group || ""]);
+  }
+  s.art = W.wallArt || [];
+  var postIdx = {};
+  for (i = 0; i < W.posts.length; i++) {
+    p = W.posts[i];
+    s.posts.push([p.x, p.y, p.taken ? p.taken.id : 0]);
+  }
+  for (i = 0; i < W.posts.length; i++) {
+    p = W.posts[i];
+    if (p.taken) postIdx[p.taken.id] = i;
+  }
+  for (i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    var pi = u.post && u.post.taken === u ? (postIdx[u.id] === undefined ? -1 : postIdx[u.id]) : -1;
+    /* 坐标与速度必须存全精度：取整到 0.01 会在读档瞬间引入亚像素误差，
+       之后的推演就会一路偏移，重演也就复现不了 */
+    s.units.push([u.id, u.kind, u.x, u.y, u.vx, u.vy,
+      u.hp, u.infectT, u.infectLocked ? 1 : 0, u.fadeT, u.pounceT, u.pounceCd, pi,
+      u.mag, u.reloading ? 1 : 0, Math.round(u.reloadT * 100) / 100,
+      u.defend ? Math.round(u.defend.x) : -1, u.defend ? Math.round(u.defend.y) : -1,
+      Math.round(u.incubT * 100) / 100,
+      /* 第 19 项：复现所需的全部计时器与瞬时状态。
+         少了这些，读档后每个单位的行为节奏都会和存档那一刻错开，
+         重新推演就必然走上另一条时间线，读档也就失去了意义 */
+      {
+        pT: u.pathT, rt: u.retargetT,
+        fF: u.fireFarT, fN: u.fireNearT,
+        dT: u.dirT, mT: u.mateT,
+        ls: u.laneSlot, fT: u.formT,
+        tg: (u.target && !u.target.dead) ? u.target.id : 0,
+        hT: u.herdT, hH: u.herdHit ? 1 : 0,
+        rT: u.recoilT, vb: u.vmaxBoost, bT: u.boostT,
+        slT: u.slowT, rcT: u.recoverT, snT: u.stunT,
+        lfT: u.lastFireT, sT: u.sniperT, iF: u.idleFireT,
+        gu: u.giveUpTo ? u.giveUpTo.id : 0,
+        guT: u.giveUpT,
+        /* 朝向与瞄准：不存的话读档后所有人会回到随机朝向，
+           枪口位置、开火方向全变，重演立刻走样 */
+        fa: u.faceAng, aa: u.aimAng, aT: u.aimT,
+        wT: u.wanderT, wA: u.wanderAng,
+        skT: u.stuckT,
+        /* 护卫关系：谁在保护谁。不存的话读档后"保平民"这条行为链整个消失 */
+        gs: u.guards ? u.guards.map(function (g) { return g.id; }) : null,
+        go2: u.guardOf ? u.guardOf.id : 0,
+        /* 当前寻路路径。不存的话读档后所有人都是"无路径"状态，
+           会直接朝目标直线冲，和存档那一刻走的完全不是一条路 */
+        pth: (u.path && u.path.length) ? u.path.map(function (p) { return [Math.round(p.x), Math.round(p.y)]; }) : null,
+        /* 各种缓存与放弃记录，它们决定"这一帧要不要重新决策" */
+        nz: u.nzCache ? u.nzCache.id : 0,
+        mO: u.mateOk, mX: u.mateX, mY: u.mateY, dO: u.dirOk,
+        guR: u.giveUpRev, guX: u.giveUpX, guY: u.giveUpY, guH: u.giveUpHold, guC: u.giveUpCount,
+        /* 计时器一律全精度 */
+        p2: u.pathT, r2: u.retargetT, f1: u.fireFarT, f2: u.fireNearT,
+        d2: u.dirT, m2: u.mateT, h2: u.herdT, s2: u.sniperT, i2: u.idleFireT,
+        /* 1.3.3 新兵种状态：受冻/点燃/磁爆节奏/激光相位。少一个都会让读档后的节奏错位 */
+        cr: u.cryoT, ck: u.chillT, fb: u.frozen ? 1 : 0,
+        bt: u.burnT, b2: u.burnTickT,
+        ts: u.teslaBurst, tt: u.teslaT, tc: u.teslaCdT, za: u.zapT,
+        lp: u.laserPhase, lt: u.laserT, la: u.laserAng, lw: u.laserSweeps, lc: u.laserCdT
+      }]);
+  }
+  s.squadT = W.squadT;
+  s.squadArmed = W.squadArmed || 0;
+  s.bulletSeq = W.bulletSeq;
+  s.ws = { ahm: W.armedHadMany, chm: W.civHadMany, hc: W.hadCivilians ? 1 : 0 };
+  /* 波次进度也要存：读档时如果把"还没刷出来的波次"丢了，
+     场上刚好空着就会立刻判胜，等于一读档就通关 */
+  s.wv = W.waves ? { left: W.waves.left, gap: W.waves.gap, size: W.waves.size,
+    t: Math.round(W.waves.t * 100) / 100, idx: W.waves.idx } : null;
+  /* 1.3.3 新兵种留在场上的东西：飞行中的液氮罐、寒冷圈、火墙。
+     不存的话读档瞬间整片战场会"解冻"，正在挨冻的尸群立刻满速 */
+  s.cryoPots = [];
+  for (i = 0; i < W.cryoPots.length; i++) {
+    var cp = W.cryoPots[i];
+    s.cryoPots.push([cp.x, cp.y, cp.z, cp.vx, cp.vy, cp.vz, cp.spin, cp.spinV,
+      cp.t, cp.T, cp.owner ? cp.owner.id : 0, cp.hero]);
+  }
+  s.cryoFields = [];
+  for (i = 0; i < W.cryoFields.length; i++) {
+    var cf = W.cryoFields[i];
+    s.cryoFields.push([cf.x, cf.y, cf.r, cf.t, cf.life,
+      cf.owner ? cf.owner.id : 0, cf.hero, cf.seed]);
+  }
+  /* 火焰落地片区：读档之后火墙还在烧，不会凭空灭掉 */
+  s.firePatches = [];
+  for (i = 0; i < W.firePatches.length; i++) {
+    var fp2 = W.firePatches[i];
+    s.firePatches.push([fp2.x, fp2.y, fp2.r, fp2.t, fp2.life, fp2.tickT,
+      fp2.owner ? fp2.owner.id : 0, fp2.hero, fp2.seed, fp2.hue]);
+  }
+  for (i = 0; i < W.bullets.length; i++) {
+    var b = W.bullets[i];
+    /* owner 决定"谁的子弹"，不存的话读档后子弹会六亲不认 */
+    s.bul.push([b.x, b.y, b.px, b.py, b.vx, b.vy, b.life, b.dmg,
+      b.owner ? b.owner.id : 0, b.wmul || 1, b.chain ? 1 : 0, b.snipe ? 1 : 0]);
+  }
+  return s;
+}
+function deserialize(s) {
+  if (!s || s.v !== 1) throw new Error("存档版本不兼容");
+  resetWorld(s.seed);
+  W.seed = s.seed; RNG.s = s.rng >>> 0;
+  W.t = s.t; W.resources = s.res; W.kills = s.kills || 0; W.infected = s.inf || 0;
+  W.over = !!s.over; W.result = s.result || "";
+  /* 旧存档没有这些集合：统一补空数组，后续逻辑不必逐处判空 */
+  if (!W.zones) W.zones = [];
+  if (!W.tiles) W.tiles = [];
+  if (!W.spawners) W.spawners = [];
+  if (!W.holds) W.holds = [];
+  W.waves = s.wv ? { left: s.wv.left, gap: s.wv.gap, size: s.wv.size, t: s.wv.t, idx: s.wv.idx,
+    batch: [], chk: 0.25 } : null;
+  W.obstacles = [];
+  for (var i = 0; i < s.obs.length; i++) {
+    var a = s.obs[i];
+    var ob = { x: a[0], y: a[1], w: a[2], h: a[3], hue: a[4], sat: a[5], lit: a[6],
+      kind: a[7] === 1 ? "low" : "wall" };
+    if (a[8]) { ob.destructible = true; ob.maxHp = 240; ob.hp = a[9] || 240; }
+    if (a[10]) ob.tile = true;
+    W.obstacles.push(ob);
+  }
+  W.wallArt = s.art || [];
+  W.doors = [];
+  if (s.doors) {
+    for (i = 0; i < s.doors.length; i++) {
+      var da = s.doors[i];
+      W.doors.push({ x: da[0], y: da[1], w: da[2], h: da[3], vertical: da[4] === 1 });
+    }
+  }
+  W.zones = [];
+  if (s.zones) {
+    for (i = 0; i < s.zones.length; i++) {
+      var za = s.zones[i];
+      W.zones.push({ x: za[0], y: za[1], w: za[2], h: za[3], type: za[4] === 1 ? "burn" : "slow",
+        slow: za[5] || 0, dps: za[6] || 0 });
+    }
+  }
+  W.tiles = [];
+  if (s.tiles) {
+    for (i = 0; i < s.tiles.length; i++) {
+      var ta = s.tiles[i];
+      W.tiles.push({ x: ta[0], y: ta[1], w: ta[2], h: ta[3], color: ta[4] || "#3a4a56",
+        alpha: ta[5] || 0.5, slow: ta[6] || 0, dps: ta[7] || 0,
+        solid: !!ta[8], pierce: !!ta[9], hp: ta[10] || 0, maxHp: ta[11] || 0, pattern: ta[12] || "solid", group: ta[13] || null });
+    }
+  }
+  W.holds = [];
+  if (s.holds) {
+    for (i = 0; i < s.holds.length; i++) {
+      var ha = s.holds[i];
+      W.holds.push({ x: ha[0], y: ha[1], w: ha[2], h: ha[3], r: ha[4] || 80,
+        owner: ha[5] || null, prog: ha[6] || 0 });
+    }
+  }
+  W.spawners = [];
+  if (s.spawners) {
+    for (i = 0; i < s.spawners.length; i++) {
+      var sa = s.spawners[i];
+      W.spawners.push({ x: sa[0], y: sa[1], w: sa[2], h: sa[3], kind: sa[4] || "zombie",
+        interval: sa[5] || 3, limit: sa[6] || 0, count: sa[7] || 0, t: sa[8] || 0 });
+    }
+  }
+  NAV.build(CFG.world, W.obstacles, 9);
+  W.posts = [];
+  for (i = 0; i < s.posts.length; i++) W.posts.push({ x: s.posts[i][0], y: s.posts[i][1], taken: null });
+  var byId = {};
+  var pendingTargets = [];   /* 目标引用要等所有单位建好再连 */
+  W.nextId = 1;
+  for (i = 0; i < s.units.length; i++) {
+    var d = s.units[i];
+    var u = newUnit(d[1], d[2], d[3]);
+    if (u.kind === "plagueNest") { W.boss = u; u.bossSeg = 5; }
+    u.id = d[0];
+    u.vx = d[4]; u.vy = d[5]; u.hp = d[6]; u.infectT = d[7];
+    u.infectLocked = !!d[8]; u.fadeT = d[9]; u.pounceT = d[10]; u.pounceCd = d[11];
+    if (d.length > 14) { u.mag = d[13]; u.reloading = !!d[14]; u.reloadT = d[15] || 0; }
+    if (d.length > 16 && d[16] >= 0) u.defend = { x: d[16], y: d[17] };
+    if (d.length > 18) u.incubT = d[18] || 0;
+    /* 恢复计时器与瞬时状态（旧存档没有这段，跳过即可） */
+    if (d.length > 19 && d[19]) {
+      var x2 = d[19];
+      u.pathT = x2.pT || 0; u.retargetT = x2.rt || 0;
+      u.fireFarT = x2.fF || 0; u.fireNearT = x2.fN || 0;
+      u.dirT = x2.dT || 0; u.mateT = x2.mT || 0;
+      u.laneSlot = x2.ls || 0; u.laneSlotInit = 1;
+      u.formT = x2.fT || 0;
+      u.herdT = x2.hT || 0; u.herdHit = x2.hH || 0;
+      u.recoilT = x2.rT || 0; u.vmaxBoost = x2.vb || 0; u.boostT = x2.bT || 0;
+      u.slowT = x2.slT || 0; u.recoverT = x2.rcT || 0; u.stunT = x2.snT || 0;
+      u.lastFireT = x2.lfT || 0; u.sniperT = x2.sT || 0; u.idleFireT = x2.iF || 0;
+      u.giveUpT = x2.guT || 0;
+      if (x2.fa !== undefined) u.faceAng = x2.fa;
+      if (x2.aa !== undefined) { u.aimAng = x2.aa; u.aimT = x2.aT || 0; }
+      if (x2.wT !== undefined) { u.wanderT = x2.wT; u.wanderAng = x2.wA || 0; }
+      if (x2.skT !== undefined) u.stuckT = x2.skT;
+      if (x2.p2 !== undefined) u.pathT = x2.p2;
+      if (x2.r2 !== undefined) u.retargetT = x2.r2;
+      if (x2.f1 !== undefined) { u.fireFarT = x2.f1; u.fireNearT = x2.f2 || 0; }
+      if (x2.d2 !== undefined) u.dirT = x2.d2;
+      if (x2.m2 !== undefined) u.mateT = x2.m2;
+      if (x2.h2 !== undefined) u.herdT = x2.h2;
+      if (x2.s2 !== undefined) { u.sniperT = x2.s2; u.idleFireT = x2.i2 || 0; }
+      u.__gs = x2.gs || null;          /* 护卫名单延后连：那时平民可能还没建好 */
+      u.__go = x2.go2 || 0;
+      if (x2.pth && x2.pth.length) {
+        u.path = [];
+        for (var pq = 0; pq < x2.pth.length; pq++) u.path.push({ x: x2.pth[pq][0], y: x2.pth[pq][1] });
+      } else {
+        u.path = [];
+      }
+      u.lastTx = u.target ? u.target.x : -1; u.lastTy = u.target ? u.target.y : -1;
+      u.mateOk = x2.mO || 0; u.mateX = x2.mX || 0; u.mateY = x2.mY || 0; u.dirOk = x2.dO || 0;
+      u.giveUpRev = x2.guR || 0; u.giveUpX = x2.guX || 0; u.giveUpY = x2.guY || 0;
+      u.giveUpHold = x2.guH || 0; u.giveUpCount = x2.guC || 0;
+      u.__nz = x2.nz || 0;
+      /* 1.3.3 新兵种状态：少一个都会让读档后的节奏错位 */
+      u.cryoT = x2.cr || 0; u.chillT = x2.ck || 0; u.frozen = x2.fb ? 1 : 0;
+      u.burnT = x2.bt || 0; u.burnTickT = x2.b2 || 0;
+      u.teslaBurst = x2.ts || 0; u.teslaT = x2.tt || 0; u.teslaCdT = x2.tc || 0; u.zapT = x2.za || 0;
+      u.laserPhase = x2.lp || 0; u.laserT = x2.lt || 0; u.laserAng = x2.la || 0;
+      u.laserSweeps = x2.lw || 0; u.laserCdT = x2.lc || 0;
+      pendingTargets.push([u, x2.tg || 0, x2.gu || 0]);
+    }
+    u.stuckX = u.x; u.stuckY = u.y;
+    W.units.push(u);
+    byId[u.id] = u;
+    if (d[12] >= 0 && W.posts[d[12]]) { u.post = W.posts[d[12]]; W.posts[d[12]].taken = u; }
+  }
+  /* 目标引用要等所有单位都建好才能连 */
+  for (i = 0; i < pendingTargets.length; i++) {
+    var pt = pendingTargets[i];
+    if (pt[1] && byId[pt[1]] && !byId[pt[1]].dead) pt[0].target = byId[pt[1]];
+    if (pt[2] && byId[pt[2]] && !byId[pt[2]].dead) pt[0].giveUpTo = byId[pt[2]];
+  }
+  /* 重建护卫关系 */
+  for (i = 0; i < W.units.length; i++) {
+    var gu2 = W.units[i];
+    if (gu2.__gs && gu2.guards) {
+      gu2.guards.length = 0;
+      for (var gq = 0; gq < gu2.__gs.length; gq++) {
+        var gv2 = byId[gu2.__gs[gq]];
+        if (gv2 && !gv2.dead) gu2.guards.push(gv2);
+      }
+    }
+    if (gu2.__go && byId[gu2.__go] && !byId[gu2.__go].dead) gu2.guardOf = byId[gu2.__go];
+    if (gu2.__nz && byId[gu2.__nz] && !byId[gu2.__nz].dead) gu2.nzCache = byId[gu2.__nz];
+    gu2.__gs = null; gu2.__go = 0; gu2.__nz = 0;
+  }
+  pendingTargets.length = 0;
+  W.nextId = s.nid;
+  /* 关键：newUnit() 内部会调用 RNG.range() 初始化各种计时器，
+     把"读档时恢复的随机数状态"一路消耗掉了。不重新设回来的话，
+     往后每一帧的随机数流都和存档那一刻错位，重演必然走上另一条时间线 */
+  RNG.s = s.rng >>> 0;
+  for (i = 0; i < s.posts.length; i++) {
+    var tid = s.posts[i][2];
+    if (tid && byId[tid]) W.posts[i].taken = byId[tid];
+  }
+  W.squadT = (s.squadT !== undefined) ? s.squadT : 0;
+  W.squadArmed = s.squadArmed || 0;
+  if (s.ws) { W.armedHadMany = s.ws.ahm || 0; W.civHadMany = s.ws.chm || 0; W.hadCivilians = !!s.ws.hc; }
+  if (s.bulletSeq) W.bulletSeq = s.bulletSeq;
+  W.bullets = [];
+  for (i = 0; i < s.bul.length; i++) {
+    var e = s.bul[i];
+    W.bullets.push({ x: e[0], y: e[1], px: e[2], py: e[3], ox: e[0], oy: e[1],
+      vx: e[4], vy: e[5], life: e[6], dmg: e[7], ang: Math.atan2(e[5], e[4]),
+      wmul: e[9] || 1, chain: e[10] ? 1 : 0, snipe: e[11] ? 1 : 0,
+      owner: (e[8] && byId[e[8]]) ? byId[e[8]] : null,
+      bid: W.bulletSeq++ });
+  }
+  /* 1.3.3 新兵种的场景物：读档之后寒冷圈与火墙不会凭空消失 */
+  W.cryoPots = [];
+  if (s.cryoPots) {
+    for (i = 0; i < s.cryoPots.length; i++) {
+      var cp2 = s.cryoPots[i];
+      W.cryoPots.push({ x: cp2[0], y: cp2[1], z: cp2[2], vx: cp2[3], vy: cp2[4], vz: cp2[5],
+        spin: cp2[6], spinV: cp2[7], t: cp2[8], T: cp2[9],
+        owner: (cp2[10] && byId[cp2[10]]) || null, hero: cp2[11] ? 1 : 0 });
+    }
+  }
+  W.cryoFields = [];
+  if (s.cryoFields) {
+    for (i = 0; i < s.cryoFields.length; i++) {
+      var cf2 = s.cryoFields[i];
+      W.cryoFields.push({ x: cf2[0], y: cf2[1], r: cf2[2], t: cf2[3], life: cf2[4],
+        owner: (cf2[5] && byId[cf2[5]]) || null, hero: cf2[6] ? 1 : 0, seed: cf2[7] || 0 });
+    }
+  }
+  W.firePatches = [];
+  if (s.firePatches) {
+    for (i = 0; i < s.firePatches.length; i++) {
+      var fp3 = s.firePatches[i];
+      W.firePatches.push({ x: fp3[0], y: fp3[1], r: fp3[2], t: fp3[3], life: fp3[4],
+        tickT: fp3[5], owner: (fp3[6] && byId[fp3[6]]) || null,
+        hero: fp3[7] ? 1 : 0, seed: fp3[8] || 0, hue: fp3[9] || 20 });
+    }
+  }
+  if (s.cam) { CAM.x = s.cam[0]; CAM.y = s.cam[1]; CAM.zoom = clamp(s.cam[2], CAM.minZ, CAM.maxZ); }
+  UI.shownResult = false;
+}
+function saveGame(silent) {
+  try {
+    localStorage.setItem(CFG.saveKey, JSON.stringify(serialize()));
+    if (!silent) toast("已存档");
+    return true;
+  } catch (e) { if (!silent) toast("存档失败：" + e.message); return false; }
+}
+function loadGame() {
+  try {
+    var raw = localStorage.getItem(CFG.saveKey);
+    if (!raw) { toast("没有找到存档"); return false; }
+    deserialize(JSON.parse(raw));
+    hideOverlay();
+    HOME_PANEL = false; START_PANEL = false;
+    setGameChrome(true);
+  setHomeBoard(false);
+    syncSpeedBtn();
+    toast("已读档");
+    return true;
+  } catch (e) { toast("读档失败：" + e.message); return false; }
+}
+/* ============================================================================
+   手动存档：与 15 秒自动存档完全分离（不同 localStorage key），
+   自动存档永远覆盖不到这里。拍剧情时可以随时"定格"，不满意就读回来重推。
+   ============================================================================ */
+var MANUAL_KEY = "zombieSandbox.manualSlots.v1";
+var MANUAL_MAX = 8;
+var MANUAL = [];
+function loadManualSlots() {
+  MANUAL = [];
+  try {
+    var raw = localStorage.getItem(MANUAL_KEY);
+    if (raw) {
+      var a = JSON.parse(raw);
+      if (a && a.length) MANUAL = a;
+    }
+  } catch (e) { MANUAL = []; }
+}
+function persistManualSlots() {
+  try { localStorage.setItem(MANUAL_KEY, JSON.stringify(MANUAL)); return true; }
+  catch (e) { toast("手动存档写入失败（可能空间不够）：" + e.message); return false; }
+}
+/* 存到第 idx 个槽（0 起）。name 为空就用时间戳 */
+function manualSave(idx, name) {
+  var d = serialize();
+  var now = new Date();
+  var stamp = now.getFullYear() + "-" +
+    ("0" + (now.getMonth() + 1)).slice(-2) + "-" +
+    ("0" + now.getDate()).slice(-2) + " " +
+    ("0" + now.getHours()).slice(-2) + ":" +
+    ("0" + now.getMinutes()).slice(-2) + ":" +
+    ("0" + now.getSeconds()).slice(-2);
+  var slot = {
+    name: name || ("存档 " + (MANUAL.length + 1)),
+    savedAt: stamp,
+    gameTime: Math.round(W.t * 10) / 10,
+    units: W.units.length,
+    data: d
+  };
+  while (MANUAL.length <= idx) MANUAL.push(null);
+  MANUAL[idx] = slot;
+  /* 去掉空槽，保持列表紧凑 */
+  var compact = [];
+  for (var i = 0; i < MANUAL.length; i++) if (MANUAL[i]) compact.push(MANUAL[i]);
+  MANUAL = compact.slice(0, MANUAL_MAX);
+  if (persistManualSlots()) toast("已存入手动存档：" + slot.name);
+  return true;
+}
+function manualLoad(idx) {
+  var slot = MANUAL[idx];
+  if (!slot || !slot.data) { toast("这个槽是空的"); return false; }
+  try {
+    deserialize(slot.data);
+    hideOverlay();
+    syncSpeedBtn();
+    /* 读档后把"剧情模式"重新挂上，指令和面板状态都清空 */
+    DIRECTOR.cues = [];
+    DIRECTOR.events = [];
+    DIRECTOR.sel = null;
+    DIRECTOR.pending = null;
+    if (DIRECTOR.on) syncDirectorBar();
+    storyLine("已读取手动存档：" + slot.name, { col: "180,255,200", life: 4 });
+    toast("已读档：" + slot.name);
+    return true;
+  } catch (e) { toast("读档失败：" + e.message); return false; }
+}
+function manualDelete(idx) {
+  if (!MANUAL[idx]) return;
+  var nm = MANUAL[idx].name;
+  MANUAL.splice(idx, 1);
+  persistManualSlots();
+  toast("已删除：" + nm);
+}
+/* 手动存档面板：从导演条的「存档」按钮进入 */
+function showManualPanel() {
+  if (!panelEl) return;
+  loadManualSlots();
+  var html = "<h2>剧情存档</h2>" +
+    "<p style='color:#9fb4dd;font-size:12.5px'>这里的存档与 15 秒自动存档完全独立，不会被自动存档覆盖。" +
+    "对当前走向不满意时，读回来就能让 AI 用同样的条件重新推演一遍。<br>" +
+    "（回合数、随机种子、地形、单位状态全部写进存档，所以重演是可复现的）</p>";
+  html += "<div id='slotList'>";
+  if (!MANUAL.length) html += "<p style='color:#6b7a99'>还没有手动存档。</p>";
+  for (var i = 0; i < MANUAL.length; i++) {
+    var s = MANUAL[i];
+    html += "<div class='bindrow'><span class='bindname'>" +
+      "<b>" + s.name + "</b><br>" +
+      "<span style='color:#9fb4dd;font-size:11.5px'>" + s.savedAt +
+      " · 游戏内 " + s.gameTime + " 秒 · " + s.units + " 个单位</span></span>" +
+      "<span style='white-space:nowrap'>" +
+      "<button class='slotbtn' data-load='" + i + "'>读取</button> " +
+      "<button class='slotbtn' data-del='" + i + "'>删除</button></span></div>";
+  }
+  html += "</div>";
+  html += "<h3>新建存档</h3><p>" +
+    "<input type='text' id='slotName' placeholder='给这个存档起个名字（可留空）' " +
+    "style='width:260px;padding:6px 8px;background:#1a2136;color:#dfe6f5;border:1px solid #2c3757;border-radius:8px'> " +
+    "<button id='slotSave'>存入</button></p>";
+  html += "<p style='text-align:right;margin-top:14px'><button id='slotClose'>关闭</button></p>";
+  panelEl.innerHTML = html;
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var btns = panelEl.querySelectorAll("[data-load]");
+  for (var j = 0; j < btns.length; j++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        manualLoad(parseInt(b.getAttribute("data-load"), 10) || 0);
+      });
+    })(btns[j]);
+  }
+  var dbs = panelEl.querySelectorAll("[data-del]");
+  for (var k = 0; k < dbs.length; k++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        manualDelete(parseInt(b.getAttribute("data-del"), 10) || 0);
+        showManualPanel();
+      });
+    })(dbs[k]);
+  }
+  var sv = document.getElementById("slotSave");
+  if (sv) sv.addEventListener("click", function () {
+    var nmEl = document.getElementById("slotName");
+    manualSave(MANUAL.length, nmEl ? nmEl.value.trim() : "");
+    showManualPanel();
+  });
+  var cl = document.getElementById("slotClose");
+  if (cl) cl.addEventListener("click", function () { hideOverlay(); });
+}
+
+function exportSave() {
+  try {
+    var blob = new Blob([JSON.stringify(serialize())], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = GAME_TITLE + "存档.json";
+    document.body.appendChild(a); a.click();
+    setTimeout(function () { URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    toast("已导出存档文件");
+  } catch (e) { toast("导出失败：" + e.message); }
+}
+/* ------------------------------ 存档码 ------------------------------
+   整份存档 → JSON → deflate → base64url，得到一段可复制的文本。
+   浏览器支持 CompressionStream 时用 "SB2Z."，否则回退到不压缩的 "SB2."；
+   导入同时接受这两种前缀和旧的 JSON 文本。 */
+function bytesToB64Url(bytes) {
+  var bin = "", chunk = 0x8000;
+  for (var i = 0; i < bytes.length; i += chunk) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+function b64UrlToBytes(str) {
+  var s = String(str).replace(/-/g, "+").replace(/_/g, "/");
+  while (s.length % 4) s += "=";
+  var bin = atob(s);
+  var out = new Uint8Array(bin.length);
+  for (var i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function encodeSaveCode(text) {
+  var bytes = new TextEncoder().encode(String(text));
+  if (typeof CompressionStream === "function" && typeof Blob === "function" && typeof Response === "function") {
+    try {
+      var stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream("deflate"));
+      return new Response(stream).arrayBuffer().then(function (buf) {
+        return "SB2Z." + bytesToB64Url(new Uint8Array(buf));
+      });
+    } catch (e) { /* 落到不压缩 */ }
+  }
+  return Promise.resolve("SB2." + bytesToB64Url(bytes));
+}
+function decodeSaveCode(code) {
+  var s = String(code || "").trim().replace(/\s+/g, "");
+  if (!s) return Promise.reject(new Error("存档码是空的"));
+  if (s.indexOf("SB2Z.") === 0) {
+    if (typeof DecompressionStream !== "function") return Promise.reject(new Error("当前浏览器不支持解压存档码"));
+    var raw = b64UrlToBytes(s.slice(5));
+    var stream2 = new Blob([raw]).stream().pipeThrough(new DecompressionStream("deflate"));
+    return new Response(stream2).arrayBuffer().then(function (buf) {
+      return new TextDecoder().decode(new Uint8Array(buf));
+    });
+  }
+  if (s.indexOf("SB2.") === 0) {
+    return Promise.resolve(new TextDecoder().decode(b64UrlToBytes(s.slice(4))));
+  }
+  /* 兼容直接粘贴的 JSON 存档 */
+  if (s.charAt(0) === "{") return Promise.resolve(s);
+  return Promise.reject(new Error("不是有效的存档码（应以 SB2Z. / SB2. 开头）"));
+}
+function copyTextToClipboard(text) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    return navigator.clipboard.writeText(text);
+  }
+  return new Promise(function (resolve, reject) {
+    try {
+      var ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed"; ta.style.left = "-9999px"; ta.style.top = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+      resolve();
+    } catch (e) { reject(e); }
+  });
+}
+function showSaveCodePanel() {
+  if (!panelEl || !overlayEl) return;
+  panelEl.innerHTML =
+    "<h2>存档码</h2>" +
+    "<p style='margin:0 0 8px;color:#9fb4dd;font-size:12.5px'>复制这段文本发到另一台设备，在下面粘贴导入。含完整战场状态。</p>" +
+    "<textarea id='saveCodeBox' readonly style='width:100%;height:92px;box-sizing:border-box;background:#0d1420;" +
+      "color:#dfe6f5;border:1px solid #2c3757;border-radius:8px;padding:8px;font:12px monospace;resize:none'></textarea>" +
+    "<div class='row' style='display:flex;gap:8px;margin:8px 0 14px'>" +
+      "<button id='saveCodeCopy' style='flex:1'>复制存档码</button>" +
+      "<button id='saveCodeShare' style='flex:1'>分享</button></div>" +
+    "<h2>导入</h2>" +
+    "<textarea id='saveCodeIn' placeholder='粘贴 SB2Z... / SB2... 或 JSON 存档' style='width:100%;height:76px;box-sizing:border-box;" +
+      "background:#0d1420;color:#dfe6f5;border:1px solid #2c3757;border-radius:8px;padding:8px;font:12px monospace;resize:none'></textarea>" +
+    "<div class='row' style='display:flex;gap:8px;margin:8px 0'>" +
+      "<button id='saveCodeImport' style='flex:1'>导入并读档</button>" +
+      "<button id='saveCodeClose' style='flex:1'>关闭</button></div>" +
+    "<div id='saveCodeMsg' style='min-height:18px;color:#9fb4dd;font-size:12px'></div>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var box = $("saveCodeBox"), inp = $("saveCodeIn"), msg = $("saveCodeMsg");
+  var code = "";
+  box.value = "生成中…";
+  var payload;
+  try {
+    payload = JSON.stringify({ app: "shibian-sandbox", v: GAME_VERSION, at: Date.now(), data: serialize() });
+  } catch (e) {
+    msg.textContent = "生成失败：" + e.message;
+    return;
+  }
+  encodeSaveCode(payload).then(function (c) {
+    code = c; box.value = c;
+    msg.textContent = "已生成（" + c.length + " 字符）";
+  }).catch(function (e) {
+    box.value = ""; msg.textContent = "生成失败：" + e.message;
+  });
+  $("saveCodeCopy").addEventListener("click", function () {
+    if (!code) { msg.textContent = "还没生成好"; return; }
+    copyTextToClipboard(code).then(function () { toast("存档码已复制"); msg.textContent = "已复制到剪贴板"; })
+      .catch(function (e) { msg.textContent = "复制失败：" + e.message; box.select(); });
+  });
+  $("saveCodeShare").addEventListener("click", function () {
+    if (!code) { msg.textContent = "还没生成好"; return; }
+    if (navigator.share) {
+      navigator.share({ title: GAME_TITLE + "存档码", text: code }).catch(function () {});
+    } else if (navigator.clipboard) {
+      copyTextToClipboard(code).then(function () { msg.textContent = "已复制（当前浏览器不支持系统分享）"; });
+    } else { box.select(); document.execCommand("copy"); }
+  });
+  $("saveCodeImport").addEventListener("click", function () {
+    var raw = String(inp.value || "").trim();
+    if (!raw) { msg.textContent = "先粘贴存档码"; return; }
+    msg.textContent = "正在解析…";
+    decodeSaveCode(raw).then(function (txt) {
+      var obj = JSON.parse(txt);
+      var save = (obj && obj.data) ? obj.data : obj;
+      if (!save || !Array.isArray(save.units)) throw new Error("存档内容不完整");
+      deserialize(save);
+      hideOverlay();
+      syncSpeedBtn();
+      toast("已导入存档码");
+    }).catch(function (e) {
+      msg.textContent = "导入失败：" + e.message;
+    });
+  });
+  $("saveCodeClose").addEventListener("click", hideOverlay);
+}
+/* ------------------------------ 16. UI 与输入 ---------------------------- */
+var UI = { selected: null, promotePick: false, pointer: { x: 0, y: 0, in: false }, debug: false, shownResult: false,
+           debugOnly: "" };   /* 空 = 调试视图显示全部；否则只显示这一类 */
+/* 调试分类判定：UI.debug 是总开关，debugOnly 用来在总开关打开后只留一类 */
+function dbgOn(kind) {
+  if (!UI.debug) return false;
+  if (!UI.debugOnly) return true;
+  return UI.debugOnly === kind;
+}
+/* ============================================================================
+   剧情提示：屏幕右上角的临时文字（右上角的增援倒计时也属于这一类）。
+   它与"操作界面"是两回事，按 H 隐藏工具栏时，剧情提示照常显示。
+   ============================================================================ */
+var STORY = { lines: [], max: 6 };
+function storyLine(text, opt) {
+  opt = opt || {};
+  var life = opt.life || 3.5;
+  STORY.lines.push({
+    text: text,
+    col: opt.col || "235,242,255",
+    glow: !!opt.glow,
+    t: life, life: life
+  });
+  while (STORY.lines.length > STORY.max) STORY.lines.shift();
+}
+function stepStory(dt) {
+  for (var i = STORY.lines.length - 1; i >= 0; i--) {
+    STORY.lines[i].t -= dt;
+    if (STORY.lines[i].t <= 0) STORY.lines.splice(i, 1);
+  }
+}
+function drawStoryLines() {
+  if (!STORY.lines.length) return;
+  var touch = !!(document.body && document.body.classList && document.body.classList.contains("touch-ui"));
+  var ms = touch ? hudUiScale() : 1;
+  var size = Math.round(Math.max(15, Math.min(22, VW * 0.022)) * ms);
+  /* 挪到左上角、波次倒计时下面，右上角已经被增援倒计时和淘汰播报占满了，
+     剧情提示再挤在那儿必然打架 */
+  var lx = touch ? 14 : 30;
+  var y = (TOPBAR_H || 0) + (touch ? 8 : 18);
+  if (W.waves && W.waves.left > 0) {
+    var wts = Math.round(Math.max(15, Math.min(21, VW * 0.022)) * ms);
+    var wss = Math.round(Math.max(26, Math.min(38, VW * 0.038)) * ms);
+    y += wts + Math.round(wss * 1.1) + (touch ? 8 : 16);
+  }
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  CTX.textAlign = "left";
+  CTX.textBaseline = "top";
+  CTX.font = "600 " + size + "px system-ui,-apple-system,'Microsoft YaHei',sans-serif";
+  for (var i = 0; i < STORY.lines.length; i++) {
+    var L = STORY.lines[i];
+    var a = L.t / L.life;
+    if (a > 1) a = 1;
+    CTX.globalAlpha = a < 0.25 ? a / 0.25 : 1;
+    if (L.glow) {
+      CTX.shadowColor = "rgba(255,206,60,0.9)";
+      CTX.shadowBlur = 14;
+    }
+    CTX.fillStyle = "rgb(" + L.col + ")";
+    CTX.fillText(L.text, lx, y);
+    CTX.shadowBlur = 0;
+    y += Math.round(size * 1.55);
+  }
+  CTX.globalAlpha = 1;
+  CTX.textAlign = "start";
+  CTX.textBaseline = "alphabetic";
+}
+
+/* ============================================================================
+   剧情模式（导演模式）：暂停时给任意单位下指令，指令优先级高于全部 AI 走位。
+   与玩家操控（playerDriven）是同一套思路，只是驱动源从键盘换成指令队列。
+   ============================================================================ */
+/* ===== 全部键位绑定：全局操作 + 方向 + 导演指令，全部可自定义，存 localStorage ===== */
+var KEY_ACTS = [
+  /* ---- 全局 ---- */
+  { id: "pause",      g: "game", label: "暂停 / 继续",       def: " " },
+  { id: "cancel",     g: "game", label: "取消选中 / 关面板",   def: "escape" },
+  { id: "director",   g: "game", label: "剧情模式",           def: "t" },
+  { id: "toggleUI",   g: "game", label: "隐藏 / 显示界面",     def: "h" },
+  { id: "cinema",     g: "game", label: "电影遮幅",           def: "c" },
+  { id: "command",    g: "game", label: "指挥框选",           def: "f" },
+  { id: "fireMode",   g: "game", label: "切换开火模式",       def: "v" },
+  { id: "market",     g: "game", label: "装备市场",           def: "z" },
+  { id: "debug",      g: "game", label: "调试视图",           def: "f1" },
+  { id: "batchMinus", g: "game", label: "批量 −",             def: "q" },
+  { id: "batchPlus",  g: "game", label: "批量 +",             def: "e" },
+  { id: "reload",     g: "game", label: "操控时手动换弹",      def: "r" },
+  { id: "place1", g: "game", label: "投放：步枪兵", def: "1" },
+  { id: "place2", g: "game", label: "投放：机枪兵", def: "2" },
+  { id: "place3", g: "game", label: "投放：狙击手", def: "3" },
+  { id: "place4", g: "game", label: "投放：盾兵",   def: "4" },
+  { id: "place5", g: "game", label: "投放：平民",   def: "5" },
+  { id: "place6", g: "game", label: "投放：沙袋",   def: "6" },
+  /* ---- 方向：角色移动与镜头平移共用 ---- */
+  { id: "up",    g: "move", label: "向上", def: "w" },
+  { id: "down",  g: "move", label: "向下", def: "s" },
+  { id: "left",  g: "move", label: "向左", def: "a" },
+  { id: "right", g: "move", label: "向右", def: "d" },
+  /* ---- 剧情模式指令 ---- */
+  { id: "moveTo",    g: "dir", label: "移动",     def: "m" },
+  { id: "follow",    g: "dir", label: "跟随",     def: "o" },
+  { id: "hold",      g: "dir", label: "待命",     def: "k" },
+  { id: "garrison",  g: "dir", label: "坚守",     def: "g" },
+  { id: "face",      g: "dir", label: "朝向",     def: "v" },
+  { id: "fireAt",    g: "dir", label: "射击",     def: "x" },
+  { id: "safe",      g: "dir", label: "保险",     def: "b" },
+  { id: "say",       g: "dir", label: "对话",     def: "n" },
+  { id: "die",       g: "dir", label: "阵亡",     def: "p" },
+  { id: "release",   g: "dir", label: "解除",     def: "l" },
+  { id: "camTo",     g: "dir", label: "镜头到此", def: "i" },
+  { id: "camFollow", g: "dir", label: "跟拍",     def: "j" },
+  { id: "camFree",   g: "dir", label: "解除运镜", def: "u" }
+];
+var KEYMAP = {};
+var BIND_WAIT = null;   /* 正在等待玩家按键的动作 id */
+function loadBinds() {
+  var i;
+  KEYMAP = {};
+  for (i = 0; i < KEY_ACTS.length; i++) KEYMAP[KEY_ACTS[i].id] = KEY_ACTS[i].def;
+  try {
+    var raw = localStorage.getItem("zombieSandbox.keys.v2");
+    if (raw) {
+      var o = JSON.parse(raw);
+      for (i = 0; i < KEY_ACTS.length; i++) {
+        var a = KEY_ACTS[i];
+        if (o && typeof o[a.id] === "string") KEYMAP[a.id] = o[a.id];
+      }
+    }
+  } catch (e) {}
+}
+function saveBinds() {
+  try { localStorage.setItem("zombieSandbox.keys.v2", JSON.stringify(KEYMAP)); } catch (e) {}
+}
+function resetBinds() {
+  for (var i = 0; i < KEY_ACTS.length; i++) KEYMAP[KEY_ACTS[i].id] = KEY_ACTS[i].def;
+  saveBinds();
+}
+/* 某个动作是否被按住（方向键额外保留固定备用键，避免改键后彻底没方向） */
+function keyHeld(id) {
+  var k = KEYMAP[id];
+  if (k && keys[k]) return true;
+  if (id === "up") return !!keys["arrowup"];
+  if (id === "down") return !!keys["arrowdown"];
+  if (id === "left") return !!keys["arrowleft"];
+  if (id === "right") return !!keys["arrowright"];
+  return false;
+}
+/* 这个按键绑到了哪个动作 */
+function actionOfKey(k, group) {
+  for (var i = 0; i < KEY_ACTS.length; i++) {
+    var a = KEY_ACTS[i];
+    if (KEYMAP[a.id] === k && (!group || a.g === group)) return a.id;
+  }
+  return null;
+}
+/* 这个按键被谁占着（用于冲突提示） */
+function ownerOfKey(k, exceptId) {
+  for (var i = 0; i < KEY_ACTS.length; i++) {
+    var a = KEY_ACTS[i];
+    if (a.id !== exceptId && KEYMAP[a.id] === k) return a.label;
+  }
+  return null;
+}
+
+var DIRECTOR = {
+  on: false,
+  sel: null,        /* 当前选中的单位 */
+  pending: null,    /* 正在等待点地图确认的指令类型 */
+  cues: [],         /* 全剧本指令记录（导出用） */
+  events: [],       /* 已触发事件记录（导出用） */
+  camFollow: null   /* 镜头跟拍的目标单位 */
+};
+function cueUnitById(id) {
+  for (var i = 0; i < W.units.length; i++) if (W.units[i].id === id) return W.units[i];
+  return null;
+}
+function directorSelect(u) {
+  DIRECTOR.sel = u;
+  syncDirectorBar();
+}
+/* 把一条指令塞进单位队列；第一条立刻生效 */
+function cueAdd(u, act, opt) {
+  if (!u || u.dead) return null;
+  opt = opt || {};
+  var c = {
+    act: act,
+    x: opt.x !== undefined ? opt.x : null,
+    y: opt.y !== undefined ? opt.y : null,
+    unitId: opt.unitId !== undefined ? opt.unitId : null,
+    ang: opt.ang !== undefined ? opt.ang : null,
+    speed: opt.speed || 1600,
+    text: opt.text || "",
+    r: opt.r || 0,
+    life: opt.life || 0,
+    t: opt.life || 0,
+    done: false
+  };
+  if (act === "say" && c.text) { u.sayText = c.text; u.sayT = c.life || 4; }
+  u.cueQ.push(c);
+  if (!u.cue) u.cue = u.cueQ[0];
+  DIRECTOR.cues.push({ unitId: u.id, act: act, x: c.x, y: c.y, unitId2: c.unitId, text: c.text,
+    r: c.r || 0 });
+  return c;
+}
+/* 当前指令完成，推进到队列里的下一条 */
+function cueAdvance(u) {
+  if (!u.cueQ || !u.cueQ.length) { u.cue = null; return; }
+  u.cueQ.shift();
+  u.cue = u.cueQ.length ? u.cueQ[0] : null;
+}
+/* 立刻清空该单位的剧本，交还 AI */
+function cueClear(u) {
+  if (!u) return;
+  u.cue = null;
+  u.cueQ = [];
+  u.gar = null;   /* 交还 AI 时坚守姿态一并解除 */
+}
+/* 剧情模式开关：进入时自动暂停，退出时保留已有指令 */
+function setDirector(v) {
+  DIRECTOR.on = !!v;
+  DIRECTOR.pending = null;
+  if (DIRECTOR.on) {
+    DIRECTOR.sel = null;
+    if (!W.paused) { W.paused = true; var pb = document.getElementById("bPause"); if (pb) pb.textContent = "继续"; }
+  }
+  syncDirectorBar();
+}
+/* 剧情模式下点画布：选人，或给已选中的单位指定目标点 */
+function directorClickAt(wx, wy) {
+  if (!DIRECTOR.on) return false;
+  if (DIRECTOR.pending === "camTo") {
+    DIRECTOR.pending = null;
+    focusCameraOn(wx, wy, 1.2);
+    toast("镜头推镜中");
+    return true;
+  }
+  if (DIRECTOR.pending && DIRECTOR.sel) {
+    var u = DIRECTOR.sel;
+    var kind = DIRECTOR.pending;
+    DIRECTOR.pending = null;
+    if (kind === "followPick") {
+      var t2 = unitAt(wx, wy, 46);
+      if (!t2 || t2 === u || t2.dead) { toast("没点到可跟随的单位"); return true; }
+      cueAdd(u, "follow", { unitId: t2.id });
+      toast("已下达：跟随 #" + t2.id);
+    } else if (kind === "face") {
+      cueAdd(u, "face", { ang: Math.atan2(wy - u.y, wx - u.x) });
+      toast("已下达：朝向");
+    } else if (kind === "garrison") {
+      var rr = window.prompt("坚守半径（像素，40~600）", String(CFG.garrison.r));
+      var rv = (rr === null || rr === "") ? CFG.garrison.r : parseFloat(rr);
+      if (!(rv > 40) || rv > 600) rv = CFG.garrison.r;
+      cueAdd(u, "garrison", { x: wx, y: wy, r: rv });
+      toast("已下达：坚守 " + Math.round(rv) + "px 范围");
+    } else {
+      cueAdd(u, kind, { x: wx, y: wy });
+      toast("已下达：" + (kind === "moveTo" ? "移动" : "射击") + " → " +
+        Math.round(wx) + "," + Math.round(wy));
+    }
+    syncDirectorBar();
+    return true;
+  }
+  var u2 = unitAt(wx, wy, 46);
+  if (u2 && isHuman(u2) && !isZombieSide(u2)) { directorSelect(u2); return true; }
+  directorSelect(null);
+  return true;
+}
+
+/* 刷新导演条上的选中单位信息 */
+function syncDirectorBar() {
+  var bar = document.getElementById("directorBar");
+  if (bar) bar.style.display = DIRECTOR.on ? "flex" : "none";
+  var lab = document.getElementById("dirSel");
+  if (!lab) return;
+  var u = DIRECTOR.sel;
+  if (!u || u.dead) {
+    lab.textContent = "未选中单位 — 点一个人";
+    lab.style.color = "#9fb4dd";
+  } else {
+    var n = u.cueQ ? u.cueQ.length : 0;
+    var now = u.cue ? (u.cue.act === "moveTo" ? "移动中" : u.cue.act) : "无指令";
+    lab.textContent = CFG.unit[u.kind].name + " #" + u.id + " · " + now + (n > 1 ? " · 队列 " + n : "");
+    lab.style.color = "#ffd479";
+  }
+}
+/* 执行一条导演动作：按钮点击与快捷键共用同一条路径 */
+function directorDoAction(act) {
+  if (!DIRECTOR.on) { toast("先按 T 进入剧情模式"); return; }
+  var u = DIRECTOR.sel;
+  if (!u || u.dead) { toast("先点选一个人类单位"); return; }
+  if (act === "release") { cueClear(u); toast("已交还 AI"); syncDirectorBar(); return; }
+  if (act === "camTo") { DIRECTOR.pending = "camTo"; toast("再点一下画布，镜头会平滑推到那里"); return; }
+  if (act === "camFollow") {
+    DIRECTOR.camFollow = u;
+    toast("镜头开始跟拍 " + CFG.unit[u.kind].name + " #" + u.id);
+    return;
+  }
+  if (act === "camFree") {
+    DIRECTOR.camFollow = null;
+    toast("镜头已解除锁定");
+    return;
+  }
+  if (act === "die") {
+    cueClear(u);
+    u.hp = 0;
+    toast("已安排阵亡");
+    syncDirectorBar();
+    return;
+  }
+  if (act === "moveTo" || act === "fireAt" || act === "face") {
+    DIRECTOR.pending = act;
+    toast("再点一下画布指定" + (act === "face" ? "朝向" : "目标位置"));
+    return;
+  }
+  if (act === "follow") {
+    DIRECTOR.pending = "followPick";
+    toast("再点一下要跟随的单位");
+    return;
+  }
+  if (act === "garrison") {
+    DIRECTOR.pending = "garrison";
+    toast("再点一下画布指定坚守中心");
+    return;
+  }
+  if (act === "say") {
+    var txt = window.prompt("台词", "你们先走，我拖住它们");
+    if (txt) {
+      cueAdd(u, "say", { text: txt, life: 4 });
+      storyLine(txt, { col: "255,240,200", life: 4 });
+    }
+    syncDirectorBar();
+    return;
+  }
+  cueAdd(u, act, { life: act === "hold" ? 9999 : 0 });
+  toast("已下达：" + act);
+  syncDirectorBar();
+}
+function bindDirectorBar() {
+  var bar = document.getElementById("directorBar");
+  if (!bar) return;
+  var btns = bar.querySelectorAll("[data-cue]");
+  for (var i = 0; i < btns.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () { directorDoAction(b.getAttribute("data-cue")); });
+    })(btns[i]);
+  }
+  var fireBtn = document.getElementById("dirFire");
+  if (fireBtn) fireBtn.addEventListener("click", function () {
+    var sel2 = document.getElementById("dirEvent");
+    directorFireEvent(sel2 ? sel2.value : "");
+  });
+  var exBtn = document.getElementById("dirExport");
+  if (exBtn) exBtn.addEventListener("click", directorExport);
+  var imBtn = document.getElementById("dirImport");
+  if (imBtn) imBtn.addEventListener("click", directorImport);
+  var bkBtn = document.getElementById("dirBinds");
+  if (bkBtn) bkBtn.addEventListener("click", showBindPanel);
+  var svBtn = document.getElementById("dirSave");
+  if (svBtn) svBtn.addEventListener("click", showManualPanel);
+}
+
+/* ===== 键位设置面板：从导演条上的「键位」按钮进入 ===== */
+function keyDisplay(k) {
+  if (!k) return "未绑定";
+  if (k === " ") return "空格";
+  if (k === "escape") return "Esc";
+  if (k === "f1") return "F1";
+  if (k.length > 1) return k.charAt(0).toUpperCase() + k.slice(1);
+  return k.toUpperCase();
+}
+/* 帮助里出现的键位一律现取现拼：玩家改过键位之后，说明文字必须跟着变，
+   否则教程说的和实际按下去的对不上 */
+function keysHelpText(g) {
+  var out = [], i;
+  for (i = 0; i < KEY_ACTS.length; i++) {
+    if (g && KEY_ACTS[i].g !== g) continue;
+    out.push(KEY_ACTS[i].label + "=" + keyDisplay(KEYMAP[KEY_ACTS[i].id]));
+  }
+  return out.join("、");
+}
+var KEY_GROUPS = [
+  { g: "game", title: "全局操作" },
+  { g: "move", title: "方向（角色移动 / 镜头平移）" },
+  { g: "dir",  title: "剧情模式指令" }
+];
+function showBindPanel() {
+  if (!panelEl) return;
+  var html = "<h2>键位设置</h2>" +
+    "<p style='color:#9fb4dd;font-size:12.5px'>点右边的键位按钮，然后直接按下你想用的键；按 Esc 取消本次绑定。<br>" +
+    "所有键都可以改，改完立刻保存，重开游戏也记得。</p>";
+  for (var gi = 0; gi < KEY_GROUPS.length; gi++) {
+    var grp = KEY_GROUPS[gi];
+    html += "<h3>" + grp.title + "</h3><div class='bindlist'>";
+    for (var i = 0; i < KEY_ACTS.length; i++) {
+      var a = KEY_ACTS[i];
+      if (a.g !== grp.g) continue;
+      var k = KEYMAP[a.id] || "";
+      var warn = "";
+      var own = k ? ownerOfKey(k, a.id) : null;
+      if (own) warn = " <span style='color:#ff9a9a;font-size:11.5px'>（与「" + own + "」冲突）</span>";
+      html += "<div class='bindrow'><span class='bindname'>" + a.label + "</span>" +
+        "<button class='bindbtn' data-bind='" + a.id + "'>" + keyDisplay(k) + warn + "</button></div>";
+    }
+    html += "</div>";
+  }
+  html += "<p style='text-align:right;margin-top:14px'>" +
+    "<button id='bindReset'>恢复默认</button> <button id='bindClose'>关闭</button></p>";
+  panelEl.innerHTML = html;
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  BIND_WAIT = null;
+  var btns = panelEl.querySelectorAll("[data-bind]");
+  for (var j = 0; j < btns.length; j++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        BIND_WAIT = b.getAttribute("data-bind");
+        b.textContent = "请按键…";
+        b.className = "bindbtn waiting";
+      });
+    })(btns[j]);
+  }
+  var rs = document.getElementById("bindReset");
+  if (rs) rs.addEventListener("click", function () {
+    resetBinds();
+    showBindPanel();
+    toast("键位已恢复默认");
+  });
+  var cl = document.getElementById("bindClose");
+  if (cl) cl.addEventListener("click", function () { BIND_WAIT = null; hideOverlay(); });
+}
+/* 在键位面板里按下了一个键 */
+function applyBind(k) {
+  var id = BIND_WAIT;
+  BIND_WAIT = null;
+  if (!id) return false;
+  if (k === "escape") { showBindPanel(); return true; }
+  var own = ownerOfKey(k, id);
+  KEYMAP[id] = k;
+  saveBinds();
+  showBindPanel();
+  var label = "";
+  for (var i = 0; i < KEY_ACTS.length; i++) if (KEY_ACTS[i].id === id) label = KEY_ACTS[i].label;
+  if (own) toast("已将「" + label + "」绑定到 " + keyDisplay(k) + "，注意它与「" + own + "」冲突");
+  else toast("已将「" + label + "」绑定到 " + keyDisplay(k));
+  return true;
+}
+
+/* 剧本导出：把下达过的指令与触发过的事件存成 JSON，方便复盘与复用 */
+function directorExport() {
+  var data = {
+    v: 1,
+    seed: W.seed,
+    t: Math.round(W.t * 100) / 100,
+    start: {
+      gameMode: START.gameMode,
+      waveMode: !!START.waveMode,
+      reinforce: !!START.reinforce, emperor: !!START.emperor,
+      heroMode: !!START.heroMode
+    },
+    cues: DIRECTOR.cues,
+    events: DIRECTOR.events
+  };
+  try {
+    var txt = JSON.stringify(data, null, 2);
+    var blob = new Blob([txt], { type: "application/json" });
+    var a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "剧本_" + Date.now() + ".json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast("剧本已导出：" + DIRECTOR.cues.length + " 条指令、" + DIRECTOR.events.length + " 个事件");
+  } catch (e) {
+    toast("导出失败：" + e.message);
+  }
+}
+function directorImport() {
+  try {
+    var inp = document.createElement("input");
+    inp.type = "file";
+    inp.accept = ".json,application/json";
+    inp.onchange = function () {
+      var file = inp.files && inp.files[0];
+      if (!file) return;
+      var rd = new FileReader();
+      rd.onload = function () {
+        try {
+          var d = JSON.parse(rd.result);
+          DIRECTOR.cues = d.cues || [];
+          DIRECTOR.events = d.events || [];
+          toast("剧本已载入：" + DIRECTOR.cues.length + " 条指令（仅作记录，需重新下达才会生效）");
+          syncDirectorBar();
+        } catch (e2) { toast("剧本解析失败：" + e2.message); }
+      };
+      rd.readAsText(file);
+    };
+    inp.click();
+  } catch (e) { toast("导入失败：" + e.message); }
+}
+
+/* 事件触发：无条件，随时可点。全部是现有函数的薄封装 */
+function directorFireEvent(type) {
+  if (!type) { toast("先选一个事件"); return; }
+  var u = DIRECTOR.sel;
+  var cx = CAM.x, cy = CAM.y;
+  var n = 0, i;
+  if (type === "supportSquad" || type === "supportSpecial" || type === "supportLegion" || type === "supportEmperor") {
+    var sk = supportKindOf(type);
+    if (sk === "legion" && START.emperor) sk = "emperor";
+    beginSupportDrop(sk, cx, cy, "director");
+  } else if (type === "apotheosis") {
+    beginApotheosis(cx, cy);
+  } else if (type === "wave") {
+    var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+    n = spawnWaveBatch(zs, START.waveSize || 40);
+    storyLine("手动投放尸潮：" + n + " 只", { col: "255,146,146", life: 4 });
+  } else if (type === "spawnZombies") {
+    for (i = 0; i < 20; i++) {
+      addUnit(pickZombieKind(), cx + RNG.range(-220, 220), cy + RNG.range(-220, 220));
+      n++;
+    }
+    storyLine("该区域出现 " + n + " 个目标", { col: "255,146,146", life: 4 });
+  } else if (type === "spawnHumans") {
+    var hk = ["rifle", "mg", "sniper", "shield", "cryo", "flame", "tesla", "laser"];
+    for (i = 0; i < 5; i++) {
+      addUnit(hk[i], cx + RNG.range(-160, 160), cy + RNG.range(-160, 160));
+      n++;
+    }
+    storyLine("该区域出现 " + n + " 名人员", { col: "180,255,200", life: 4 });
+  } else if (type === "heroSel") {
+    if (!u || u.dead) { toast("先点选一个人类单位"); return; }
+    promoteHero(u, isArmed(u) ? "armed" : "civilian");
+    storyLine(CFG.unit[u.kind].name + " 升格为英雄", { col: "255,210,74", glow: true, life: 5 });
+  } else if (type === "infectSel") {
+    if (!u || u.dead) { toast("先点选一个单位"); return; }
+    if (u.infectT <= 0) u.infectT = 0.01;
+    storyLine(CFG.unit[u.kind].name + " 已被感染", { col: "200,120,255", life: 5 });
+  } else if (type === "win") {
+    W.over = true; W.result = "win";
+    storyLine("战斗结束：人类守住了", { col: "160,255,180", life: 6 });
+  } else if (type === "lose") {
+    W.over = true; W.result = "lose";
+    storyLine("战斗结束：防线崩溃", { col: "255,120,120", life: 6 });
+  }
+  DIRECTOR.events.push({ type: type, t: W.t });
+  syncDirectorBar();
+}
+
+/* 电影遮幅：2.35:1 黑边，一秒提升成片观感 */
+var CINEMA = false;
+function drawCinemaBars() {
+  if (!CINEMA) return;
+  var target = VW / 2.35;
+  var barH = (VH - target) / 2;
+  if (barH < 1) return;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  CTX.fillStyle = "#000";
+  CTX.fillRect(0, 0, VW, barH);
+  CTX.fillRect(0, VH - barH, VW, barH);
+}
+
+/* ============================================================================
+   指挥模式：按快捷键进入 → 拖拽框选人类单位 → 点地图上一点，被选中的人强制朝那里靠拢。
+   只覆盖"去哪"，开火、受伤、感染、碰撞一概照旧。
+   ============================================================================ */
+var CMD = { on: false, busy: false, rx: 0, ry: 0, tx: 0, ty: 0,
+  units: [], hasT: false, col: "120,220,255" };
+function toggleCmd() {
+  CMD.on = !CMD.on;
+  CMD.busy = false;
+  CMD.hasT = false;
+  CMD.units.length = 0;
+  if (CMD.on) toast("指挥模式：拖拽框选人类单位，再点地图让他们朝那里靠拢（Esc 退出）");
+  else toast("已退出指挥模式");
+}
+function cmdAbort() {
+  CMD.on = false;
+  CMD.busy = false;
+  CMD.hasT = false;
+  CMD.units.length = 0;
+}
+function cmdSelect(ax, ay, bx, by) {
+  var x0 = Math.min(ax, bx), x1 = Math.max(ax, bx);
+  var y0 = Math.min(ay, by), y1 = Math.max(ay, by);
+  CMD.units.length = 0;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+    var px = w2sx(u.x), py = w2sy(u.y);
+    if (px >= x0 && px <= x1 && py >= y0 && py <= y1) CMD.units.push(u);
+  }
+  if (CMD.units.length) toast("已选中 " + CMD.units.length + " 人，现在点地图，他们就会朝那里靠拢");
+  else toast("框里没有人类单位");
+}
+function cmdIssue(wx, wy) {
+  var n = 0;
+  for (var i = 0; i < CMD.units.length; i++) {
+    var u = CMD.units[i];
+    if (!u || u.dead) continue;
+    u.cmdTo = { x: wx, y: wy };
+    /* 立刻允许重新寻路：新单位的首次寻路被摊到了 0~5 秒（削峰用），
+       不下令清掉的话，玩家指挥之后它可能还要愣好几秒才肯挪窝 */
+    u.pathT = 0;
+    u.path = null;
+    u.stuckT = 0;
+    n++;
+  }
+  if (!n) { toast("选中的单位已经不在了"); CMD.units.length = 0; return; }
+  CMD.hasT = true;
+  CMD.tx = w2sx(wx);
+  CMD.ty = w2sy(wy);
+  storyLine("指挥官下令：" + n + " 人向目标靠拢", { col: CMD.col, life: 2.5 });
+}
+function drawCmdOverlay() {
+  if (!CMD.on) return;
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.globalAlpha = 1;
+  var i, u;
+  for (i = 0; i < CMD.units.length; i++) {
+    u = CMD.units[i];
+    if (!u || u.dead) continue;
+    CTX.beginPath();
+    CTX.arc(w2sx(u.x), w2sy(u.y), u.r * CAM.zoom + 5, 0, TAU);
+    CTX.strokeStyle = "rgba(" + CMD.col + ",0.9)";
+    CTX.lineWidth = 2;
+    CTX.stroke();
+  }
+  if (CMD.busy) {
+    var fx = Math.min(CMD.rx, CMD.tx), fy = Math.min(CMD.ry, CMD.ty);
+    var fw = Math.abs(CMD.tx - CMD.rx), fh = Math.abs(CMD.ty - CMD.ry);
+    CTX.fillStyle = "rgba(" + CMD.col + ",0.12)";
+    CTX.fillRect(fx, fy, fw, fh);
+    CTX.strokeStyle = "rgba(" + CMD.col + ",0.85)";
+    CTX.lineWidth = 1.5;
+    CTX.setLineDash([6, 4]);
+    CTX.strokeRect(fx, fy, fw, fh);
+    CTX.setLineDash([]);
+  }
+  if (CMD.hasT) {
+    CTX.beginPath(); CTX.arc(CMD.tx, CMD.ty, 11, 0, TAU);
+    CTX.strokeStyle = "rgba(" + CMD.col + ",0.9)";
+    CTX.lineWidth = 2;
+    CTX.stroke();
+    CTX.beginPath(); CTX.arc(CMD.tx, CMD.ty, 3.2, 0, TAU);
+    CTX.fillStyle = "rgba(" + CMD.col + ",0.95)";
+    CTX.fill();
+  }
+}
+
+/* 拍片用：按 H 把所有"操作界面"藏起来。
+   注意藏的是"能点的东西"（工具栏按钮、底栏、导演条、光标），
+   不是"战况读数"，击杀数、波次倒计时这些是给观众看的，必须留着：
+   观众得知道现在第几波、杀了多少，否则画面再干净也看不懂在演什么 */
+var HIDE_UI = false;
+function setHideUI(v) {
+  HIDE_UI = !!v;
+  var top = document.getElementById("top");
+  var bot = document.getElementById("bottom");
+  /* 顶栏只留状态文字，按钮全部收掉 */
+  if (top) top.className = HIDE_UI ? "bar hideui" : "bar";
+  if (bot) bot.style.display = HIDE_UI ? "none" : "";
+  if (toastEl) toastEl.style.display = HIDE_UI ? "none" : "";
+  if (typeof resize === "function") resize();
+  if (!HIDE_UI) toast("界面已显示（按 H 可再次隐藏）");
+}
+var $ = function (id) { return document.getElementById(id); };
+var statEl = null, overlayEl = null, panelEl = null, toastEl = null, toastT = 0;
+var keys = {}, autoSaveT = 0, lastFrameT = 0, accum = 0;
+/* ---------------------------- 玩家操控 ----------------------------
+   只作用于人类阵营。开关打开后点一名友军即可接管，关闭开关立刻把角色交还 AI。
+   被接管的角色照常参与碰撞、分离、编队与感染，丧尸也照常锁敌它，
+   玩家换掉的只是"由谁来决定往哪走、朝哪打" */
+var PLAYER = {
+  on: false, unit: null,
+  moveX: 0, moveY: 0,
+  aimX: 1, aimY: 0, aimLen: 0,
+  firing: false, pressing: false, pressT: 0, attackHeld: false, attackMode: "two",
+  stickL: null, stickR: null,
+  camHoldT: 0, pounceT: 0, hitT: 0, killT: 0,
+  fireMode: 0,       /* 0 = 全自动，1 = 半自动；V 键切换 */
+  semiShot: 0        /* 半自动模式下"攒着的那一发"，按一次点击就置 1 */
+};
+var STICK_R = 76;
+var _aimTgt = { x: 0, y: 0 };
+function playerUnitValid() {
+  var u = PLAYER.unit;
+  return !!(PLAYER.on && u && !u.dead && isHuman(u) && !isZombieSide(u));
+}
+function releasePlayerUnit(msg) {
+  if (PLAYER.unit && msg) toast(msg);
+  PLAYER.on = false;
+  PLAYER.unit = null;
+  var bc = document.getElementById("bControl");
+  if (bc) { bc.textContent = "操控"; bc.className = ""; }
+  UI.peek = null;
+  PLAYER.firing = false;
+  PLAYER.pressing = false;
+  PLAYER.stickL = null; PLAYER.stickR = null;
+}
+function togglePlayerControl() {
+  /* 只要操控模式还开着，不管单位是否已死亡/尸变，都先退出 */
+  if (PLAYER.on) {
+    releasePlayerUnit(null);
+    UI.peek = null;
+    toast("操控已关闭，角色交还 AI");
+    return;
+  }
+  PLAYER.on = true;
+  /* 打开操控时如果已经点选过某个人，直接接管他，手机上不用再点一次 */
+  var pk = UI.peek;
+  if (pk && !pk.dead && isHuman(pk) && !isZombieSide(pk)) {
+    PLAYER.unit = pk;
+    UI.peek = null;
+    var b1 = $("bControl");
+    if (b1) b1.className = "on";
+    toast("已接管：" + CFG.unit[pk.kind].name + "（WASD 移动 · 鼠标瞄准 · 按住左键射击；手机用左右摇杆）");
+    return;
+  }
+  var b = $("bControl");
+  if (b) b.className = PLAYER.on ? "on" : "";
+  toast("操控已开启：点一名人类单位选中他，再点一次「操控」即可接管");
+}
+/* 点在地图上选一名人类单位接管；只认人类阵营 */
+/* 指名升格：先按按钮进入"选人"状态，再点一名人类单位 */
+function togglePromotePick() {
+  if (W.over) { toast("本局已结束"); return; }
+  if (UI.promotePick) { UI.promotePick = false; syncPromoteBtn(); return; }
+  if (W.resources < CFG.hero.cost) { toast("资源不足（赐福需要 " + CFG.hero.cost + "）"); return; }
+  UI.promotePick = true;
+  syncPromoteBtn();
+  toast("点一名人类单位施以赐福（消耗 " + CFG.hero.cost + " 资源）");
+}
+function syncPromoteBtn() {
+  var b = $("bPromote");
+  if (b) b.className = UI.promotePick ? "on" : "";
+}
+function tryPromoteAt(wx, wy) {
+  var best = null, bd = 50 * 50, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u) || u.hero) continue;
+    var d = dist2(wx, wy, u.x, u.y);
+    if (d < bd) { bd = d; best = u; }
+  }
+  if (!best) { toast("这里没有可以赐福的人类单位"); return; }
+  if (W.resources < CFG.hero.cost) { toast("资源不足（赐福需要 " + CFG.hero.cost + "）"); return; }
+  W.resources -= CFG.hero.cost;
+  promoteHero(best, isArmed(best) ? "armed" : "civilian");
+  UI.promotePick = false;
+  syncPromoteBtn();
+}
+/* 点中一名人类单位（只看不动）：操控还没接管时，点人就是"查看" */
+function pickPeekUnit(sx, sy) {
+  var wx = s2wx(sx), wy = s2wy(sy);
+  var best = null, bd = 46 * 46;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u) || u.penned) continue;
+    var d = dist2(wx, wy, u.x, u.y);
+    if (d < bd) { bd = d; best = u; }
+  }
+  return best;
+}
+function pickPlayerUnit(sx, sy) {
+  var wx = s2wx(sx), wy = s2wy(sy);
+  var best = null, bd = 46 * 46;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead || !isHuman(u) || isZombieSide(u) || u.penned) continue;
+    var d = dist2(wx, wy, u.x, u.y);
+    if (d < bd) { bd = d; best = u; }
+  }
+  if (best) {
+    PLAYER.unit = best;
+    toast("已接管：" + CFG.unit[best.kind].name + "（关掉「操控」即可交还 AI）");
+  }
+}
+/* 摇杆：把触摸点折算成 -1..1 的方向与幅度 */
+function stickUpdate(st, px, py) {
+  st.x = px; st.y = py;
+  var dx = px - st.ox, dy = py - st.oy;
+  var m = Math.sqrt(dx * dx + dy * dy);
+  if (m > STICK_R) { dx = dx / m * STICK_R; dy = dy / m * STICK_R; m = STICK_R; }
+  st.nx = dx / STICK_R; st.ny = dy / STICK_R; st.mag = m / STICK_R;
+  st.kx = st.ox + dx; st.ky = st.oy + dy;
+}
+/* 每帧把键盘 / 鼠标 / 摇杆汇总成一组输入 */
+function stepPlayerInput(dt) {
+  if (PLAYER.pounceT > 0) PLAYER.pounceT -= dt;
+  if (PLAYER.hitT > 0) PLAYER.hitT -= dt;
+  if (PLAYER.killT > 0) PLAYER.killT -= dt;
+  if (PLAYER.on && PLAYER.unit && !playerUnitValid()) {
+    releasePlayerUnit("操控的角色已阵亡或尸变，自动交还 AI");
+  }
+  if (!PLAYER.on || !PLAYER.unit) { PLAYER.moveX = 0; PLAYER.moveY = 0; return; }
+  var mx = 0, my = 0;
+  if (!PLAYER.stickL) {
+    if (keyHeld("up")) my -= 1;
+    if (keyHeld("down")) my += 1;
+    if (keyHeld("left")) mx -= 1;
+    if (keyHeld("right")) mx += 1;
+  }
+  if (PLAYER.stickL) {
+    if (PLAYER.stickL.mag > 0.14) { PLAYER.moveX = PLAYER.stickL.nx; PLAYER.moveY = PLAYER.stickL.ny; }
+    else { PLAYER.moveX = 0; PLAYER.moveY = 0; }
+  } else {
+    PLAYER.moveX = mx; PLAYER.moveY = my;
+  }
+  /* 右摇杆：瞄准 + 自动开火 */
+  if (PLAYER.stickR && PLAYER.stickR.mag > 0.12) {
+    PLAYER.aimX = PLAYER.stickR.nx / PLAYER.stickR.mag;
+    PLAYER.aimY = PLAYER.stickR.ny / PLAYER.stickR.mag;
+    PLAYER.aimLen = Math.max(0.12, Math.min(1, PLAYER.stickR.mag));
+    /* 两指：右摇杆瞄准即开火；三指：右摇杆只瞄准，攻击交给悬浮攻击键 */
+    PLAYER.firing = PLAYER.attackHeld || PLAYER.attackMode !== "three";
+  } else if (!PLAYER.stickR) {
+    var u = PLAYER.unit;
+    /* 三指模式按住攻击键时，右摇杆松开后不要用左手触摸点覆盖最后瞄准方向 */
+    if (!(PLAYER.attackMode === "three" && PLAYER.attackHeld)) {
+      var wx = s2wx(UI.pointer.x), wy = s2wy(UI.pointer.y);
+      var dx = wx - u.x, dy = wy - u.y;
+      var m = Math.sqrt(dx * dx + dy * dy);
+      if (m > 1e-6) { PLAYER.aimX = dx / m; PLAYER.aimY = dy / m; PLAYER.aimLen = 1; }
+    }
+    /* 左键长按超过 0.16 秒才算射击：短按留给"点选角色" */
+    if (PLAYER.pressing) {
+      PLAYER.pressT += dt;
+      if (PLAYER.pressT > 0.16) PLAYER.firing = true;
+    }
+    if (PLAYER.attackHeld) PLAYER.firing = true;
+  } else {
+    PLAYER.firing = false;
+  }
+  /* R 键手动换弹（光环里弹药无限就不必了） */
+  var reloadKey = KEYMAP.reload;
+  if (reloadKey && keys[reloadKey] && PLAYER.unit && !PLAYER.unit.aura) {
+    keys[reloadKey] = false;                 /* 按住不重复触发 */
+    manualReload();
+  }
+}
+var fpsAcc = 0, fpsN = 0, fpsShown = 0;
+/* 画面亮度：1 是原样。小于 1 压暗、大于 1 提亮，只作用于战场那几层 */
+function setBrightness(v) {
+  CFG.brightness = clamp(v, 0.5, 1.5);
+  var t = document.getElementById("brightVal");
+  if (t) t.textContent = Math.round(CFG.brightness * 100) + "%";
+  try { localStorage.setItem("zombieSandbox.bright", String(CFG.brightness)); } catch (e) {}
+}
+function loadShake() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.shakeOn");
+    var sc = parseFloat(localStorage.getItem("zombieSandbox.shakeScale"));
+    if (on !== null) CFG.shake.enabled = on === "1";
+    if (isFinite(sc)) CFG.shake.scale = Math.max(0, Math.min(1.5, sc));
+    var dist = localStorage.getItem("zombieSandbox.shakeDist");
+    if (dist !== null) CFG.shake.distance = dist === "1";
+  } catch (e) {}
+}
+function loadVisualFx() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.visualFx");
+    if (on !== null) CFG.visualFx.enabled = on === "1";
+  } catch (e) {}
+}
+function saveVisualFx() {
+  try { localStorage.setItem("zombieSandbox.visualFx", CFG.visualFx.enabled ? "1" : "0"); } catch (e) {}
+}
+function loadMinimalStats() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.minimalStats");
+    if (on !== null) CFG.minimalStats = on === "1";
+  } catch (e) {}
+}
+function saveMinimalStats() {
+  try { localStorage.setItem("zombieSandbox.minimalStats", CFG.minimalStats ? "1" : "0"); } catch (e) {}
+}
+function loadReplay() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.replayOn");
+    if (on !== null) CFG.replay.enabled = on === "1";
+  } catch (e) {}
+}
+function saveReplay() {
+  try { localStorage.setItem("zombieSandbox.replayOn", CFG.replay.enabled ? "1" : "0"); } catch (e) {}
+}
+function loadGlowLayer() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.glowLayer");
+    var st = parseFloat(localStorage.getItem("zombieSandbox.glowStrength"));
+    if (on !== null) CFG.glowLayer.enabled = on === "1";
+    if (isFinite(st)) CFG.glowLayer.strength = Math.max(0, Math.min(1, st));
+  } catch (e) {}
+}
+function saveGlowLayer() {
+  try {
+    localStorage.setItem("zombieSandbox.glowLayer", CFG.glowLayer.enabled ? "1" : "0");
+    localStorage.setItem("zombieSandbox.glowStrength", String(CFG.glowLayer.strength));
+  } catch (e) {}
+}
+function loadQuality() {
+  try {
+    var on = localStorage.getItem("zombieSandbox.qualityAdapt");
+    if (on !== null) CFG.quality.enabled = on === "1";
+  } catch (e) {}
+  if (!CFG.quality.enabled) QUALITY.scale = 1;
+}
+function saveQuality() {
+  try { localStorage.setItem("zombieSandbox.qualityAdapt", CFG.quality.enabled ? "1" : "0"); } catch (e) {}
+}
+function updateQualityLabel() {
+  var el = document.getElementById("qualityInfo");
+  if (!el) return;
+  el.textContent = "当前渲染比例：" + Math.round(QUALITY.scale * 100) + "% · " +
+    (CFG.quality.enabled ? "自动" : "固定");
+}
+function saveShake() {
+  try {
+    localStorage.setItem("zombieSandbox.shakeOn", CFG.shake.enabled ? "1" : "0");
+    localStorage.setItem("zombieSandbox.shakeScale", String(CFG.shake.scale));
+    localStorage.setItem("zombieSandbox.shakeDist", CFG.shake.distance === false ? "0" : "1");
+  } catch (e) {}
+}
+function loadBrightness() {
+  try {
+    var v = parseFloat(localStorage.getItem("zombieSandbox.bright"));
+    if (isFinite(v) && v >= 0.5 && v <= 1.5) CFG.brightness = v;
+  } catch (e) {}
+}
+/* ---------------------------- 设置 / 帮助面板 ---------------------------- */
+/* 控件本体只有一份，放在 settingBag 里整体搬进搬出：
+   这样 id 和事件绑定都不用重做，也不会出现"面板关了控件却留在面板里" */
+var SETTINGS_HOME = null;
+function showSettingsPanel() {
+  loadShake();
+  loadQuality();
+  loadGlowLayer();
+  loadVisualFx();
+  loadMinimalStats();
+  loadReplay();
+  if (document.getElementById("moreHost")) morePark();
+  var bag = $("settingBag");
+  if (!bag) return;
+  if (!SETTINGS_HOME) SETTINGS_HOME = bag.parentNode;
+  /* 上次如果不是走「关闭」离开的，控件可能还留在旧面板里，先收回来 */
+  if (document.getElementById("setPlayHost")) settingsPark();
+  panelEl.className = "";
+  panelEl.innerHTML =
+    "<h2>设置与画面</h2>" +
+    "<div class='setSec'><h3>一、音效</h3>" +
+      "<div class='setRow'><span>音量</span><input type='range' id='volSlot' min='0' max='150' value='95'>" +
+      "<b id='volVal2'>95%</b></div></div>" +
+    "<div class='setSec'><h3>二、画面</h3>" +
+      "<div class='setRow'><span>亮度</span><input type='range' id='brightRange' min='50' max='150' value='100'>" +
+      "<b id='brightVal'>100%</b></div>" +
+      "<p class='netTip'>亮度只影响战场本身，界面和文字不会被一起调暗。</p>" +
+      "<div class='setRow'><span>自动画质</span><label><input type='checkbox' id='qualityAdapt'" + (CFG.quality.enabled ? " checked" : "") + "> 根据帧率调整渲染比例</label></div>" +
+      "<p class='netTip' id='qualityInfo'>当前渲染比例：100%</p>" +
+      "<div class='setRow'><span>动态光晕</span><label><input type='checkbox' id='glowLayerOn'" + (CFG.glowLayer.enabled ? " checked" : "") + "> 枪口、爆炸与首领局部光晕</label></div>" +
+      "<div class='setRow'><span>光晕强度</span><input type='range' id='glowStrength' min='0' max='100' value='" + Math.round((CFG.glowLayer.strength || 0.48) * 100) + "'><b id='glowStrengthV'>" + Math.round((CFG.glowLayer.strength || 0.48) * 100) + "%</b></div>" +
+      "<div class='setRow'><span>画面增强</span><label><input type='checkbox' id='fxOn'" + (CFG.visualFx.enabled ? " checked" : "") + "> 子弹曳光、墙缘高光、角色轮廓光</label></div>" +
+      "<div class='setRow'><span>极简统计</span><label><input type='checkbox' id='minimalStats'" + (CFG.minimalStats ? " checked" : "") + "> 只显示人类与丧尸总占比</label></div>" +
+      "<div class='setRow'><span>配色</span><div class='palRow' id='palRow'></div></div></div>" +
+    "<div class='setSec'><h3>三、屏幕震动</h3>" +
+      "<p><label><input type='checkbox' id='shakeOn'" + (CFG.shake.enabled ? " checked" : "") + "> 启用屏幕震动</label></p>" +
+      "<div class='setRow'><span>震动强度系数</span><input type='range' id='shakeScale' min='0' max='150' value='" + Math.round((CFG.shake.scale === undefined ? 1 : CFG.shake.scale) * 100) + "'><b id='shakeScaleV'>" + Math.round((CFG.shake.scale === undefined ? 1 : CFG.shake.scale) * 100) + "%</b></div>" +
+      "<p><label><input type='checkbox' id='shakeDistance'" + (CFG.shake.distance !== false ? " checked" : "") + "> 按镜头距离衰减普通震动</label></p>" +
+      "<p class='netTip'>特殊事件使用全局震动；开枪、命中、激光等普通震动会随离镜头中心变远而减弱。单次震动有强度上限和时长上限，暂停时立即停止。</p></div>" +
+    "<div class='setSec'><h3>四、玩法与操作</h3><div id='setPlayHost' class='setBtns'></div></div>" +
+    "<details class='setAdv'><summary>四、调试与版本</summary><div id='setDebugHost' class='setBtns'></div></details>" +
+    "<details class='setAdv'><summary>创作者工具 · 录像与回放</summary>" +
+      "<p class='netTip'>仅用于创作者观察和编辑，不属于玩家主流程；默认收起，不再继续扩展。</p>" +
+      "<div class='setRow'><span>战局录像</span><button id='recBtn'>开始录像</button><b id='recInfo'>未录制</b></div>" +
+      "<div class='setRow'><span>战局快照</span><label><input type='checkbox' id='replayOn'" + (CFG.replay.enabled ? " checked" : "") + "> 记录单位快照</label></div>" +
+      "<div class='setRow'><span></span><button id='replayExport'>导出 JSON</button><button id='replayOpen'>打开回放</button><b id='replayInfo'>暂无快照</b></div>" +
+      "<div class='setRow'><span>首领统计</span><button id='bossStatsRefresh'>刷新</button><b id='bossStatsInfo'>—</b></div>" +
+    "</details>" +
+    "<p style='text-align:right'><button id='setSaveAll' style='background:#2b4a86;border-color:#4b76d1'>保存当前设置</button> <button id='setClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var playHost = $("setPlayHost"), dbgHost = $("setDebugHost");
+  var dbgBag = $("debugBag");
+  if (dbgBag && dbgHost) dbgHost.appendChild(dbgBag);
+  if (playHost) {
+    /* 音量源滑块留在 bag 里，但不能在 while 循环里再塞回 bag：
+       否则 firstChild 永远是它，主线程会死循环 */
+    var volSrc = document.getElementById("volRange");
+    if (volSrc && volSrc.parentNode === bag) bag.removeChild(volSrc);
+    /* 防御性上限：任何搬控件逻辑都不允许无限循环，宁可漏搬也不能冻住主线程 */
+    var moveGuard = 0;
+    while (bag.firstChild && moveGuard++ < 200) playHost.appendChild(bag.removeChild(bag.firstChild));
+    if (volSrc) bag.appendChild(volSrc);
+  }
+  bag.style.display = "none";
+  /* 把音量滑块接到面板里那个位置，原滑块藏在 bag 里，直接取它的值 */
+  var src = $("volRange");
+  var slot = $("volSlot");
+  if (src && slot) {
+    slot.value = src.value;
+    slot.addEventListener("input", function () {
+      src.value = this.value;
+      src.dispatchEvent(new Event("input"));
+      var v = $("volVal2"); if (v) v.textContent = this.value + "%";
+    });
+    var vv = $("volVal2"); if (vv) vv.textContent = src.value + "%";
+  }
+  updateQualityLabel();
+  var qa = $("qualityAdapt");
+  if (qa) qa.addEventListener("change", function () {
+    CFG.quality.enabled = !!this.checked;
+    if (!CFG.quality.enabled) { QUALITY.scale = 1; resize(); }
+    saveQuality();
+    updateQualityLabel();
+  });
+  var gl = $("glowLayerOn");
+  if (gl) gl.addEventListener("change", function () {
+    CFG.glowLayer.enabled = !!this.checked;
+    saveGlowLayer();
+  });
+  var fxo = $("fxOn");
+  if (fxo) fxo.addEventListener("change", function () {
+    CFG.visualFx.enabled = !!this.checked;
+    saveVisualFx();
+  });
+  var mst = $("minimalStats");
+  if (mst) mst.addEventListener("change", function () {
+    CFG.minimalStats = !!this.checked;
+    saveMinimalStats();
+  });
+  var recBtn = $("recBtn");
+  if (recBtn) recBtn.addEventListener("click", function () { startBattleRecord(); });
+  updateRecordUI();
+  var rpOn = $("replayOn");
+  if (rpOn) rpOn.addEventListener("change", function () {
+    CFG.replay.enabled = !!this.checked;
+    saveReplay();
+    updateReplayUI();
+  });
+  var rpBtn = $("replayExport");
+  if (rpBtn) rpBtn.addEventListener("click", function () { exportReplay(); });
+  var bsBtn = $("bossStatsRefresh");
+  if (bsBtn) bsBtn.addEventListener("click", function () { updateBossStatsUI(); });
+  updateBossStatsUI();
+  var rpOpen = $("replayOpen");
+  if (rpOpen) rpOpen.addEventListener("click", function () {
+    settingsPark();
+    closeOverlaySmart();
+    openReplay();
+  });
+  updateReplayUI();
+  var gs = $("glowStrength");
+  if (gs) gs.addEventListener("input", function () {
+    CFG.glowLayer.strength = Math.max(0, Math.min(1, (parseInt(this.value, 10) || 0) / 100));
+    var gv = $("glowStrengthV"); if (gv) gv.textContent = this.value + "%";
+    saveGlowLayer();
+  });
+  var br = $("brightRange");
+  if (br) {
+    br.value = String(Math.round(CFG.brightness * 100));
+    var bv = $("brightVal"); if (bv) bv.textContent = br.value + "%";
+    br.addEventListener("input", function () { setBrightness(this.value / 100); });
+  }
+  /* 配色主题：一排按钮，点一下整张图换色 */
+  var palRow = $("palRow");
+  if (palRow) {
+    var pid;
+    for (pid in PALETTE_THEMES) {
+      (function (id) {
+        var b = document.createElement("button");
+        b.textContent = PALETTE_THEMES[id].name;
+        if (CFG.palette.theme === id) b.className = "on";
+        b.addEventListener("click", function () {
+          applyPaletteTheme(id);
+          var row = $("palRow");
+          if (row && row.children) {
+            for (var ci = 0; ci < row.children.length; ci++) row.children[ci].className = "";
+          }
+          b.className = "on";
+        });
+        palRow.appendChild(b);
+      })(pid);
+    }
+  }
+  var shakeOn = $("shakeOn"), shakeScale = $("shakeScale"), shakeDist = $("shakeDistance");
+  if (shakeOn) shakeOn.addEventListener("change", function () {
+    CFG.shake.enabled = !!this.checked;
+    saveShake();
+  });
+  if (shakeScale) shakeScale.addEventListener("input", function () {
+    CFG.shake.scale = Math.max(0, Math.min(1.5, (parseInt(this.value, 10) || 0) / 100));
+    var sv = $("shakeScaleV"); if (sv) sv.textContent = this.value + "%";
+    saveShake();
+  });
+  if (shakeDist) shakeDist.addEventListener("change", function () {
+    CFG.shake.distance = !!this.checked;
+    saveShake();
+  });
+  var setSave = $("setSaveAll");
+  if (setSave) setSave.addEventListener("click", function () {
+    var on = $("shakeOn"), sc = $("shakeScale"), dist = $("shakeDistance");
+    if (on) CFG.shake.enabled = !!on.checked;
+    if (sc) CFG.shake.scale = Math.max(0, Math.min(1.5, (parseInt(sc.value, 10) || 0) / 100));
+    if (dist) CFG.shake.distance = !!dist.checked;
+    var qaSave = $("qualityAdapt");
+    if (qaSave) CFG.quality.enabled = !!qaSave.checked;
+    if (!CFG.quality.enabled) { QUALITY.scale = 1; resize(); }
+    saveQuality();
+    updateQualityLabel();
+    var glSave = $("glowLayerOn");
+    if (glSave) CFG.glowLayer.enabled = !!glSave.checked;
+    var gsSave = $("glowStrength");
+    if (gsSave) CFG.glowLayer.strength = Math.max(0, Math.min(1, (parseInt(gsSave.value, 10) || 0) / 100));
+    saveGlowLayer();
+    var rpSave = $("replayOn");
+    if (rpSave) CFG.replay.enabled = !!rpSave.checked;
+    saveReplay();
+    saveShake();
+    var sv = $("shakeScaleV"); if (sv) sv.textContent = Math.round(CFG.shake.scale * 100) + "%";
+    toast("屏幕震动设置已保存");
+  });
+  var cl = $("setClose");
+  if (cl) cl.addEventListener("click", function () { settingsPark(); closeOverlaySmart(); });
+}
+function settingsPark() {
+  var bag = $("settingBag");
+  if (!bag) return;
+  var dbg = $("setDebugHost"), play = $("setPlayHost"), dbgBag = $("debugBag");
+  if (dbgBag && dbg) bag.appendChild(dbgBag);
+  if (play) { while (play.firstChild) bag.appendChild(play.firstChild); }
+  if (SETTINGS_HOME) { SETTINGS_HOME.appendChild(bag); bag.style.display = "none"; }
+}
+function showMorePanel() {
+  if (document.getElementById("moreHost")) morePark();
+  if (document.getElementById("setDebugHost")) settingsPark();
+  panelEl.className = "";
+  panelEl.innerHTML =
+    "<h2>帮助与其他</h2>" +
+    "<p style='text-align:right;margin:-4px 0 10px'><button id='moreHelp'>玩法说明</button> " +
+    "<button id='morePatch'>更新公告</button> " +
+    "<button id='moreHistory'>版本号详情</button> " +
+    "<button id='moreTutor'>重看新手引导</button></p>" +
+    "<h3>排查与调试</h3><div id='moreHost'></div>" +
+    "<p style='text-align:right'><button id='moreClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var src = $("debugBag");
+  var host = $("moreHost");
+  if (src && host) { host.appendChild(src); src.style.display = ""; }
+  var h1 = $("moreHelp"); if (h1) h1.addEventListener("click", showHelp);
+  var h2 = $("morePatch"); if (h2) h2.addEventListener("click", showPatchNote);
+  var hh = $("moreHistory"); if (hh) hh.addEventListener("click", showPatchHistory);
+  var h3 = $("moreTutor");
+  if (h3) h3.addEventListener("click", function () {
+    hideOverlay();
+    try { tutorReset(); } catch (e) {}
+    TUTOR.i = 0;
+    showTutor(0);
+  });
+  var mc = $("moreClose");
+  if (mc) mc.addEventListener("click", function () { morePark(); hideOverlay(); });
+}
+function morePark() {
+  var d = $("debugBag");
+  var bag = $("settingBag");
+  if (!d || !bag) return;
+  /* 不再要求 bag.parentNode === SETTINGS_HOME：Esc/点空白关闭时也要把调试控件收回去，
+     否则下一次 panelEl.innerHTML 会连同 #debugBag 一起清掉，刷新前就少了按钮 */
+  bag.appendChild(d);
+  d.style.display = "none";
+}
+/* ---------------------------- 阵营兵种库 ---------------------------- */
+/* 所有和"有哪些兵种"有关的判断都从这里读，不再手写名单。
+   加新兵种、删自定义兵种之后调用 rebuildFactionKinds() 就会全线生效。 */
+var HUMAN_KINDS = [];
+var ZOMBIE_KINDS = [];
+/* 排序参考：列表里有的按这个顺序排，没列到的自动排在后面。
+   它只影响观感，不影响"能不能用"，新增兵种忘了加进来顶多是排最后 */
+var KIND_ORDER = ["rifle", "mg", "sniper", "shield", "medic",
+                  "cryo", "flame", "tesla", "laser", "civilian",
+                  "zombie", "runner", "licker", "bomber", "mother"];
+function kindRank(k) {
+  var i = KIND_ORDER.indexOf(k);
+  return i < 0 ? 999 : i;
+}
+function rebuildFactionKinds() {
+  HUMAN_KINDS.length = 0;
+  ZOMBIE_KINDS.length = 0;
+  var k, c;
+  for (k in CFG.unit) {
+    c = CFG.unit[k];
+    if (!c || !c.name || c.hidden) continue;
+    if (isZombieKind(k)) ZOMBIE_KINDS.push(k);
+    else HUMAN_KINDS.push(k);
+  }
+  HUMAN_KINDS.sort(function (a, b) { return kindRank(a) - kindRank(b); });
+  ZOMBIE_KINDS.sort(function (a, b) { return kindRank(a) - kindRank(b); });
+}
+function isUnitKind(k) {
+  return HUMAN_KINDS.indexOf(k) >= 0 || ZOMBIE_KINDS.indexOf(k) >= 0;
+}
+/* 按阵营库重新生成两个下拉框。编队选项只出现在投放栏（编辑器里不摆编队） */
+function buildUnitOptions(withSquad) {
+  var h = "<option value=''>" + (withSquad ? "— 不放任何东西 —" : "放置单位…") + "</option>";
+  var i, k;
+  h += "<optgroup label='人类阵营'>";
+  for (i = 0; i < HUMAN_KINDS.length; i++) {
+    k = HUMAN_KINDS[i];
+    if (k === "militia" && !withSquad) continue;
+    h += "<option value='" + k + "'>" + CFG.unit[k].name + "</option>";
+  }
+  if (withSquad) {
+    h += "<option value='supportSquad'>" + supportLabel("squad", true) + "</option>";
+    h += "<option value='supportSpecial'>" + supportLabel("special", true) + "</option>";
+    h += "<option value='supportLegion'>" + supportLabel(START.emperor ? "emperor" : "legion", true) + "</option>";
+    h += "<option value='supportEmperor'>" + supportLabel("emperor", true) + "</option>";
+  }
+  h += "</optgroup>";
+  h += "<optgroup label='丧尸阵营'>";
+  for (i = 0; i < ZOMBIE_KINDS.length; i++) {
+    k = ZOMBIE_KINDS[i];
+    h += "<option value='" + k + "'>" + CFG.unit[k].name + "</option>";
+  }
+  h += "</optgroup>";
+  if (withSquad) h += "<optgroup label='工事'><option value='sandbag'>沙袋</option></optgroup>";
+  return h;
+}
+function refreshUnitSelects() {
+  var eds = document.getElementById("editUnitSel");
+  var ps = document.getElementById("placeSel");
+  var curP = ps ? ps.value : "";
+  if (eds) eds.innerHTML = buildUnitOptions(false);
+  if (ps) {
+    ps.innerHTML = buildUnitOptions(true);
+    if (curP && ps.querySelector("option[value='" + curP + "']")) ps.value = curP;
+    else if (curP) selectPlace(null);
+  }
+}
+/* ---------------------------- 联机 ---------------------------- */
+/* 信令走 pages.dev（workers.dev 在国内被 DNS 污染），WebRTC 打通之后
+   游戏数据走 P2P 直连，不再经过任何服务器。 */
+var NET = {
+  on: false,
+  role: null,              /* "host" / "guest"，由双方 id 比大小自动决定 */
+  room: "",
+  state: "idle",           /* idle / signaling / webrtc / ready / failed */
+  ws: null, pc: null, dc: null,
+  myId: "", remoteId: "",
+  queue: [],               /* 收到的消息，统一在主循环里处理，避免回调里改游戏状态 */
+  helloReplied: false,
+  roleDecided: false,
+  pendingIce: [],
+  remoteSet: false,
+  candCount: 0,
+  err: "",
+  peerGone: false,
+  remotePaused: false      /* 当前这次暂停是不是对面要求的 */
+};
+/* 追帧：发现和房主不同步时，成员按房主的种子重建，然后空跑追上进度 */
+var RESYNC = { active: false, target: 0, asked: 0 };
+var NET_URL = "wss://zangbishahe.pages.dev/api/signal/";
+/* 房间号用四位数字：手机上直接弹数字键盘，念给对方也不会听错。
+   撞车概率按同时在线十来局算不到百分之一，真撞上换个号就行 */
+function netRandomRoom() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+var NET_ICE = {
+  iceServers: [
+    { urls: "stun:stun.cloudflare.com:3478" },
+    { urls: "stun:stun.l.google.com:19302" }
+  ]
+};
+NET.set = function (s, e) {
+  this.state = s;
+  if (e !== undefined) this.err = e;
+  netRefresh();
+};
+NET.send = function (obj) {
+  if (this.dc && this.dc.readyState === "open") {
+    try { this.dc.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+  }
+  return false;
+};
+NET.signal = function (obj) {
+  if (this.ws && this.ws.readyState === 1) {
+    try { this.ws.send(JSON.stringify(obj)); return true; } catch (e) { return false; }
+  }
+  return false;
+};
+NET.newPeer = function () {
+  var self = this;
+  var pc = new RTCPeerConnection(NET_ICE);
+  this.pc = pc;
+  pc.onicecandidate = function (e) {
+    if (e.candidate) {
+      self.candCount++;
+      self.signal({ type: "ice", c: e.candidate });
+      netRefresh();
+    }
+  };
+  pc.oniceconnectionstatechange = function () {
+    if (pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed") {
+      if (self.state !== "ready") self.set("webrtc");
+    } else if (pc.iceConnectionState === "failed") {
+      self.set("failed", "打洞失败：双方都在对称 NAT 后面，或者一方禁用了 WebRTC");
+    }
+  };
+  pc.ondatachannel = function (e) {
+    self.dc = e.channel;
+    netBindChannel();
+  };
+};
+NET.offer = function () {
+  var self = this;
+  if (!this.pc) this.newPeer();
+  this.dc = this.pc.createDataChannel("game", { ordered: true });
+  netBindChannel();
+  this.pc.createOffer().then(function (o) {
+    return self.pc.setLocalDescription(o);
+  }).then(function () {
+    self.signal({ type: "offer", sdp: self.pc.localDescription });
+  }).catch(function (e) { self.set("failed", "发起失败：" + e.message); });
+};
+NET.flushIce = function () {
+  var self = this;
+  if (!this.pc || !this.remoteSet) return;
+  while (this.pendingIce.length) {
+    var c = this.pendingIce.shift();
+    try { this.pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) {}
+  }
+};
+NET.onSignal = function (m) {
+  var self = this;
+  if (m.type === "hello") {
+    this.remoteId = m.id;
+    if (m.role) this.remoteWant = m.role;
+    if (!this.helloReplied) {
+      this.helloReplied = true;
+      this.signal({ type: "hello", id: this.myId, role: this.wantRole });
+    }
+    if (!this.roleDecided) {
+      this.roleDecided = true;
+      /* 房主 = 点「创建房间」的那个人，他的世界优先。
+         只有两边都选了同一个身份（都创建或都加入）时，才退回比 id 大小来决定谁发起 */
+      var iAmHost;
+      if (this.wantRole === "host" && this.remoteWant !== "host") iAmHost = true;
+      else if (this.wantRole === "guest" && this.remoteWant === "host") iAmHost = false;
+      else iAmHost = this.myId < this.remoteId;
+      if (iAmHost) {
+        this.role = "host";
+        toast("你是房主，由你发起连接，你的开局会同步给对方");
+        this.offer();
+      } else {
+        this.role = "guest";
+        toast("你是成员，等待房主发起");
+      }
+      netRefresh();
+    }
+    return;
+  }
+  if (m.type === "offer") {
+    if (!this.pc) this.newPeer();
+    this.pc.setRemoteDescription(new RTCSessionDescription(m.sdp)).then(function () {
+      self.remoteSet = true;
+      self.flushIce();
+      return self.pc.createAnswer();
+    }).then(function (a) {
+      return self.pc.setLocalDescription(a);
+    }).then(function () {
+      self.signal({ type: "answer", sdp: self.pc.localDescription });
+    }).catch(function (e) { self.set("failed", "应答失败：" + e.message); });
+    return;
+  }
+  if (m.type === "answer") {
+    if (!this.pc) return;
+    this.pc.setRemoteDescription(new RTCSessionDescription(m.sdp)).then(function () {
+      self.remoteSet = true;
+      self.flushIce();
+    }).catch(function (e) { self.set("failed", "握手失败：" + e.message); });
+    return;
+  }
+  if (m.type === "ice") {
+    if (!this.pc || !this.remoteSet) { this.pendingIce.push(m.c); return; }
+    try { this.pc.addIceCandidate(new RTCIceCandidate(m.c)); } catch (e) {}
+  }
+};
+NET.connect = function (room, asHost) {
+  var self = this;
+  this.close();
+  this.room = room;
+  this.wantRole = asHost ? "host" : "guest";
+  this.myId = Math.random().toString(36).slice(2, 10);
+  this.helloReplied = false;
+  this.roleDecided = false;
+  this.role = null;
+  this.remoteId = "";
+  this.candCount = 0;
+  this.pendingIce = [];
+  this.remoteSet = false;
+  this.peerGone = false;
+  this.set("signaling");
+  var ws;
+  try {
+    ws = new WebSocket(NET_URL + "?room=" + encodeURIComponent(room));
+  } catch (e) {
+    this.set("failed", "信令连接失败：" + e.message);
+    return;
+  }
+  this.ws = ws;
+  ws.onopen = function () {
+    self.set("signaling");
+    self.signal({ type: "hello", id: self.myId, role: self.wantRole });
+    netRefresh();
+  };
+  ws.onmessage = function (ev) {
+    var m;
+    try { m = JSON.parse(ev.data); } catch (e) { return; }
+    self.onSignal(m);
+  };
+  ws.onerror = function () { self.set("failed", "信令出错，检查网络或网址"); };
+  ws.onclose = function (ev) {
+    if (self.state === "failed" || self.peerGone) return;
+    if (ev.code === 1013) {
+      self.set("failed", "这个号码已经被别人占用了，换一个再来");
+    } else if (ev.code === 1006) {
+      /* 手机切后台、锁屏、切飞行模式都是这个码 */
+      self.set("failed", "连接意外断开了（手机切到后台或网络切换常见），回到游戏会自动重连");
+    } else if (ev.code !== 1000) {
+      self.set("failed", "信令断开 code=" + ev.code);
+    }
+  };
+};
+NET.close = function () {
+  netShowPauseTip(false);
+  if (this.dc) { try { this.dc.close(); } catch (e) {} }
+  if (this.pc) { try { this.pc.close(); } catch (e) {} }
+  if (this.ws) { try { this.ws.close(1000, "bye"); } catch (e) {} }
+  this.dc = null; this.pc = null; this.ws = null;
+  this.on = false;
+  this.role = null;
+  this.remoteId = "";
+  this.candCount = 0;
+  this.state = "idle";
+  netRefresh();
+};
+/* 玩家离开时通知对面，免得他一个人对着空气玩 */
+NET.disconnect = function () {
+  this.send({ t: "bye" });
+  this.close();
+  toast("已断开联机");
+};
+/* 暂停面板：只在自己按暂停时出现，联机对方暂停只显示顶部提示，不抢界面 */
+var PAUSE_OPEN = false;
+function hidePausePanel() {
+  if (!PAUSE_OPEN) return;
+  PAUSE_OPEN = false;
+  if (overlayEl && overlayEl.className === "show" && panelEl && panelEl.getAttribute("data-panel") === "pause") {
+    overlayEl.className = "";
+  }
+}
+function showPausePanel() {
+  if (!panelEl || W.over || overlayEl.className === "show") return;
+  PAUSE_OPEN = true;
+  panelEl.className = "";
+  panelEl.setAttribute("data-panel", "pause");
+  var c = countUnits();
+  panelEl.innerHTML =
+    "<h2>战局摘要</h2>" +
+    "<p style='margin:-4px 0 12px;color:#9fb4dd;font-size:12.5px'>这是上一局的战况摘要。点「继续」回到战场，点「重开」进入下一局编辑。</p>" +
+    "<div class='statGrid'>" +
+      "<div><span>时间</span><b>" + fmtTime(W.t) + "</b></div>" +
+      "<div><span>击杀</span><b>" + W.kills + "</b></div>" +
+      "<div><span>感染</span><b>" + W.infected + "</b></div>" +
+      "<div><span>资源</span><b>" + Math.floor(W.resources) + "</b></div>" +
+      "<div><span>人类</span><b>" + c.h + "</b></div>" +
+      "<div><span>丧尸</span><b>" + c.z + "</b></div>" +
+    "</div>" + combatBoardsHtml() +
+    "<div class='pauseBtns'>" +
+      "<button id='pzResume' class='primary'>▶ 继续</button>" +
+      "<button id='pzSettings'>设置</button>" +
+      "<button id='pzRestart'>重开</button>" +
+      "<button id='pzHome'>返回主页</button>" +
+    "</div>" +
+    "<p style='margin:10px 0 0;color:#7f93a0;font-size:11.5px'>提示：也可以直接点顶栏的「继续」恢复。</p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  drawStatIcons(panelEl);
+  var rb = $("pzResume"); if (rb) rb.addEventListener("click", function () { setPausedState(false, false); });
+  var sb = $("pzSettings"); if (sb) sb.addEventListener("click", function () { OVERLAY_BACK = showPausePanel; showSettingsPanel(); });
+  var rs = $("pzRestart"); if (rs) rs.addEventListener("click", function () { setPausedState(false, false); hideOverlay(); resetForSetup(); showStartPanel(); });
+  var hm = $("pzHome"); if (hm) hm.addEventListener("click", function () { setPausedState(false, false); hideOverlay(); showHome(); });
+}
+/* 暂停是双方同步的：一方停下，另一方也停下，免得对面还在挨打
+   remote=true 表示这次暂停是对方要求的，不要回广播，否则两边会互相触发 */
+function setPausedState(v, remote) {
+  W.paused = !!v;
+  if (W.paused) { W.shakeT = 0; W.shakeMag = 0; }
+  /* 自己按的暂停，就不再算作"对方要求的"，提示条没有存在的理由 */
+  if (!remote) NET.remotePaused = false;
+  var pb = document.getElementById("bPause");
+  if (pb) {
+    pb.textContent = W.paused ? "继续" : "暂停";
+    pb.className = W.paused ? "on" : "";
+  }
+  if (!remote && NET.on) NET.send({ t: "pause", on: W.paused ? 1 : 0 });
+  /* 提示条的唯一判据：既在联机、又停着、而且这次停下是对方要求的。
+     之前只在"收到对方消息"那一条路径里收提示，自己解除暂停时它就赖着不走了 */
+  netShowPauseTip(!!(NET.on && W.paused && NET.remotePaused));
+  /* 暂停不再自动弹出面板：只冻结战场，避免挡住操作；需要摘要时从菜单进入 */
+  if (!W.paused) hidePausePanel();
+}
+/* 屏幕上方那条"对方已暂停" */
+function netShowPauseTip(on) {
+  var el = document.getElementById("netPauseTip");
+  if (!el) {
+    el = document.createElement("div");
+    el.id = "netPauseTip";
+    el.style.cssText = "position:fixed;left:50%;top:14%;transform:translateX(-50%);" +
+      "background:rgba(12,18,32,.94);border:1px solid #35507f;border-radius:10px;" +
+      "padding:9px 22px;color:#ffd479;font-size:15px;letter-spacing:1px;z-index:19;" +
+      "pointer-events:none;box-shadow:0 10px 30px rgba(0,0,0,.6);display:none";
+    document.body.appendChild(el);
+  }
+  el.textContent = on ? "对方已暂停" : "";
+  el.style.display = on ? "block" : "none";
+}
+NET.step = function () {
+  if (!this.queue.length) return;
+  var i;
+  for (i = 0; i < this.queue.length; i++) netHandle(this.queue[i]);
+  this.queue.length = 0;
+};
+/* 手机切后台回来时，WebSocket 多半已经被系统掐了。
+   这里做一次自动重连，省得玩家自己去点按钮 */
+var netRetryT = 0;
+function netAutoRetry() {
+  if (!NET.room) return;
+  if (NET.state !== "failed") return;
+  if (NET.peerGone) return;
+  var now = Date.now();
+  if (now - netRetryT < 3000) return;      /* 别连太急 */
+  netRetryT = now;
+  toast("正在重新连接…");
+  NET.connect(NET.room);
+}
+if (typeof document !== "undefined" && document.addEventListener) {
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState !== "visible") return;
+    netAutoRetry();
+  });
+}
+/* ---------------------------- 确定性锁步 ---------------------------- */
+/* 联机时两端各跑一份完全相同的模拟，只交换"玩家的输入"。
+   操作不当场执行，而是约定一个延迟帧数再执行，这样对方的输入有时间送到，
+   两边就会在同一个帧号上做同一件事，结果必然一致（模拟是确定性的）。
+   单机时 LOCK.on 为 false，所有操作照旧立即执行。 */
+var LOCK = {
+  on: false,
+  frame: 0,
+  delay: 8,               /* 约 133ms，够一次往返 */
+  pending: [],            /* 等着执行的命令 */
+  localHash: "",
+  remoteHash: "",
+  peerFrame: -1,
+  peerHashF: -1,
+  hist: {},               /* 帧号 -> 本地指纹，供按帧对账 */
+  log: [],                /* 最近执行过的命令：重建时用它把丢掉的操作补回来 */
+  maxLog: 600,
+  leadLimit: 3,           /* 帧号领先对方超过这么多就先停下等一等 */
+  lastTick: 0,
+  lastTickMs: 0,
+  peerFrameT: 0,
+  waitSince: 0,
+  lastCheck: 0,
+  checkEvery: 300,        /* 改成 5 秒对一次账：每秒算哈希+发消息本身就够呛 */
+  resyncTries: 0,         /* 已经尝试过几次重同步 */
+  mismatch: 0,
+  sent: 0,
+  got: 0
+};
+LOCK.reset = function () {
+  this.frame = 0;
+  this.pending = [];
+  this.localHash = "";
+  this.remoteHash = "";
+  this.peerFrame = -1;
+  this.peerHashF = -1;
+  this.hist = {};
+  this.log = [];
+  this.lastTick = 0;
+  this.lastTickMs = 0;
+  this.peerFrameT = 0;
+  this.waitSince = 0;
+  this.lastCheck = 0;
+  this.resyncTries = 0;
+  this.mismatch = 0;
+  this.sent = 0;
+  this.got = 0;
+};
+/* 世界指纹：只取"两端必须一致"的那部分，位置量化到 0.01、血量到 0.1 */
+LOCK.hash = function () {
+  var h = 2166136261 >>> 0, n = 0, i, j, u, s;
+  var us = W.units;
+  for (i = 0; i < us.length; i++) {
+    u = us[i];
+    if (u.dead) continue;
+    n++;
+    s = u.id + "," + ((u.x * 100) | 0) + "," + ((u.y * 100) | 0) + "," + ((u.hp * 10) | 0);
+    for (j = 0; j < s.length; j++) { h ^= s.charCodeAt(j); h = Math.imul(h, 16777619) >>> 0; }
+  }
+  return (h >>> 0).toString(16) + "/" + n + "/" + (W.kills | 0);
+};
+/* 本地产生一条操作：联机时带着目标帧号广播出去，自己也排队等那一帧 */
+LOCK.issue = function (cmd) {
+  cmd.f = this.frame + this.delay;
+  this.pending.push(cmd);
+  if (this.on) {
+    this.sent++;
+    NET.send({ t: "cmd", cmd: cmd });
+  }
+};
+/* 对面发来的命令，塞进同一个队列，到帧号自然执行 */
+LOCK.receive = function (cmd) {
+  if (!cmd || typeof cmd.f !== "number") return;
+  this.pending.push(cmd);
+  this.got++;
+};
+/* 每个模拟步调用一次 */
+LOCK.tick = function () {
+  this.frame++;
+  var i, c, out;
+  if (this.pending.length) {
+    out = [];
+    for (i = 0; i < this.pending.length; i++) {
+      c = this.pending[i];
+      if (c.f <= this.frame) lockApply(c);
+      else out.push(c);
+    }
+    this.pending = out;
+  }
+  if (!this.on) return;
+  /* 注意：帧号上报不在这里做，挪到了渲染循环。
+     tick 只在 stepSim 里跑，而"等待对方"时 stepSim 是不跑的，于是等的人不发帧号，
+     对面以为他卡死，也跟着等，两边一起冻住。 */
+  /* 房主：每 6 帧把整个世界打包发出去（约 10Hz） */
+  if (NET.role === "host" && NET.on && this.frame % 6 === 0) {
+    NET.send({ t: "snap", f: this.frame, u: packSnapshot() });
+  }
+  /* 每秒记一次本地指纹，连同帧号一起发出去 */
+  if (this.frame - this.lastCheck >= this.checkEvery) {
+    this.lastCheck = this.frame;
+    var h = this.hash();
+    this.localHash = h;
+    this.hist[this.frame] = h;
+    /* 只留最近 12 条，够对面慢慢对 */
+    var keys = [], k;
+    for (k in this.hist) keys.push(+k);
+    if (keys.length > 12) {
+      keys.sort(function (a, b) { return a - b; });
+      for (var di = 0; di < keys.length - 12; di++) delete this.hist[keys[di]];
+    }
+    NET.send({ t: "hash", f: this.frame, h: h });
+  }
+};
+/* 真正落地一条命令。两端执行的是同一段代码、同一组参数。 */
+function lockApply(c) {
+  if (!c || !c.c) return;
+  /* 记一条账。重同步时房主把这份日志发给成员，
+     成员重建完按帧号重放一遍，卡掉期间放的单位就都补回来了 */
+  if (LOCK.on) {
+    LOCK.log.push(c);
+    if (LOCK.log.length > LOCK.maxLog) LOCK.log.shift();
+  }
+  if (c.c === "place") {
+    var n = Math.max(1, c.n | 0);
+    var i, sp;
+    if (c.list) {
+      /* 编队：每个成员占一个格子 */
+      var slots = n * c.list.length;
+      var sp2 = findSpots(c.x, c.y, slots);
+      for (i = 0; i < n; i++) {
+        for (var m = 0; m < c.list.length; m++) {
+          sp = sp2[i * c.list.length + m];
+          if (!sp) break;
+          addUnit(c.list[m], sp.x, sp.y);
+        }
+      }
+      W.hadCivilians = true;
+      return;
+    }
+    var spots = findSpots(c.x, c.y, n);
+    var real = Math.min(n, spots.length);
+    var isZ = isZombieKind(c.kind);
+    for (i = 0; i < real; i++) {
+      sp = spots[i];
+      var zu = addUnit(c.kind, sp.x, sp.y);
+      if (isZ) { zu.hot = 1; zu.pounceCd = RNG.range(0, CFG.pounce.cd); }
+    }
+    if (c.kind === "civilian") W.hadCivilians = true;
+    return;
+  }
+}
+/* 联机同步开局：房主把自己这一局的种子和规模发给对面，对面照着重建。
+   两边从同一个种子出发，后面的模拟才会完全一样，否则各跑各的，怎么对都对不上。 */
+/* 收到对方的开局邀请：不自动接受，先问一句。
+   4 位房间号只有一万种，陌生人撞号是常事，不能因为连上了就把人家的一局抹掉 */
+/* 收到房主的开局：直接照他的来。
+   房主创建的世界优先级更高，成员这边无条件跟着重建，联机只可能有一个世界 */
+function netAcceptSync(m) {
+  var myName = (W.mode === "escort") ? "护送" : "防线";
+  netApplySync(m);
+  NET.send({ t: "synced" });
+  toast("已按房主的开局重建（你原来那局" + myName + "被覆盖了）");
+}
+function netSendSync() {
+  if (NET.role !== "host") return;
+  /* 先把自己按住，等对方点头再一起开跑，否则他确认时我已经跑出去几十帧了 */
+  NET.waitingSync = true;
+  setPausedState(true, true);
+  toast("已把开局发给对方，等待对方接受…");
+  NET.send({
+    t: "sync",
+    seed: W.seed,
+    mode: W.mode,
+    zc: LAST_ZOMBIE_COUNT,
+    civ: LAST_CIV_COUNT,
+    squad: LAST_SQUAD
+  });
+}
+function netApplySync(m) {
+  /* 清掉本地正在进行的一切交互状态，避免残留的选中/指令影响重建 */
+  UI.peek = null;
+  UI.selected = null;
+  selectPlace(null);
+  PLAYER.on = false;
+  PLAYER.unit = null;
+  PLAYER.firing = false;
+  if (typeof CMD !== "undefined" && CMD.on) { try { cmdAbort(); } catch (e) {} }
+  if (m.mode === "escort") {
+    LAST_CIV_COUNT = m.civ || 8;
+    LAST_SQUAD = (m.squad && m.squad.length) ? m.squad : LAST_SQUAD;
+    buildEscortScenario(m.seed, LAST_CIV_COUNT, LAST_SQUAD);
+  } else {
+    LAST_ZOMBIE_COUNT = m.zc || CFG.start.baseZombies;
+    buildScenario(m.seed, LAST_ZOMBIE_COUNT);
+  }
+  W.over = false;
+  W.paused = false;
+  LOCK.reset();
+  LOCK.on = NET.on;
+  centerCamera();
+  hideOverlay();
+  toast("已按房主的种子重新开局，两端从同一起点出发");
+}
+/* ---------------------------- 状态同步（房主权威） ---------------------------- */
+/* 营救模式单位不多（开场五十来个），直接传全量快照就够用，先不做增量编码。
+   房主每 6 帧发一次，成员收到后把自己的世界往快照上"拉"，
+   不是硬贴，硬贴会一跳一跳，用比例收敛能保住 60fps 的顺滑。 */
+var SNET = {
+  on: false,
+  last: null,        /* 最近一条快照 */
+  lastT: 0,
+  got: 0,
+  applied: 0,
+  pull: 0.35         /* 每帧朝快照靠拢的比例 */
+};
+/* 单位类型索引：快照里用数字代替字符串，省一半字节 */
+var KIND_LIST = ["zombie", "runner", "licker", "bomber", "mother", "plagueNest", "tyrant", "nestEgg",
+                 "civilian", "rifle", "mg", "sniper", "shield", "medic",
+                 "cryo", "flame", "tesla", "laser"];
+function kindToIdx(k) {
+  var i;
+  for (i = 0; i < KIND_LIST.length; i++) if (KIND_LIST[i] === k) return i;
+  return 0;
+}
+function idxToKind(n) {
+  return KIND_LIST[n] || "zombie";
+}
+/* 打包当前世界：每单位 6 个数 */
+function packSnapshot() {
+  var out = [], us = W.units, i, u;
+  for (i = 0; i < us.length; i++) {
+    u = us[i];
+    if (u.dead) continue;
+    out.push(u.id, kindToIdx(u.kind),
+      Math.round(u.x * 4), Math.round(u.y * 4),
+      Math.round(u.hp * 4), Math.round((u.faceAng || 0) * 100));
+  }
+  return out;
+}
+function findUnitById(id) {
+  var us = W.units, i;
+  for (i = 0; i < us.length; i++) if (us[i].id === id) return us[i];
+  return null;
+}
+/* 把一条快照揉进本地世界 */
+function applySnapshot(m) {
+  var arr = m.u, i, u, id, kd, x, y, hp, ang, seen = {};
+  var pull = SNET.pull;
+  for (i = 0; i + 5 < arr.length; i += 6) {
+    id = arr[i];
+    kd = arr[i + 1];
+    x = arr[i + 2] / 4;
+    y = arr[i + 3] / 4;
+    hp = arr[i + 4] / 4;
+    ang = arr[i + 5] / 100;
+    seen[id] = 1;
+    u = findUnitById(id);
+    if (!u) {
+      /* 房主那边有、这边没有：补一个出来 */
+      u = addUnit(idxToKind(kd), x, y);
+      u.id = id;
+      u.netSpawned = 1;
+    }
+    if (u.dead) continue;
+    /* 差得远就直接吸附（刚补出来的、或者刚被重置的），差得近就慢慢拉 */
+    var dx = x - u.x, dy = y - u.y;
+    var dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist > 90) { u.x = x; u.y = y; }
+    else { u.x += dx * pull; u.y += dy * pull; }
+    u.hp = hp;
+    if (ang !== 0) u.faceAng = ang;
+  }
+  /* 房主那边已经没有的单位，这边也收掉 */
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || u === PLAYER.unit) continue;
+    if (u.id !== undefined && !seen[u.id] && u.netSpawned) u.dead = true;
+  }
+  SNET.applied++;
+}
+function netBindChannel() {
+  var dc = NET.dc;
+  dc.onopen = function () {
+    NET.on = true;
+    LOCK.on = true;
+    LOCK.reset();
+    NET.set("ready");
+    toast("联机已就绪，可以和对面一起打了");
+    /* 只让发起方报一次自己的暂停状态。
+       两边都报的话会变成：A 说我停着 → B 收到后进入暂停 → B 也报"我停着" → A 收到又显示，
+       结果谁都没按暂停，两边屏幕上却都挂着"对方已暂停" */
+    if (NET.role === "host") {
+      if (W.paused) NET.send({ t: "pause", on: 1 });
+      netSendSync();
+    }
+  };
+  dc.onclose = function () {
+    if (!NET.on) return;
+    NET.on = false;
+    LOCK.on = false;
+    if (W.paused && NET.remotePaused) setPausedState(false, true);
+    NET.remotePaused = false;
+    netShowPauseTip(false);
+    NET.set("failed", "对方断开了连接");
+  };
+  dc.onmessage = function (e) {
+    var m;
+    try { m = JSON.parse(e.data); } catch (err) { return; }
+    NET.queue.push(m);
+  };
+}
+function netHandle(m) {
+  if (!m || !m.t) return;
+  if (m.t === "bye") {
+    NET.peerGone = true;
+    NET.on = false;
+    /* 对面走了，如果这次暂停是他要求的，得由这边替他解除，
+       否则没人会再去按那个"继续"，画面就一直停在那儿 */
+    if (W.paused && NET.remotePaused) setPausedState(false, true);
+    NET.remotePaused = false;
+    netShowPauseTip(false);
+    NET.set("failed", "对方离开了房间");
+    toast("对方离开了联机");
+    return;
+  }
+  if (m.t === "place") {
+    /* 第 1 步只验证指令能走通：在相同位置放同样的单位 */
+    var n = Math.max(1, m.n | 0);
+    var i, sp;
+    var spots = findSpots(m.x, m.y, n);
+    var real = Math.min(n, spots.length);
+    for (i = 0; i < real; i++) {
+      sp = spots[i];
+      addUnit(m.kind, sp.x, sp.y);
+    }
+    var c = CFG.unit[m.kind];
+    toast("对面投放了 " + real + " 个" + (c ? c.name : "单位"));
+    return;
+  }
+  if (m.t === "sync") {
+    netAcceptSync(m);
+    return;
+  }
+  if (m.t === "synced") {
+    /* 对方接受了，把刚才按住的放开，两边同时从第 0 帧开始 */
+    NET.waitingSync = false;
+    LOCK.reset();
+    LOCK.on = NET.on;
+    setPausedState(false, true);
+    toast("对方接受了，联机正式开始");
+    return;
+  }
+  if (m.t === "refuse") {
+    NET.waitingSync = false;
+    NET.close();
+    toast("对方拒绝了这次联机");
+    return;
+  }
+  if (m.t === "cmd") {
+    LOCK.receive(m.cmd);
+    return;
+  }
+  if (m.t === "snap") {
+    SNET.last = m;
+    SNET.lastT = Date.now();
+    SNET.got++;
+    if (m.f > LOCK.peerFrame) LOCK.peerFrame = m.f;
+    return;
+  }
+  if (m.t === "tick") {
+    if (m.f > LOCK.peerFrame) LOCK.peerFrame = m.f;
+    LOCK.peerFrameT = Date.now();
+    return;
+  }
+  if (m.t === "hash") {
+    if (m.f > LOCK.peerFrame) LOCK.peerFrame = m.f;
+    LOCK.peerHashF = m.f;
+    LOCK.remoteHash = m.h;
+    /* 只有本地也走到过那一帧，才有资格对账 */
+    var mine = LOCK.hist[m.f];
+    if (mine !== undefined && mine !== m.h) {
+      LOCK.mismatch++;
+      if (LOCK.mismatch <= 3) {
+        toast("⚠ 第 " + m.f + " 帧两端对不上，正在纠正");
+      }
+      /* 成员主动请求重同步：光报警没人管，那不叫同步 */
+      var nowMs = Date.now();
+      if (NET.role === "guest" && !RESYNC.active && nowMs - RESYNC.asked > 20000) {
+        if (LOCK.resyncTries < 2) {
+          LOCK.resyncTries++;
+          RESYNC.asked = nowMs;
+          NET.send({ t: "needresync" });
+          toast("正在跟房主重新对齐（第 " + LOCK.resyncTries + " 次）");
+        } else if (LOCK.resyncTries === 2) {
+          LOCK.resyncTries++;   /* 只提示一次 */
+          toast("两端存在系统性差异，已停止自动纠正");
+        }
+      }
+    }
+    return;
+  }
+  if (m.t === "needresync") {
+    /* 房主：把当前进度告诉成员，让他重来一遍追上来 */
+    if (NET.role !== "host" || !NET.on) return;
+    NET.send({
+      t: "resync",
+      seed: W.seed,
+      frame: LOCK.frame,
+      mode: W.mode,
+      zc: LAST_ZOMBIE_COUNT,
+      civ: LAST_CIV_COUNT,
+      squad: LAST_SQUAD,
+      /* 这一局到现在执行过的所有命令。成员重建后按帧号重放，
+         他卡住期间漏掉的那些投放就都回来了，不用把整套世界状态传一遍 */
+      log: LOCK.log.slice()
+    });
+    return;
+  }
+  if (m.t === "resync") {
+    if (NET.role === "host") return;
+    netApplySync(m);                 /* 重建（内部会把队列和日志清空） */
+    var lg = m.log || [], li, back = 0;
+    for (li = 0; li < lg.length; li++) {
+      if (!lg[li] || typeof lg[li].f !== "number") continue;
+      /* 只补还没到期的那些；已经过去的帧直接落地 */
+      if (lg[li].f > LOCK.frame) LOCK.pending.push(lg[li]);
+      else { lockApply(lg[li]); back++; }
+    }
+    RESYNC.target = m.frame | 0;
+    RESYNC.active = RESYNC.target > LOCK.frame;
+    if (lg.length) toast("已补回 " + lg.length + " 条操作（其中 " + back + " 条当场落地）");
+    else toast("已重新对齐");
+    return;
+  }
+  if (m.t === "pause") {
+    var on = !!m.on;
+    NET.remotePaused = on;
+    setPausedState(on, true);
+    netShowPauseTip(on);
+    toast(on ? "对方已暂停" : "对方继续了");
+    return;
+  }
+  if (m.t === "chat") {
+    toast("对面：" + String(m.text || "").slice(0, 40));
+    return;
+  }
+}
+/* 主循环里每帧调用一次的落地处理 */
+/* 面板 */
+function netStatusText() {
+  if (NET.state === "idle") return "未连接";
+  if (NET.state === "signaling") return "正在寻找对手…";
+  if (NET.state === "webrtc") return "正在打通直连…";
+  if (NET.state === "ready") return "已连接";
+  if (NET.state === "failed") return "失败";
+  return NET.state;
+}
+function netRefresh() {
+  var el = document.getElementById("netLive");
+  if (!el || !el.parentNode) return;
+  var c = NET.candCount;
+  var dc = NET.dc && NET.dc.readyState === "open" ? "已打通" : "未建立";
+  el.innerHTML =
+    "<div><b>信令</b><span>" + (NET.ws && NET.ws.readyState === 1 ? "已连接" : "未连接") + "</span></div>" +
+    "<div><b>直连</b><span>" + (NET.state === "ready" ? "已打通" : netStatusText()) + "</span></div>" +
+    "<div><b>数据通道</b><span>" + dc + "</span></div>" +
+    "<div><b>本端候选</b><span>" + c + "</span></div>" +
+    "<div><b>我的角色</b><span>" + (NET.role === "host" ? "发起方" : (NET.role === "guest" ? "应答方" : "待定")) + "</span></div>" +
+    "<div><b>房间</b><span>" + (NET.room || "—") + "</span></div>" +
+    "<div><b>同步帧</b><span>" + LOCK.frame + (LOCK.peerFrame >= 0 ? (" / 对面 " + LOCK.peerFrame) : "") +
+    (LOCK.peerFrame >= 0 ? (Math.abs(LOCK.frame - LOCK.peerFrame) <= LOCK.leadLimit ?
+      "　<span style='color:#7fe0a0'>✓ 对齐</span>" : "　<span style='color:#ffd479'>差值 " + (LOCK.frame - LOCK.peerFrame) + "</span>") : "") + "</span></div>" +
+    "<div><b>指令</b><span>" + LOCK.sent + " 发 / " + LOCK.got + " 收（队列 " + LOCK.pending.length + "）</span></div>" +
+    "<div style='flex-basis:100%'><b>世界指纹</b><span style='font-family:ui-monospace,monospace'>" +
+    (LOCK.localHash || "—") + (LOCK.remoteHash ? ("　对方 " + LOCK.remoteHash) : "") +
+    (LOCK.remoteHash ? (LOCK.remoteHash === LOCK.localHash ? "　<span style='color:#7fe0a0'>✓ 一致</span>" : "　<span style='color:#ff9a9a'>✗ 对不上 " + LOCK.mismatch + "</span>") : "") + "</span></div>" +
+    (NET.err ? "<div style='flex-basis:100%'><b>错误</b><span style='color:#ff9a9a'>" + NET.err + "</span></div>" : "");
+}
+function showNetPanel() {
+  panelEl.className = "";
+  panelEl.innerHTML =
+    "<h2>联机对战</h2>" +
+    "<p style='margin:-4px 0 10px;color:#9fb4dd;font-size:12.5px'>" +
+    "点「创建房间」的一方是<b>房主</b>，他的开局会覆盖成员那边。<br>" +
+    "另一方填同一个号码点「加入房间」。号码可以念给对方，四位数字。</p>" +
+    "<div class='netRow'><input id='netRoom' maxlength='16' inputmode='numeric' autocomplete='off' " +
+    "placeholder='四位数字，例如 4821' value='" +
+    (NET.room || netRandomRoom()) + "'>" +
+    "<button id='netRand'>换一个</button></div>" +
+    "<div class='netRow'>" +
+    "<button id='netHost' style='flex:1;background:#22406b'>创建房间</button>" +
+    "<button id='netJoin' style='flex:1'>加入房间</button>" +
+    "</div>" +
+    "<div class='netRow'>" +
+    "<button id='netBye'>断开</button>" +
+    "<button id='netClose'>关闭</button></div>" +
+    "<div class='netState' id='netLive'></div>" +
+    "<p class='netTip'>连上之后成员的世界会按房主的种子重建，两边从同一局开始。" +
+    "目前已经同步了投放和暂停，移动与开火还在做。</p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  netRefresh();
+  var rand = $("netRand");
+  if (rand) rand.addEventListener("click", function () {
+    var i = $("netRoom");
+    if (i) i.value = netRandomRoom();
+  });
+  function goWith(asHost) {
+    var i = $("netRoom");
+    var room = i ? String(i.value || "").trim() : "";
+    if (!/^[0-9]{1,8}$/.test(room) && !/^[A-Za-z0-9_-]{1,32}$/.test(room)) {
+      toast("房间号填数字就行，最多 8 位"); return;
+    }
+    NET.connect(room, asHost);
+    showNetPanel();
+  }
+  var hb = $("netHost");
+  if (hb) hb.addEventListener("click", function () { goWith(true); });
+  var jb = $("netJoin");
+  if (jb) jb.addEventListener("click", function () { goWith(false); });
+  var bye = $("netBye");
+  if (bye) bye.addEventListener("click", function () { NET.disconnect(); showNetPanel(); });
+  var cl = $("netClose");
+  if (cl) cl.addEventListener("click", hideOverlay);
+}
+var REDUCE_MOTION = false;
+function setReduceMotion(on) {
+  REDUCE_MOTION = !!on;
+  try { document.body.classList.toggle("reduce-motion", REDUCE_MOTION); } catch (e) {}
+  var b = document.getElementById("bReduce");
+  if (b) {
+    b.textContent = "减少动态效果：" + (REDUCE_MOTION ? "开" : "关");
+    b.className = REDUCE_MOTION ? "on" : "";
+  }
+  try { localStorage.setItem("zombieSandbox.reduceMotion", REDUCE_MOTION ? "1" : "0"); } catch (e) {}
+}
+function loadReduceMotion() {
+  try { setReduceMotion(localStorage.getItem("zombieSandbox.reduceMotion") === "1"); } catch (e) {}
+}
+function toast(msg) {
+  if (!toastEl) return;
+  toastEl.textContent = msg;
+  toastEl.style.opacity = "1";
+  toastT = 2.2;
+}
+function capExceeded(kind) {
+  var c = countUnits();
+  if (kind === "humans") return c.h >= CFG.caps.humans;
+  return c.z >= CFG.caps.zombies;
+}
+function blockedForPlacement(x, y, pad) {
+  var obs = W.obstacles;
+  for (var i = 0; i < obs.length; i++) {
+    var o = obs[i];
+    if (x >= o.x - pad && x <= o.x + o.w + pad && y >= o.y - pad && y <= o.y + o.h + pad) return true;
+  }
+  return false;
+}
+var BATCH_STEPS = [1, 2, 3, 5, 10];
+var BATCH_IDX = 0;
+function batchCount() { return BATCH_STEPS[BATCH_IDX]; }
+function refreshPlacePrices() {
+  var sel = $("placeSel");
+  if (!sel || !sel.options) return;
+  for (var i = 0; i < sel.options.length; i++) {
+    var o = sel.options[i], kind = o.value;
+    if (!kind) continue;
+    var sk = effectiveSupportKey(kind);
+    if (sk) {
+      o.textContent = supportLabel(sk, true);
+    } else if (CFG.unit[kind]) {
+      o.textContent = CFG.unit[kind].name + "（" + unitCostOf(kind) + "）";
+    }
+  }
+}
+function setBatch(i) {
+  BATCH_IDX = ((i % BATCH_STEPS.length) + BATCH_STEPS.length) % BATCH_STEPS.length;
+  var el = $("batchVal");
+  if (el) el.textContent = "×" + batchCount();
+  var el2 = $("eBatchVal");
+  if (el2) el2.textContent = "×" + batchCount();
+}
+/* 投放表里的「编队」：一次放下整支队伍，不是单个单位。
+   返回 null 表示这不是编队 */
+function placeSquadOf(kind) {
+  if (kind === "squad") return { rifle: 3, mg: 1, civilian: 1 };   /* 混编小队 5 人 */
+  if (kind === "squadSmall" || kind === "squadMid") return null;
+  return null;
+}
+function squadSizeOf(kind) {
+  var m = placeSquadOf(kind);
+  if (!m) return 1;
+  var n = 0;
+  for (var k in m) n += (m[k] | 0);
+  return n;
+}
+/* 编队总价 = 每个成员按单价累加 */
+function squadMapCost(m) {
+  var c = CFG.econ.cost, t = 0, k;
+  if (!m) return 0;
+  for (k in m) t += (m[k] | 0) * (c[k] || 0);
+  return t;
+}
+/* 小队 = 1 平民 + 3 步枪兵 + 1 机枪兵，按各项单价合计 */
+function squadCost() { return squadMapCost(placeSquadOf("squad")); }
+function unitCostOf(kind) {
+  var sk = effectiveSupportKey(kind);
+  if (sk) return supportCostOf(sk);
+  var sm = placeSquadOf(kind);
+  if (sm) return squadMapCost(sm);
+  /* 丧尸阵营的投放价 = 打死它给的赏金，两头就都是一杆秤：
+     放一只普通丧尸 10 块，正好等于打死一只赚的 10 块 */
+  if (isZombieKind(kind)) {
+    return kind === "mother" ? CFG.econ.killMother
+      : (kind === "licker" ? CFG.econ.killLicker : CFG.econ.killZombie);
+  }
+  var c = CFG.unit[kind];
+  /* 自定义兵种没有预设价格，用建它时从模板抄下来的成本 */
+  if (c && typeof c.cost === "number" && c.cost > 0) return c.cost;
+  return CFG.econ.cost[kind] || 0;
+}
+/* 在点击位置周围螺旋找落点：避开障碍与已有单位，落点之间也互不重叠 */
+var _spotList = [];
+function findSpots(cx, cy, count) {
+  _spotList.length = 0;
+  if (count <= 0) return _spotList;
+  var step = 34, guard = 0;
+  for (var ring = 0; ring <= 9 && _spotList.length < count; ring++) {
+    var r = ring * step;
+    var n = ring === 0 ? 1 : Math.max(8, Math.round(TAU * r / step));
+    for (var k = 0; k < n && _spotList.length < count; k++) {
+      var a = TAU * k / n;
+      var x = cx + Math.cos(a) * r, y = cy + Math.sin(a) * r;
+      if (x < 24 || y < 24 || x > CFG.world.w - 24 || y > CFG.world.h - 24) continue;
+      if (blockedForPlacement(x, y, 12)) continue;
+      var ok = true;
+      for (var j = 0; j < W.units.length; j++) {
+        var u = W.units[j];
+        if (u.dead) continue;
+        if (dist2(x, y, u.x, u.y) < 1156) { ok = false; break; }   /* 34px */
+      }
+      if (!ok) continue;
+      for (j = 0; j < _spotList.length; j++) {
+        if (dist2(x, y, _spotList[j].x, _spotList[j].y) < 1156) { ok = false; break; }
+      }
+      if (!ok) continue;
+      _spotList.push({ x: x, y: y });
+    }
+  }
+  return _spotList;
+}
+function canPlace(kind, x, y) {
+  if (W.over) return false;
+  if (kind === "sandbag") {
+    var rx = x - 30, ry = y - 20, rw = 60, rh = 40;
+    if (rx < 0 || ry < 0 || rx + rw > CFG.world.w || ry + rh > CFG.world.h) return false;
+    for (var i = 0; i < W.obstacles.length; i++) {
+      var o = W.obstacles[i];
+      if (rx < o.x + o.w && rx + rw > o.x && ry < o.y + o.h && ry + rh > o.y) return false;
+    }
+    for (var j = 0; j < W.units.length; j++) {
+      var u = W.units[j];
+      if (u.x > rx - u.r && u.x < rx + rw + u.r && u.y > ry - u.r && u.y < ry + rh + u.r) return false;
+    }
+    return true;
+  }
+  if (blockedForPlacement(x, y, 10)) return false;
+  /* 丧尸和人类各有各的数量上限 */
+  var zside = isZombieKind(kind);
+  if (capExceeded(zside ? "zombies" : "humans")) return false;
+  for (var k = 0; k < W.units.length; k++) {
+    var v = W.units[k];
+    var rr = v.r + 10;
+    if (dist2(x, y, v.x, v.y) < rr * rr) return false;
+  }
+  return true;
+}
+/* 一次性投放 want 个同兵种单位（或 want 支小队），按实际放下的数量扣资源 */
+function doPlace(kind, wx, wy, want) {
+  if (W.over) return false;
+  if (kind === "militia") { toast("民兵只能通过选择平民转化"); return false; }
+  want = Math.max(1, want | 0);
+  var per = unitCostOf(kind);
+  if (per <= 0) return false;
+
+  var supportKey = effectiveSupportKey(kind);
+  if (supportKey) {
+    var nSup = Math.min(3, Math.max(1, want));
+    var costSup = supportCostOf(supportKey);
+    if (W.resources < costSup * nSup) {
+      toast("资源不足（" + supportDefOf(supportKey).name + " 需要 " + costSup + "）");
+      return false;
+    }
+    W.resources -= costSup * nSup;
+    for (var si = 0; si < nSup; si++) {
+      beginSupportDrop(supportKey, wx + si * 90, wy + (si % 2) * 70, "paid");
+    }
+    toast("已呼叫 " + supportDefOf(supportKey).name + "（消耗 " + (costSup * nSup) + "）");
+    return true;
+  }
+
+  if (kind === "sandbag") {
+    if (!canPlace("sandbag", wx, wy)) { toast("沙袋不能放在这里"); return false; }
+    if (W.resources < per) { toast("资源不足（沙袋 " + per + "）"); return false; }
+    W.resources -= per;
+    W.obstacles.push(makeObstacle(wx - 30, wy - 20, 60, 40));
+    NAV.build(CFG.world, W.obstacles, 9);
+    return true;
+  }
+
+  var squadMap = placeSquadOf(kind);
+  var slotsPer = squadMap ? squadSizeOf(kind) : 1;
+  var isZ = isZombieKind(kind);
+  var capN = isZ ? CFG.caps.zombies : CFG.caps.humans;
+  var haveN = isZ ? countUnits().z : countUnits().h;
+  var byMoney = Math.floor(W.resources / per);
+  var room = capN - haveN;
+  var byRoom = Math.floor(room / slotsPer);
+  var n = Math.min(want, byMoney, byRoom);
+  if (n <= 0) {
+    toast(byRoom <= 0 ? ((isZ ? "丧尸" : "人类") + "数量已达上限 " + capN) : ("资源不足（每个需要 " + per + "）"));
+    return false;
+  }
+  var spots = findSpots(wx, wy, n * slotsPer);
+  var real = Math.min(n, Math.floor(spots.length / slotsPer));
+  if (real <= 0) { toast("这附近放不下单位，换个空旷些的位置"); return false; }
+  var total = per * real;
+  W.resources -= total;
+  var i;
+  /* 联机：扣完资源就把"放什么、放哪、放几个"打包成命令，两端在同一个帧号执行。
+     本地也不许当场落地，自己先落地、对面几帧后才落地，两边的模拟就从这里开始分叉。 */
+  if (LOCK.on) {
+    var lc = { c: "place", x: wx, y: wy, n: real };
+    if (squadMap) {
+      var lmem = [], lk2;
+      for (lk2 in squadMap) for (var lc2 = 0; lc2 < (squadMap[lk2] | 0); lc2++) lmem.push(lk2);
+      lc.list = lmem;
+    } else {
+      lc.kind = kind;
+    }
+    LOCK.issue(lc);
+    if (isCivilianRole({ kind: kind }) || (squadMap && squadMap.civilian)) W.hadCivilians = true;
+    toast("投放 " + real + (squadMap ? (" 支编队（" + (real * slotsPer) + " 人）") :
+      (" 名" + CFG.unit[kind].name)) + "（已同步，消耗 " + total + "）");
+  } else if (squadMap) {
+    /* 把编队摊平成一个成员列表，再按格子一个个放下 */
+    var members = [], mk;
+    for (mk in squadMap) for (var mc = 0; mc < (squadMap[mk] | 0); mc++) members.push(mk);
+    for (i = 0; i < real; i++) {
+      for (var mi = 0; mi < members.length; mi++) {
+        var sp = spots[i * slotsPer + mi];
+        if (!sp) break;
+        var pnu = addUnit(members[mi], sp.x, sp.y);
+        if (pnu && isHuman(pnu)) pnu.deployHold = 0.55;
+      }
+    }
+    if (squadMap.civilian) W.hadCivilians = true;
+    toast("投放 " + real + " 支编队（" + (real * members.length) + " 人，消耗 " + total + "）");
+  } else {
+    for (i = 0; i < real; i++) {
+      var zu = addUnit(kind, spots[i].x, spots[i].y);
+      if (zu && isHuman(zu)) zu.deployHold = 0.55;
+      /* 手动投放的丧尸立刻进入活动状态，不能像地图原生的那样在护送图里装睡 */
+      if (isZ) { zu.hot = 1; zu.pounceCd = RNG.range(0, CFG.pounce.cd); }
+    }
+    if (isCivilianRole({ kind: kind })) W.hadCivilians = true;
+    toast("投放 " + real + " 名" + CFG.unit[kind].name + "（消耗 " + total + "）");
+  }
+  rebalanceGuards();
+  for (i = 0; i < W.units.length; i++) {
+    var nu = W.units[i];
+    if (!nu.dead && isHuman(nu) && !nu.post) assignPost(nu);
+  }
+  return true;
+}
+/* 下拉菜单里选中的就是要放置的东西；传空表示不放置 */
+function tryMilitiaConvertAt(wx, wy) {
+  if (W.over) return false;
+  var best = null, bd = 60 * 60, i, u;
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || u.kind !== "civilian") continue;
+    var d = dist2(wx, wy, u.x, u.y);
+    if (d <= bd) { bd = d; best = u; }
+  }
+  if (!best) { toast("请点选一名可武装的平民"); return false; }
+  var cost = unitCostOf("militia");
+  if (W.resources < cost) { toast("资源不足（民兵转化需要 " + cost + "）"); return false; }
+  W.resources -= cost;
+  promoteCivilianToMilitia(best);
+  UI.selected = null;
+  selectPlace(null);
+  toast("民兵转化完成（消耗 " + cost + "）");
+  return true;
+}
+function selectPlace(kind) {
+  UI.selected = kind || null;
+  if (kind === "militia") toast("民兵：点选一名平民进行武装化");
+  var sel = $("placeSel");
+  if (sel && sel.value !== (UI.selected || "")) sel.value = UI.selected || "";
+}
+function updateHUD() {
+  var c = countUnits();
+  if (W.mode === "escort") {
+    var pn = (W.phase === "infiltrate") ? "潜入" : (W.phase === "rescue" ? "解救" : "撤离");
+    var etxt = "得分 " + W.score + "  " + pn +
+      "  待救平民 " + Math.max(0, W.civTotal - W.released) + "/" + W.civTotal +
+      "  已撤离 " + W.evacCount + "/" + (W.totalHumans || 0) +
+      "  场上 " + c.h + " 人 · 丧尸 " + c.z + (W.hotPhase ? "（升级）" : "") +
+      "  " + fpsShown + "fps";
+    if (statEl.textContent !== etxt) statEl.textContent = etxt;
+    if (W.over && !UI.shownResult) { UI.shownResult = true; showResult(); }
+    if (!W.over && UI.shownResult) UI.shownResult = false;
+    return;
+  }
+  var txt = "时间 " + fmtTime(W.t) + "  资源 " + Math.floor(W.resources) +
+    "  人类 " + c.h + "  丧尸 " + c.z + (c.m ? "(母体" + c.m + ")" : "") +
+    "  击杀 " + W.kills + "  感染 " + W.infected + "  " + fpsShown + "fps";
+  if (statEl.textContent !== txt) statEl.textContent = txt;
+  if (W.over && !UI.shownResult) { UI.shownResult = true; showResult(); }
+  if (!W.over && UI.shownResult) UI.shownResult = false;
+}
+function fmtBigNum(n) {
+  n = Math.floor(Math.max(0, n || 0));
+  if (n < 1000) return String(n);
+  var units = [[1e12, "A"], [1e10, "B"], [1e8, "C"], [1e6, "E"], [1e4, "W"], [1e3, "K"]];
+  for (var i = 0; i < units.length; i++) {
+    if (n >= units[i][0]) {
+      var v = n / units[i][0];
+      var txt = v >= 10 ? String(Math.round(v)) : (Math.round(v * 10) / 10).toFixed(1);
+      return txt + units[i][1];
+    }
+  }
+  return String(n);
+}
+function combatRows(metric) {
+  var b = (W.stats && W.stats.byKind) || {}, rows = [], k;
+  for (k in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, k)) continue;
+    if (!CFG.unit[k] || (k === "tyrant" || k === "plagueNest")) continue;
+    if ((b[k][metric] || 0) > 0) rows.push({ kind: k, v: b[k][metric] || 0 });
+  }
+  rows.sort(function (a, b2) { return b2.v - a.v; });
+  return rows.slice(0, 5);
+}
+function combatBoardHtml(title, metric) {
+  var rows = combatRows(metric), max = rows.length ? rows[0].v : 1;
+  var out = "<div class='statBoard'><h3>" + title + " <em>TOP 5</em></h3>";
+  if (!rows.length) return out + "<p class='statEmpty'>暂无记录</p></div>";
+  for (var i = 0; i < rows.length; i++) {
+    var k = rows[i].kind, c = CFG.unit[k] || {}, name = c.name || k;
+    var pct = Math.max(4, Math.round(rows[i].v / max * 100));
+    out += "<div class='statRow statRank" + (i + 1) + "'>" +
+      "<span class='statRankNo'>" + (i + 1) + "</span>" +
+      "<div class='statWho'><canvas class='statIcon' data-stat-kind='" + k + "' width='36' height='36'></canvas><span>" + name + "</span></div>" +
+      "<div class='statBarTrack'><div class='statBarFill' style='width:" + pct + "%;background:" + (c.color || "#6f9bd1") + "'></div></div>" +
+      "<span class='statVal'>" + fmtBigNum(rows[i].v) + "</span></div>";
+  }
+  return out + "</div>";
+}
+function combatBoardsHtml() {
+  return "<h3>兵种战果</h3><div class='combatBoards'>" +
+    combatBoardHtml("击杀榜", "kills") + combatBoardHtml("伤害榜", "damage") + "</div>";
+}
+function drawStatIcon(cv, kind) {
+  if (!cv || !cv.getContext) return;
+  var c = cv.getContext("2d"), u = CFG.unit[kind] || {};
+  c.clearRect(0, 0, 36, 36);
+  c.fillStyle = "rgba(0,0,0,.35)"; c.beginPath(); c.arc(18, 18, 16, 0, TAU); c.fill();
+  c.fillStyle = u.color || "#6f9bd1"; c.beginPath(); c.arc(18, 18, 13, 0, TAU); c.fill();
+  c.fillStyle = "rgba(20,12,15,.8)"; c.beginPath(); c.arc(18, 18, 7.5, 0, TAU); c.fill();
+  c.fillStyle = "rgba(255,240,190,.95)";
+  c.beginPath(); c.arc(15, 17, 2.2, 0, TAU); c.fill();
+  c.beginPath(); c.arc(21, 17, 2.2, 0, TAU); c.fill();
+  c.strokeStyle = "rgba(255,255,255,.35)"; c.lineWidth = 1.4;
+  c.beginPath(); c.arc(18, 18, 13, 0, TAU); c.stroke();
+}
+function drawStatIcons(root) {
+  if (!root || !root.querySelectorAll) return;
+  var list = root.querySelectorAll("[data-stat-kind]");
+  for (var i = 0; i < list.length; i++) drawStatIcon(list[i], list[i].getAttribute("data-stat-kind"));
+}
+function showResult() {
+  /* 对局结束时必须退出操控。以前这里不清 PLAYER.on，手机上没有 Esc 键，
+     卡在操控模式里既看不到摇杆也用不了界面，只能刷新页面 */
+  PLAYER.on = false;
+  PLAYER.firing = false;
+  PLAYER.pressing = false;
+  PLAYER.stickL = null;
+  PLAYER.stickR = null;
+  PLAYER.unit = null;
+  UI.peek = null;
+  var bc = $("bControl");
+  if (bc) { bc.textContent = "操控"; bc.className = ""; }
+  var win = W.result === "win";
+  var title = win ? (W.mode === "escort" ? "全员撤离成功" : "防线守住了") : (W.mode === "escort" ? "营救失败" : "平民全部阵亡");
+  panelEl.className = "";
+  panelEl.setAttribute("data-panel", "result");
+  panelEl.innerHTML =
+    "<h2 class='" + (win ? "resWin" : "resLose") + "'>" + title + "</h2>" +
+    "<div class='statGrid'>" +
+      "<div><span>运行</span><b>" + fmtTime(W.t) + "</b></div>" +
+      "<div><span>击杀</span><b>" + W.kills + "</b></div>" +
+      "<div><span>感染</span><b>" + W.infected + "</b></div>" +
+      (W.mode === "escort" ? "<div><span>得分</span><b>" + W.score + "</b></div>" +
+        "<div><span>撤离</span><b>" + W.evacCount + " / " + (W.totalHumans || 0) + "</b></div>" : "") +
+    "</div>" + combatBoardsHtml() +
+    "<div class='pauseBtns'>" +
+      "<button id='resRestart' class='primary'>再来一局</button>" +
+      "<button id='resLoad'>读取存档</button>" +
+      "<button id='resHome'>返回主页</button>" +
+      "<button id='resClose'>观察战场</button>" +
+    "</div>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  drawStatIcons(panelEl);
+  var rr = $("resRestart"); if (rr) rr.addEventListener("click", function () { hideOverlay(); resetForSetup(); showStartPanel(); });
+  var rl = $("resLoad"); if (rl) rl.addEventListener("click", function () { loadGame(); });
+  var rh = $("resHome"); if (rh) rh.addEventListener("click", function () { hideOverlay(); showHome(); });
+  var rc = $("resClose"); if (rc) rc.addEventListener("click", function () { hideOverlay(); });
+}
+function showKeyHelp(tab) {
+  if (document.getElementById("moreHost")) morePark();
+  tab = tab || "kbm";
+  var _prevPanelK = panelEl.getAttribute ? panelEl.getAttribute("data-panel") : "";
+  function row(id) {
+    var a = null;
+    for (var i = 0; i < KEY_ACTS.length; i++) if (KEY_ACTS[i].id === id) { a = KEY_ACTS[i]; break; }
+    if (!a) return "";
+    return "<div class='keyRow'><kbd>" + keyDisplay(KEYMAP[a.id]) + "</kbd><span>" + a.label + "</span></div>";
+  }
+  var basic = ["pause", "cancel", "market", "fireMode", "reload", "director", "place1", "place2", "place3", "place4", "place5", "place6"];
+  var adv = ["toggleUI", "cinema", "command", "debug", "batchMinus", "batchPlus", "moveTo", "follow", "hold", "garrison", "face", "fireAt", "safe", "say", "die", "release", "camTo", "camFollow", "camFree"];
+  var body = "";
+  if (tab === "kbm") {
+    body += "<h3>常用</h3><div class='keyGrid'>" + basic.map(row).join("") + "</div>";
+    body += "<details class='keyAdv'><summary>进阶与剧情模式</summary><div class='keyGrid'>" + adv.map(row).join("") + "</div></details>";
+    body += "<p class='netTip'>所有键位都可以在「键位设置」里改；改完这里会同步显示新键位。</p>";
+  } else {
+    body += "<div class='touchGrid'>" +
+      "<div><b>底栏投放</b><p>选单位后点地图放下；数字键对应的投放项也在底栏。</p></div>" +
+      "<div><b>☰ 菜单</b><p>存档、设置、装备市场、帮助、快捷键都在这里。</p></div>" +
+      "<div><b>操控</b><p>点底栏「操控」再点一名单位接管；出现左右两个虚拟摇杆。</p></div>" +
+      "<div><b>左摇杆</b><p>推着走；松手停下。</p></div>" +
+      "<div><b>右摇杆</b><p>拖动瞄准，松手开火；适合边退边打。</p></div>" +
+      "<div><b>剧情模式</b><p>从 ☰ 菜单进入；框选单位后点地图下指令，不需要键盘。</p></div>" +
+      "</div><p class='netTip'>手机没有快捷键：所有键鼠操作都有对应的底栏按钮或菜单入口。</p>";
+  }
+  panelEl.innerHTML =
+    "<h2>快捷键与操作</h2>" +
+    "<p style='text-align:right;margin:-2px 0 6px'><button id='touchLayout'>键位调整</button></p>" +
+    "<div class='keyTabs'><button id='khKbm' class='" + (tab === "kbm" ? "on" : "") + "'>键鼠</button>" +
+      "<button id='khTouch' class='" + (tab === "touch" ? "on" : "") + "'>触屏</button></div>" +
+    body +
+    "<p style='text-align:right'><button id='khBind'>键位设置</button> " +
+      "<button id='khClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  if (_prevPanelK === "unitTune") OVERLAY_BACK = showUnitTune;
+  var tl = $("touchLayout");
+  if (tl) tl.addEventListener("click", showTouchLayout);
+  var kb = $("khKbm"), kt = $("khTouch");
+  if (kb) kb.addEventListener("click", function () { showKeyHelp("kbm"); });
+  if (kt) kt.addEventListener("click", function () { showKeyHelp("touch"); });
+  var bd = $("khBind");
+  if (bd) bd.addEventListener("click", function () { hideOverlay(); showBindPanel(); });
+  var cl = $("khClose");
+  if (cl) cl.addEventListener("click", function () { closeOverlaySmart(); });
+}
+function showTouchLayout() {
+  function chip(k, label) {
+    var p = MOBILE_POS[k];
+    return "<button class='touchChip' data-mk='" + k + "' style='left:" + p.x + "%;top:" + p.y + "%'>" + label + "</button>";
+  }
+  panelEl.className = "";
+  panelEl.innerHTML =
+    "<h2>手机键位调整</h2>" +
+    "<p class='netTip'>拖动圆形按钮到顺手的位置；导出编码可备份，粘回编码即可恢复。</p>" +
+    "<p>攻击模式：<button id='amTwo' class='" + (PLAYER.attackMode === "two" ? "on" : "") + "'>两指（右摇杆瞄准并开火）</button> " +
+      "<button id='amThree' class='" + (PLAYER.attackMode === "three" ? "on" : "") + "'>三指（右摇杆只瞄准 + 攻击键）</button></p>" +
+    "<div id='touchMap' style='position:relative;height:240px;margin:8px 0;border:1px solid #2b3944;" +
+      "background:rgba(8,12,16,.55);overflow:hidden'>" +
+      chip("reload", "换弹") + chip("ctrl", "操控") + chip("full", "全屏") + chip("menu", "菜单") + chip("attack", "攻击") + chip("pounce", "猛扑") +
+    "</div>" +
+    "<div id='touchCtls'>" +
+      ["reload", "ctrl", "full", "menu", "attack", "pounce"].map(function (k) {
+        var label = { reload: "换弹", ctrl: "操控", full: "全屏", menu: "菜单", attack: "攻击", pounce: "猛扑" }[k];
+        var o = MOBILE_POS[k];
+        return "<div class='touchCtl' data-mk='" + k + "'><b>" + label + "</b>" +
+          "<label>大小 <input type='range' data-k='size' min='34' max='88' value='" + o.size + "'></label>" +
+          "<label>透明 <input type='range' data-k='alpha' min='10' max='100' value='" + o.alpha + "'></label>" +
+          "<label><input type='checkbox' data-k='hidden' " + (o.hidden ? "checked" : "") + "> 隐藏</label></div>";
+      }).join("") +
+    "</div>" +
+    "<p>配置编码</p><textarea id='touchCode' style='width:100%;height:70px;background:#0e1422;color:#9fe0b0;" +
+      "border:1px solid #22304d;border-radius:2px;padding:8px;font-size:11px;font-family:monospace'></textarea>" +
+    "<p style='text-align:right'><button id='touchExport'>生成编码</button> " +
+      "<button id='touchImport'>导入编码</button> " +
+      "<button id='touchReset'>恢复默认</button> " +
+      "<button id='touchClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  applyMobilePos();
+  var map = document.getElementById("touchMap");
+  var drag = null;
+  var chips = panelEl.querySelectorAll(".touchChip");
+  for (var ci = 0; ci < chips.length; ci++) {
+    (function (b) {
+      b.addEventListener("pointerdown", function (e) {
+        e.preventDefault();
+        drag = b.getAttribute("data-mk");
+      });
+    })(chips[ci]);
+  }
+  function move(e) {
+    if (!drag || !map) return;
+    var r = map.getBoundingClientRect();
+    var x = clamp(((e.clientX - r.left) / r.width) * 100, 2, 94);
+    var y = clamp(((e.clientY - r.top) / r.height) * 100, 2, 90);
+    MOBILE_POS[drag].x = x; MOBILE_POS[drag].y = y;
+    var el = map.querySelector("[data-mk='" + drag + "']");
+    if (el) { el.style.left = x + "%"; el.style.top = y + "%"; }
+  }
+  function up() { if (!drag) return; drag = null; applyMobilePos(); saveMobilePos(); }
+  var ctlRows = panelEl.querySelectorAll(".touchCtl");
+  for (var ri = 0; ri < ctlRows.length; ri++) {
+    (function (row) {
+      var k = row.getAttribute("data-mk");
+      var ins = row.querySelectorAll("input");
+      for (var ii = 0; ii < ins.length; ii++) {
+        (function (inp) {
+          inp.addEventListener("input", function () {
+            var key = inp.getAttribute("data-k");
+            if (key === "hidden") MOBILE_POS[k].hidden = inp.checked;
+            else MOBILE_POS[k][key] = parseInt(inp.value, 10) || MOBILE_POS[k][key];
+            applyMobilePos(); saveMobilePos();
+          });
+        })(ins[ii]);
+      }
+    })(ctlRows[ri]);
+  }
+  if (document.addEventListener) {
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  }
+  var a2 = document.getElementById("amTwo"), a3 = document.getElementById("amThree");
+  if (a2) a2.addEventListener("click", function () {
+    PLAYER.attackMode = "two"; try { localStorage.setItem("zombieSandbox.attackMode", "two"); } catch (e) {}
+    applyMobilePos(); showTouchLayout();
+  });
+  if (a3) a3.addEventListener("click", function () {
+    PLAYER.attackMode = "three"; try { localStorage.setItem("zombieSandbox.attackMode", "three"); } catch (e) {}
+    applyMobilePos(); showTouchLayout();
+  });
+  var ex = document.getElementById("touchExport");
+  if (ex) ex.addEventListener("click", function () {
+    var ta = document.getElementById("touchCode");
+    if (ta) ta.value = encodeMobilePos();
+  });
+  var im = document.getElementById("touchImport");
+  if (im) im.addEventListener("click", function () {
+    var ta = document.getElementById("touchCode");
+    if (ta && decodeMobilePos(ta.value)) {
+      showTouchLayout();
+      toast("键位配置已应用");
+    } else toast("编码无效");
+  });
+  var rs = document.getElementById("touchReset");
+  if (rs) rs.addEventListener("click", function () {
+    MOBILE_POS = {
+      reload: { x: 86, y: 78, size: 52, alpha: 55, hidden: false },
+      ctrl:   { x: 8,  y: 78, size: 52, alpha: 55, hidden: false },
+      full:   { x: 88, y: 8,  size: 42, alpha: 55, hidden: false },
+      menu:   { x: 88, y: 22, size: 44, alpha: 55, hidden: false },
+      attack: { x: 84, y: 55, size: 64, alpha: 60, hidden: false },
+      pounce: { x: 72, y: 55, size: 64, alpha: 60, hidden: false }
+    };
+    applyMobilePos(); saveMobilePos(); showTouchLayout();
+  });
+  var cl = document.getElementById("touchClose");
+  if (cl) cl.addEventListener("click", function () { closeOverlaySmart(); });
+}
+function showHelp() {
+  if (document.getElementById("moreHost")) morePark();
+  if (document.getElementById("setDebugHost")) settingsPark();
+  var _prevPanel = panelEl.getAttribute ? panelEl.getAttribute("data-panel") : "";
+  panelEl.className = "";
+  panelEl.innerHTML = "<h2>玩法说明</h2>" +
+    "<div class='helpLead'>" +
+      "<b>三句话看懂</b><br>" +
+      "一、他们会自己打，你只决定往场上补什么。<br>" +
+      "二、底栏选单位，再点地图放下；资源每秒自动增长。<br>" +
+      "三、丧尸全灭为胜，平民全灭为败。" +
+    "</div>" +
+    "<div class='helpActions'><button id='helpTutor' class='primary'>重看新手引导</button>" +
+      "<button id='helpUnit'>角色编辑</button>" +
+      "<button id='helpKeys'>快捷键与操作</button>" +
+      "<button id='helpStart'>开战设置</button><button id='helpClose'>关闭</button></div>" +
+    "<p class='homeSub'>这一局里，人类和丧尸都有自己的判断，走位、找掩体、换弹、撤退、扑咬全是自动的。" +
+    "<b>你不需要操作任何一个人。</b></p>" +
+    "<h3>三条最要紧的</h3><ul>" +
+    "<li><b>你真正在做的不是「操作」，是「投放」</b>：底栏选一样东西（士兵、平民、丧尸、沙袋），点地图放下它。资源每秒自动回，杀人也回。</li>" +
+    "<li><b>看他们打就好</b>：想知道谁在追谁，左上角数字和画面上的圈都会告诉你；不放心可以点「操控」亲手接管一个人。</li>" +
+    "<li><b>胜负</b>：丧尸全灭即胜利（开了波次模式则要把设定波次全部打完）；平民全灭即失败，平民是必须守住的人。</li></ul>" +
+    "<p style='text-align:right'><button onclick=\"showStartPanel()\" class='primary'>开战设置</button> " +
+    "<button onclick=\"closeOverlaySmart()\">开始/继续</button></p>" +
+    "<details><summary>完整机制 · 全部按键 · 地形编辑器 · 剧情模式</summary>" +
+    "<h3>" + GAME_TITLE + " · 人类最后的沙盘</h3>" +
+    "<p>一场自动演算的沙盘攻防战：人类结成防线守住东边的大本营，丧尸从西边源源不断地涌进来。" +
+    "就算你什么都不做，他们也会自己打；你要决定的是往这片战场上补进什么。</p>" +
+    "<h3>怎么玩</h3><ul>" +
+    "<li>在底栏挑好要投放的东西，再点地图把它放下。底栏的「批量」可以一次放好几个。</li>" +
+    "<li>资源初始 30，每秒 +1，每击杀一只丧尸 +1（母体 +10）。</li>" +
+    "<li><b>胜利</b>：丧尸全灭；开了波次模式则要打光全部波次（最后一波投放完毕后清场才算赢）。" +
+    "<b>失败</b>：平民全部阵亡，平民是这片沙盘里必须守住的人。</li>" +
+    "<li>底栏「尸潮」可以随时再放一波丧尸进来，试探防线的极限。</li></ul>" +
+    "<h3>人类阵营</h3><ul>" +
+    "<li><b>平民</b>（浅绿 · 60）：赤手空拳，却是胜负的根本。他们会主动往武装单位身边靠。</li>" +
+    "<li><b>步枪兵</b>（深绿 · 25）：防线主力。远距离精确点射，敌人逼近后转为速射压制；会主动后撤，始终维持一个安全的交战距离。</li>" +
+    "<li><b>机枪兵</b>（黄 · 60）：射速最快、弹匣最大，一梭子能穿透前面的目标打到身后的人，专治成群涌上来的丧尸。</li>" +
+    "<li><b>狙击手</b>（淡蓝 · 120）：射程无限，一枪能把一条线上的丧尸串着打穿，连建筑都挡不住。代价是弹匣小、射速慢；他自带两名平民单独行动，长时间逮不到开枪机会会主动出击找人。</li>" +
+    "<li><b>盾兵</b>（深蓝 · 80）：举着盾挡在所有队友身前，也是全场最吸引丧尸的目标。护盾碎裂的瞬间会震开周围的丧尸。" +
+    "他<b>一边举盾一边用手枪还击</b>（破没破盾都一样打，弹药照常消耗、照常换弹），" +
+    "被感染后不会尸变，而是原地自爆。</li></ul>" +
+    "<h3>丧尸阵营</h3><ul>" +
+    "<li><b>丧尸</b>（紫）：靠数量取胜，一刻不停地冲锋，贴近之后会猛扑。</li>" +
+    "<li><b>母体</b>（淡紫）：又大又慢、非常耐打，血量每掉一成就从身上抖落一批丧尸。得集火才解决得掉。</li>" +
+    "<li><b>舔舐者</b>（粉红，120 只里掺 1 只）：站在<b>平民恐惧范围直径之外</b>读条 2 秒，读满就伸出一条深红色的舌头。" +
+    "被舔到的人会被钉住、缓缓拖向它，它自己也会钉在原地不动。" +
+    "舌头有 15 点血，<b>集火可以打断</b>：打断后双方都恢复行动，它会掉头用三分之一的移速逃走。" +
+    "本体只有 20 血，但真正的威胁是舌头拴住人的那几秒。</li></ul>" +
+    "<h3>抱团机制</h3>" +
+    "<p>人类会自己结成队伍：平民往武装单位身边靠，武装单位把平民护在背对丧尸的一侧；同一个兵种之间也会互相看齐、尽量保持一致的走向。" +
+    "所以阵型就算被尸潮冲散，他们也会自己重新聚拢。</p>" +
+    "<h3>沙盒编辑器</h3>" +
+    "<p>在开战设置里点「编辑地形」就能像搭积木一样改造整张地图，改完点「完成」，之后开局都会沿用你的布置。</p><ul>" +
+    "<li><b>地形</b>：房屋、实心墙、矮墙（子弹能穿过）、门。</li>" +
+    "<li><b>单位</b>：底栏的下拉菜单里能放任何一个阵营的任何一个单位，还能批量放置。</li>" +
+    "<li><b>护送关卡</b>：休眠尸群、波次生成区、平民牢房、解锁门、小队出生点、撤离点，护送模式的地图可以整张重做。</li>" +
+    "<li><b>行进路线</b>：点地图依次放下检查点，再点某个节点就删掉它。拖动可以框出这条路线负责的单位范围。每支队伍一种颜色，可以画多条分别指派。</li>" +
+    "<li><b>其它</b>：坚守点位、出生区、移动、橡皮擦。</li>" +
+    "<li>三种画法：拖拽框选、两角定位、单击放置。支持撤销 / 清空 / 恢复默认，矩形自动吸附 8px 网格。</li></ul>" +
+    "<h3>护送模式</h3>" +
+    "<p>换一种玩法：这次不是守家，而是带一支小队深入敌占区救人。</p><ul>" +
+    "<li>开局前先决定救几名平民、买一支什么样的小队。救得越多，经济越宽裕，但涌来的丧尸也会略多。</li>" +
+    "<li>小队从地图<b>最东边</b>出发，平民被关在<b>最西边</b>的房子里，中间成堆的丧尸正在休眠，不去招惹它们，它们就不会动。</li>" +
+    "<li>摸到封锁大门即可解除封锁，之后平民会被一个个放出来加入队伍。<b>大门口是最危险的地方</b>：你得带着小队在那里撑到所有人都出来。</li>" +
+    "<li>封锁解除的这一刻，尸潮才开始从地图边缘涌来，而且是从撤离点那一半压过来，正好堵在退路上。</li>" +
+    "<li>平民全部救出后全队往撤离点撤。回撤途中一旦越过中线，涌来的丧尸就改从另一半包抄，等于从背后追上来。</li>" +
+    "<li>撤离点每 2 秒送走一人，<b>平民优先</b>，武装单位最后撤。第一个平民成功撤离的那一刻，尸潮会升级。</li>" +
+    "<li>每撤离一人得 1 分；所有人类阵亡即失败。</li>" +
+    "<li>撤离阶段队伍会<b>分一半人到平民队伍的两翼兜后</b>，不再全都挤在前面领队，否则队伍屁股后面没人管。" +
+    "另外被丧尸逼到时会<b>继续往撤离点压</b>，哪怕尸群就堵在撤离点门口。" +
+    "盾兵身边没有队友可护时会自己跟上大部队，不会原地等死。</li></ul>" +
+    "<h3>音效与画面</h3><ul>" +
+    "<li>所有音效都是实时合成的，游戏本体不含任何音频素材，也不增加文件体积。</li>" +
+    "<li>音量在右上角 ☰ 菜单里调，滑块最高能推到 <b>150%</b>，觉得枪声不够响就往上推，不用怕爆音（后面有压缩器兜底）。</li>" +
+    "<li>枪声偏沉闷空旷，人多枪密时也不刺耳；每种武器的音色都不一样，机枪连射时音调会随节奏微微上漂。</li>" +
+    "<li>声音分远近和左右：镜头拉远，战场就安静下来；尸群越聚越多，嘶吼会越低沉、越密集。</li>" +
+    "<li>打中丧尸时屏幕会极轻微地抖一下；丧尸阵亡时屏幕边缘闪一下绿光，我方有人被感染时闪一下紫光。</li>" +
+    "<li>分出胜负时：赢了一串烟花，输了满屏渐变的红光。</li>" +
+    "<li><b>后坐力</b>：开火会把射手往后推一把。不喜欢被枪推着走？按兵种调「后坐力倍率」，" +
+    "射手会用一个<b>略小于推力</b>的抵消加速度（默认 0.85 倍推力率）把自己顶住，只是勉强站得住，仍会被一点点推着走，" +
+    "不会像钉在地上那样顶着满额后坐力往前压。只有正在逃跑时才完全顺着推力走。" +
+    "这项在「兵种数据」面板里可以调，也支持按兵种单独设。</li>" +
+    "<li><b>想停就停</b>：人类<b>起步</b>用正常加速度，但<b>想停住或掉头</b>时换用高得多的制动加速度（1500 对 360），" +
+    "所以不会松开方向键之后还滑出去一段。判断依据是「目标方向与当前速度的夹角超过约 100°」，" +
+    "只要还是往前加速就一直用起步加速度。</li>" +
+    "<li><b>最高速度是应急储备</b>：人类平时只按<b>巡航速度</b>（默认为最高速的 78%）行动，" +
+    "只有被吓到（恐惧圈里有丧尸）或者<b>掉队太远</b>时才放开到满速去追/去逃。" +
+    "所以把最高速调高不会让整个战场变快，只会让「该跑的时候真的跑得掉」。巡航比例、掉队距离都是全局可调项。</li>" +
+    "<li><b>阵型</b>：武装单位在交战时会自动沿垂直于敌人来袭的方向拉开，形成一道横队一起开火；" +
+    "谁站哪一侧是固定的（按单位编号分配），所以阵线不会每帧乱跳。敌人从多个方向来时，各人会按自己的位置找合适角度。" +
+    "逃跑和回救掉队的平民时不讲阵型，保命优先。</li></ul>" +
+    "<h3>操作</h3><ul>" +
+    "<li>电脑：左键拖动平移，滚轮缩放，左键单击投放。" +
+    "数字键直接选投放物（" + keyDisplay(KEYMAP["place1"]) + " 步枪兵 … " + keyDisplay(KEYMAP["place6"]) + " 沙袋），" +
+    keyDisplay(KEYMAP["pause"]) + " 暂停，" + keyDisplay(KEYMAP["debug"]) + " 调试视图。</li>" +
+    "<li><b>调试视图</b>旁边的下拉可以只看一类线索：<b>锁敌</b>（每只丧尸此刻在追谁，以及它判定「够不着」的目标）、" +
+    "<b>感知</b>（远射 / 速射 / 恐惧圈）、<b>岗位</b>（防线点位与坚守连线）、<b>路径</b>（寻路结果）、" +
+    "<b>护卫</b>（平民跟着谁走）。拍剧情时想知道「它为什么不追那个人」，看锁敌那条线就够了。</li>" +
+    "<li><b>按 H 隐藏/显示全部界面</b>：工具栏、比例条、倒计时、鼠标光标一起藏起来，屏幕只剩战场，录屏前按一下就很干净。</li>" +
+    "<li><b>指挥模式（所有模式都有）</b>：按 <span class='k'>" + keyDisplay(KEYMAP["command"]) + "</span> 进入，" +
+    "在画面上<b>拖拽框选</b>一批人类单位，再点地图上任意一点，被选中的人会强制朝那里靠拢。" +
+    "它只决定「去哪」，开火、撤退、受伤、感染一概照旧；走到目标附近就自己交还 AI。" +
+    "按 Esc 退出。想一次性把散在场上的人拉回来，用这个最快。</li>" +
+    "<li><b>按 T 进入剧情模式</b>：自动暂停，点一个人类单位就能给他下移动/射击/保险/对话/阵亡等指令，指令会覆盖 AI。" +
+    "底部导演条还能无条件触发增援、帝皇特使降临、刷怪等事件。<b>按 C 开电影遮幅</b>。</li>" +
+    "<li><b>键位可以全部改</b>：导演条上的「键位」按钮里，全局操作、方向键、剧情指令都能重新绑。" +
+    "点一下动作再按新键即可，立刻保存、重开游戏也记得。<br>" +
+    "<b>以下是此刻正在生效的键位</b>（你在键位设置里改过，这里就会跟着变）：<br>" +
+    "<b>全局</b>：" + keysHelpText("game") + "<br>" +
+    "<b>方向</b>：" + keysHelpText("move") + "<br>" +
+    "<b>剧情指令</b>：" + keysHelpText("dir") + "</li>" +
+    "<li><b>坚守</b>：点「坚守」再点一下地面，再填个半径，这个角色就被钉在那片区域里了。" +
+    "他的<b>恐惧半径会缩到原来的四成，而且不再随尸潮规模放大</b>，恐惧只用来躲开贴脸的接触感染，" +
+    "不再是逃跑的开关；尸群压力一退，回位拉力立刻把他顶回位置上，边打边走，火力不停。" +
+    "但<b>这条只在手上有子弹时成立</b>：弹匣打空或正在换弹时他没有火力，也就没有硬顶的资格，" +
+    "恐惧半径会恢复成普通单位的水准先保命，补好弹再自己顶回去。<br>" +
+    "地上那圈蓝色虚线就是他的防区，剧本导出时会一并记下。「解除」可以交还 AI。</li>" +
+    "<li>手机：单指拖动平移，双指捏合缩放，轻点投放。</li>" +
+    "<li><b>亲自下场</b>：底栏的「操控」开关打开后，点一名人类单位就能接管他，电脑用 <span class='k'>WASD</span> 移动、鼠标瞄准、按住左键射击；手机会自动出现左右两个摇杆（左边走位，右边瞄准并开火）。镜头会一路跟着他。<br>" +
+    "接管期间：<b>屏幕右侧</b>显示当前枪械与弹药，打空变红并在屏幕下方提示「换弹中」；" +
+    "角色朝向上会拉出一条<b>越远越淡的白色粗虚线</b>瞄准线（长度到恐惧范围的 1.5 倍为止）；" +
+    "<b>空格键不再是暂停</b>，而是朝移动方向扑一段（0.75 秒冷却），用来脱离包围或者抢位置。<br>" +
+    "<b>随时点一名角色就能查看他的状态</b>（血条、枪械、弹药），不用先开操控，这时 AI 仍然在管他。" +
+    "查看状态下点「操控」就正式接管；<b>点空白处或按 <span class='k'>Esc</span></b> 都能退出查看，" +
+    "操控中按 <span class='k'>Esc</span> 则直接交还 AI；" +
+    "手机上接管后屏幕才变成左右摇杆，再点一次「操控」同样交还。" +
+    "手里握着步枪时左键直接是<b>速射</b>，不用先等一秒一发的点射节奏。<br>" +
+    "<b>击杀反馈</b>：命中时准星上闪一个白色十字，击杀变成红色的大十字；" +
+    "右上角会像 CS:GO 那样滚一条淘汰播报，<span class='k'>步枪兵 ▸ 步枪 ▸ 丧尸</span>，" +
+    "打掉母体会标成金色。这些只在你自己操控某个人时才出现，AI 互相打不刷屏。</li>" +
+    "关掉开关，或者他阵亡／被感染，角色立刻交还 AI。接管期间队伍照样把他当自己人，丧尸也照样追他。</li>" +
+    "<li><b>战争迷雾</b>：默认开启，菜单里可以关。只显示每个人类单位<b>朝向前方 60° 扇形</b>" +
+    "加上自身恐惧范围之内的战场，其余地方压成暗影，边界是柔和过渡；贴身还会留一小圈全向视野，" +
+    "免得被摸到背后还毫不知情。这一层<b>纯粹是画面遮罩</b>：丧尸的索敌、人类的判断完全不受影响，只是让你看不见。</li>" +
+    "<li><b>调兵种数值</b>：右上角 ☰ 菜单 →「调兵种数值」。左边选兵种，中间拖滑块，" +
+    "右边是一块<b>实时样板</b>，拿当前的数值打一只丧尸，射速、伤害、弹匣、换弹、射程、散射改了立刻看得出来。" +
+    "可调的东西几乎是全部：血量、体型、速度、加速度、<b>恐惧半径</b>、伤害、射程、射击间隔、<b>散射角</b>、" +
+    "<b>弹匣容量</b>、<b>换弹时间</b>，步枪还有独立的速射档，机枪的穿透、狙击的穿墙、盾兵的护盾耐久都能改。<br>" +
+    "改完立刻对场上现有单位和新投放的单位生效（血量按当前百分比等比缩放）。<br>" +
+    "<b>这些改动只在本页、只活在内存里</b>：不写浏览器存储、不进存档、也不会发到任何服务器，" +
+    "刷新页面或重新打开链接，一切都回到代码里写死的预设。面板里有「恢复默认」。</li>" +
+    "<li><b>自己设计新角色</b>：面板里点「＋ 新建角色」，会以当前兵种为模板复制一个自带独立枪械参数的新兵种，" +
+    "改名、改色、改数值都不会牵连原来那个。建好的角色会出现在底栏投放和地形编辑器的下拉里。<br>" +
+    "<b>角色种子</b>：改动不会被保存，但面板底部的「角色种子」能把<b>你改过的全部数值 + 新建的角色</b>压成一行文本。" +
+    "复制保存下来，下次粘回去就能一字不差地还原；也可以把它发给作者，直接照着做成新的默认预设。</li>" +
+    "<li><b>恢复默认</b>：开战设置、键位设置、兵种数值、地形编辑器，每个页面都有自己的「恢复默认」；" +
+    "菜单里还有一个<b>「恢复全部默认设置」</b>，一键把它们全部拉回预设（已保存的存档和地形布置不会被动）。</li>" +
+    "<li>进度每 15 秒自动存档到浏览器；也可手动「存档/读档」，或用「导出/导入」把存档文件带走。</li></ul>" +
+    "</details>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var hu2 = document.getElementById("helpUnit");
+  if (hu2) hu2.addEventListener("click", function () {
+    OVERLAY_BACK = showHelp;
+    showUnitTune();
+  });
+  var ht = document.getElementById("helpTutor");
+  if (ht) ht.addEventListener("click", function () {
+    hideOverlay();
+    try { tutorReset(); } catch (e) {}
+    TUTOR.i = 0;
+    showTutor(0);
+  });
+  var hk = document.getElementById("helpKeys");
+  if (hk) hk.addEventListener("click", function () {
+    OVERLAY_BACK = showHelp;
+    showKeyHelp(0);
+  });
+  var hs = document.getElementById("helpStart");
+  if (hs) hs.addEventListener("click", function () {
+    OVERLAY_BACK = showHome;
+    showStartPanel();
+  });
+  var hc = document.getElementById("helpClose");
+  if (hc) hc.addEventListener("click", closeOverlaySmart);
+}
+/* 从首页打开的设置/帮助，关闭时要能回到首页，而不是停在一片空背景 */
+var OVERLAY_BACK = null;
+var HOME_PANEL = false, START_PANEL = false;
+function closeOverlaySmart() {
+  var back = OVERLAY_BACK;
+  OVERLAY_BACK = null;
+  hideOverlay();
+  if (typeof back === "function") back();
+}
+function hideOverlay() {
+  if (document.getElementById("setPlayHost")) settingsPark();
+  if (document.getElementById("moreHost")) morePark();
+  if (typeof previewStop === "function") previewStop();
+  if (typeof marketPreviewStop === "function") marketPreviewStop();
+  overlayEl.className = "";
+  MARKET_OPEN = false;
+  /* 对局已结束还挂着操控状态时，关面板顺手把它放掉 */
+  if (W.over && PLAYER.on) {
+    PLAYER.on = false;
+    if (typeof releasePlayerUnit === "function") releasePlayerUnit();
+  }
+}
+/* ------------------ 开战设置：增数与乘数互斥，最高 +200% / ×20 ------------------ */
+var START = { mode: "", add: 0, mult: 1, postDuty: false, gameMode: "defense",
+              civCount: 8, squad: { rifle: 5, mg: 1, sniper: 0, shield: 0 }, heroMode: true,
+              chaosCiv: 200, reinforce: true, emperor: false,
+              /* 波次模式：开局不铺满丧尸，改按下面四个参数分批涌入 */
+              waveMode: true, waveCount: 10, waveFirst: 50, waveGap: 180, waveSize: 150, waveScale: true,
+              bossWave: true, bossEvery: 9, doubleBoss: false, difficulty: "normal",
+              /* undefined = 按模式自动（防线关、护送开）；用户勾过就按用户的来 */
+              fogMode: undefined };
+var LAST_CIV_COUNT = 8;
+var LAST_SQUAD = ["rifle", "rifle", "rifle", "rifle", "rifle", "mg"];
+var LAST_ZOMBIE_COUNT = 0;
+function startZombieCount() {
+  var base = CFG.start.baseZombies;
+  if (START.mode === "add") return Math.max(1, Math.round(base * (1 + START.add)));
+  if (START.mode === "mult") return Math.max(1, Math.round(base * START.mult));
+  return base;
+}
+/* 波次设置的实时预览：合计多少只、最后一波大概在什么时候 */
+function refreshWaveOpts() {
+  var c = START.waveCount | 0, fi = START.waveFirst | 0, gp = START.waveGap | 0, sz = START.waveSize | 0;
+  var be = START.bossEvery | 0 || 10;
+  var e;
+  e = document.getElementById("wCountV"); if (e) e.textContent = c;
+  e = document.getElementById("wFirstV"); if (e) e.textContent = fi;
+  e = document.getElementById("wGapV"); if (e) e.textContent = gp;
+  e = document.getElementById("wSizeV"); if (e) e.textContent = sz;
+  e = document.getElementById("wBossEveryV"); if (e) e.textContent = be;
+  var bwp = document.getElementById("bossWavePreview");
+  if (bwp) bwp.innerHTML = START.bossWave ? ("首领波次：第 <b>" + be + "</b>、" + (be * 2) + "、" + (be * 3) + "… 波随机出现首领池中的首领（等概率）") : "首领波次未开启";
+  e = document.getElementById("wavePreview");
+  if (!e) return;
+  var total = c * sz;
+  var last = fi + Math.max(0, c - 1) * gp;
+  var mm = Math.floor(last / 60), ss = Math.round(last % 60);
+  e.innerHTML = "合计 <b>" + total + "</b> 只丧尸 · 首波在第 <b>" + fi + "</b> 秒，" +
+    "最后一波在第 <b>" + mm + " 分 " + (ss < 10 ? "0" + ss : ss) + " 秒</b>左右" +
+    (START.waveMode ? "" : " <span style='color:#ff9a9a'>（当前未开启）</span>");
+}
+function refreshStartPanel() {
+  var i, b, v;
+  var sizeSel = document.getElementById("sizeSel");
+  if (sizeSel) {
+    sizeSel.value = (START.mode === "add") ? ("add:" + START.add)
+      : (START.mode === "mult") ? ("mult:" + START.mult) : "base";
+  }
+  var addBtns = panelEl.querySelectorAll("[data-add]");
+  for (i = 0; i < addBtns.length; i++) {
+    b = addBtns[i];
+    v = parseFloat(b.getAttribute("data-add"));
+    b.className = (START.mode === "add" && Math.abs(v - START.add) < 1e-6) ? "on" : "";
+  }
+  var multBtns = panelEl.querySelectorAll("[data-mult]");
+  for (i = 0; i < multBtns.length; i++) {
+    b = multBtns[i];
+    v = parseFloat(b.getAttribute("data-mult"));
+    b.className = (START.mode === "mult" && Math.abs(v - START.mult) < 1e-6) ? "on" : "";
+  }
+  var n = startZombieCount();
+  var civ = Math.min(n, CFG.caps.civilians);
+  var pv = document.getElementById("preview");
+  if (pv) {
+    pv.innerHTML = "最终丧尸数量：<b>" + n + "</b> 只 · 随行平民：<b>" + civ + "</b> 人" +
+      (n > 500 ? " <span style='color:#ff9a9a'>（预计明显掉帧，建议 200 以内）</span>"
+        : n > 250 ? " <span style='color:#ffd479'>（低端设备可能掉帧）</span>" : "");
+  }
+}
+/* ------------------ 开局前地形编辑器：拖拽 / 两角 / 单击三种画法 ------------------ */
+var TILE_GROUP_SEQ = 0;
+var EDIT = {
+  active: false, tool: "house", mode: "drag", snapMode: "32", tileColor: "#3a4a56", colorSet: false, tileEffect: "none", tileSolid: false, tilePierce: false, tileHp: 0, tilePattern: "solid", genDifficulty: "normal", altFree: false, cellPainting: false, cellLastCX: -999, cellLastCY: -999, showAnalysis: false, showSuggested: false, suggestedPosts: null, lastGenMode: "rooms",
+  cornerX: 0, cornerY: 0, hasCorner: false,
+  dragging: false, startX: 0, startY: 0,
+  curX: 0, curY: 0, hover: false,
+  touched: false, unitsEdited: false, undo: [], redo: [], undoMax: 30,
+  /* 编辑器里的单位布置以"蓝图"（兵种 + 坐标）保存，而不是直接引用对局里的单位对象，
+     否则打过的残局会把位置、生死状态带进下一次编辑 */
+  units: null,
+  spawn: null, grabbed: null, selUnit: null,
+  /* 护送模式的关卡要素：玩家改过就用玩家的布置（levelTouched），否则用 CFG 里的默认关卡 */
+  level: null, levelTouched: false,
+  /* 当前正在编辑的行进路线（-1 表示下次点击会开一条新的） */
+  routeCur: -1
+};
+/* 每条路线一种颜色，编组一眼分得开 */
+var ROUTE_COLORS = ["#ff9a3c", "#4ec9ff", "#7dff9a", "#ff6ec7", "#ffd94a", "#b98cff", "#5cf0d0", "#ff8a7a"];
+function routeColor(i) { return ROUTE_COLORS[i % ROUTE_COLORS.length]; }
+/* 取当前路线；create 为真且当前没有时，开一条新的（自动分配颜色） */
+function curRoute(create) {
+  var L = ensureLevel();
+  if (!L.routes) L.routes = [];
+  if (create && EDIT.routeCur < 0) {
+    L.routes.push({ pts: [], rect: null, color: routeColor(L.routes.length), id: L.routes.length + 1 });
+    EDIT.routeCur = L.routes.length - 1;
+    toast("开始一条新路线（" + L.routes[EDIT.routeCur].color + "），点击地图依次放下检查点");
+  }
+  return (EDIT.routeCur >= 0 && L.routes[EDIT.routeCur]) ? L.routes[EDIT.routeCur] : null;
+}
+/* 点击：点到已有检查点就删掉它，否则在末尾接上一个新检查点 */
+function editRouteClick(wx, wy) {
+  var L = ensureLevel(), r, p;
+  var hitR = -1, hitP = -1, bd = 28 * 28;
+  for (r = 0; r < (L.routes || []).length; r++) {
+    var pts = L.routes[r].pts;
+    for (p = 0; p < pts.length; p++) {
+      var d = dist2(wx, wy, pts[p].x, pts[p].y);
+      if (d < bd) { bd = d; hitR = r; hitP = p; }
+    }
+  }
+  if (hitR >= 0) {
+    L.routes[hitR].pts.splice(hitP, 1);
+    EDIT.levelTouched = true;
+    toast("删掉第 " + (hitP + 1) + " 个检查点，这条路线还剩 " + L.routes[hitR].pts.length + " 个");
+    return;
+  }
+  var rt = curRoute(true);
+  rt.pts.push({ x: editSnap(wx, "x"), y: editSnap(wy, "y") });
+  EDIT.levelTouched = true;
+  toast("第 " + rt.pts.length + " 个检查点");
+}
+/* 拖动：给当前路线框出它负责的单位范围（重建场景后落在框里的单位继承这条路线） */
+function editRouteBox(x0, y0, x1, y1) {
+  var rt = curRoute(true);
+  rt.rect = editRectFrom(x0, y0, x1, y1);
+  EDIT.levelTouched = true;
+  toast("已框定这条路线负责的单位范围，重建场景后落在框内的单位会沿它行进");
+}
+/* 默认关卡：初始尸群、波次生成区、牢房、锁门、出生点、撤离点，全部来自 CFG */
+function defaultLevel() {
+  var E2 = CFG.escort, i;
+  var mounds = [];
+  for (i = 0; i < E2.mounds.length; i++) mounds.push({ x: E2.mounds[i].x, y: E2.mounds[i].y, n: E2.mounds[i].n });
+  var pts = edgeSpawnPoints(), zones = [];
+  for (i = 0; i < pts.length; i++) {
+    zones.push({ x: pts[i].x0, y: pts[i].y0, w: pts[i].x1 - pts[i].x0, h: pts[i].y1 - pts[i].y0, side: pts[i].side });
+  }
+  return {
+    mounds: mounds,
+    zones: zones,
+    prison: { x: E2.house.x, y: E2.house.y, w: E2.house.w, h: E2.house.h },
+    prisonDoor: null,
+    squad: { x: E2.evac.x, y: E2.evac.y },
+    evac: { x: E2.evac.x, y: E2.evac.y },
+    routes: [],
+    /* 无敌区：框进去的单位不会被丧尸索敌，也不参与集群行为识别 */
+    safeZones: []
+  };
+}
+function ensureLevel() {
+  if (!EDIT.level) EDIT.level = defaultLevel();
+  return EDIT.level;
+}
+/* 某个坐标是否落在无敌区里。无敌区数量通常只有一两个，直接遍历即可 */
+function inSafeZone(x, y) {
+  var L = activeLevel();
+  if (!L || !L.safeZones || !L.safeZones.length) return false;
+  for (var i = 0; i < L.safeZones.length; i++) {
+    var z = L.safeZones[i];
+    if (x >= z.x && x <= z.x + z.w && y >= z.y && y <= z.y + z.h) return true;
+  }
+  return false;
+}
+/* 当前生效的关卡：玩家动过就用玩家的，否则回落到 CFG 默认 */
+function activeLevel() {
+  return (EDIT.levelTouched && EDIT.level) ? EDIT.level : null;
+}
+/* ---------- 护送关卡要素的放置 ---------- */
+function editAddMound(wx, wy) {
+  var L = ensureLevel();
+  var n = Math.max(2, 6 * batchCount());
+  L.mounds.push({ x: editSnap(wx, "x"), y: editSnap(wy, "y"), n: n });
+  EDIT.levelTouched = true;
+  toast("放下一堆休眠丧尸（" + n + " 只），用橡皮擦可以删掉");
+}
+function editAddZone(x0, y0, x1, y1) {
+  var L = ensureLevel();
+  var r = editRectFrom(x0, y0, x1, y1);
+  var mid = CFG.world.w / 2, cx = r.x + r.w / 2;
+  var side = (r.x < mid && r.x + r.w > mid) ? 0 : (cx < mid ? -1 : 1);
+  L.zones.push({ x: r.x, y: r.y, w: r.w, h: r.h, side: side });
+  EDIT.levelTouched = true;
+  toast("新增波次生成区（" + (side === 0 ? "两侧通用" : side < 0 ? "左半场" : "右半场") + "）");
+}
+function editAddSafeZone(x0, y0, x1, y1) {
+  var L = ensureLevel();
+  if (!L.safeZones) L.safeZones = [];
+  L.safeZones.push(editRectFrom(x0, y0, x1, y1));
+  EDIT.levelTouched = true;
+  toast("新增无敌区：框内的单位不会被丧尸索敌，也不参与集群识别");
+}
+function editSetPrison(x0, y0, x1, y1) {
+  var L = ensureLevel();
+  L.prison = editRectFrom(x0, y0, x1, y1);
+  EDIT.levelTouched = true;
+  toast("已把这块矩形指定为平民牢房（自动砌墙并在最近的一面墙上开锁门）");
+}
+function editAddPrisonDoor(x0, y0, x1, y1) {
+  var L = ensureLevel();
+  L.prisonDoor = editRectFrom(x0, y0, x1, y1);
+  EDIT.levelTouched = true;
+  toast("已放置解锁门；开门位置会自动贴到牢房最近的那面墙上");
+}
+function editSetPoint(which, wx, wy) {
+  var L = ensureLevel();
+  L[which] = { x: editSnap(wx, "x"), y: editSnap(wy, "y") };
+  EDIT.levelTouched = true;
+  toast(which === "squad" ? "已设定小队出生点" : "已设定撤离点");
+}
+/* 在框选范围内删掉关卡要素（尸群 / 波次区 / 出生点等），橡皮擦会调用它 */
+function editEraseLevel(x0, y0, x1, y1, single) {
+  if (!EDIT.levelTouched || !EDIT.level) return 0;
+  var L = EDIT.level;
+  var ax = Math.min(x0, x1), ay = Math.min(y0, y1), bx = Math.max(x0, x1), by = Math.max(y0, y1);
+  var hit = function (px, py) { return px >= ax && px <= bx && py >= ay && py <= by; };
+  var n = 0, i;
+  for (i = L.mounds.length - 1; i >= 0; i--) if (hit(L.mounds[i].x, L.mounds[i].y)) { L.mounds.splice(i, 1); n++; }
+  for (i = L.zones.length - 1; i >= 0; i--) {
+    var z = L.zones[i];
+    if (hit(z.x + z.w / 2, z.y + z.h / 2)) { L.zones.splice(i, 1); n++; }
+  }
+  if (L.squad && hit(L.squad.x, L.squad.y)) { L.squad = null; n++; }
+  if (L.evac && hit(L.evac.x, L.evac.y)) { L.evac = null; n++; }
+  if (L.safeZones) {
+    for (i = 0; i < L.safeZones.length; i++) {
+      var sz = L.safeZones[i];
+      if (hit(sz.x + sz.w / 2, sz.y + sz.h / 2)) { L.safeZones.splice(i, 1); n++; break; }
+    }
+  }
+  return n;
+}
+function defaultSpawnZone() {
+  return { x: 50, y: 60, w: 780, h: CFG.world.h - 120 };
+}
+/* 出生区只是个大致范围，随机落点仍可能正好压在墙上。
+   落在墙里的丧尸既走不动也打不到，最后一只清不掉就是死局，所以生成时挪到最近的空格 */
+function navCellBlocked(x, y) {
+  var tx = Math.floor(x / NAV.tile), ty = Math.floor(y / NAV.tile);
+  if (tx < 0 || ty < 0 || tx >= NAV.cols || ty >= NAV.rows) return true;
+  return !!NAV.blocked[ty * NAV.cols + tx];
+}
+function spawnAtFreeSpot(kind, zs) {
+  var x = RNG.range(zs.x, zs.x + zs.w);
+  var y = RNG.range(zs.y, zs.y + zs.h);
+  /* 判据必须用 NAV 网格：寻路和碰撞都按它算，
+     障碍物的包围盒比格子宽松，按包围盒判会漏掉一批"看着在外面、其实格子里是墙"的点 */
+  if (navCellBlocked(x, y) || blockedForPlacement(x, y, 4)) {
+    var slot = NAV.nearestFree(Math.floor(x / NAV.tile), Math.floor(y / NAV.tile));
+    if (slot) { x = (slot[0] + 0.5) * NAV.tile; y = (slot[1] + 0.5) * NAV.tile; }
+  }
+  var u = addUnit(kind, x, y);
+  /* 兜底：万一 nearestFree 也够不着，直接按障碍法线推出来 */
+  collideObstacles(u);
+  return u;
+}
+/* 出生区必须跟着地图走。原来所有地图共用一条写死的左侧竖条，
+   换到 H 型通道时那一条横跨两间封闭房，刷出来的丧尸根本走不到交火线；
+   换到平原时又会和随机残垣叠在一起，把丧尸关进封闭的屋子里 */
+function mapSpawnZone(id) {
+  if (id === "channel") {
+    /* 走廊左半段：丧尸直接刷在走廊里，只能顺着走廊往右压 */
+    var gap = 170;
+    var cy = CFG.world.h / 2 - gap / 2;
+    return { x: 800, y: cy + 18, w: 360, h: gap - 36 };
+  }
+  if (id === "indoor") {
+    /* 室内图左侧第一间房 */
+    return { x: 90, y: 90, w: 480, h: CFG.world.h - 180 };
+  }
+  if (id === "plains") {
+    /* 平原：留出最左边一条空地，建筑不会压在这儿 */
+    return { x: 90, y: 90, w: 620, h: CFG.world.h - 180 };
+  }
+  if (id === "port") {
+    /* 港口：左侧码头整条空地，集装箱从出生区右边开始 */
+    return { x: 90, y: 180, w: 700, h: CFG.world.h - 360 };
+  }
+  return defaultSpawnZone();
+}
+var EDIT_SNAP = 8;
+/* 吸附优先级：已有墙/门的边或端点 > 网格。自由模式完全不动 */
+function editSnap(v, axis) {
+  if (!EDIT || EDIT.snapMode === "free" || EDIT.altFree) return v;
+  var best = v, bd = 12, i, o, cand;
+  for (i = 0; i < W.obstacles.length; i++) {
+    o = W.obstacles[i];
+    if (axis === "y") { cand = [o.y, o.y + o.h]; }
+    else { cand = [o.x, o.x + o.w]; }
+    for (var k = 0; k < cand.length; k++) {
+      var dd = Math.abs(cand[k] - v);
+      if (dd < bd) { bd = dd; best = cand[k]; }
+    }
+  }
+  if (bd < 12) return best;
+  var sz = parseInt(EDIT.snapMode, 10);
+  if (!sz || sz < 4) sz = 8;
+  return Math.round(v / sz) * sz;
+}
+function syncSnapBtn() {
+  var b = document.getElementById("eSnapMode");
+  if (!b) return;
+  b.textContent = "吸附：" + (EDIT.snapMode === "free" ? "自由" : EDIT.snapMode + "px");
+}
+function editSnapshotNow() {
+  return { obs: W.obstacles.slice(), doors: W.doors.slice(), units: W.units.slice(), tiles: (W.tiles || []).slice(), art: (W.wallArt || []).slice() };
+}
+function editApplySnapshot(s) {
+  W.obstacles = s.obs; W.doors = s.doors;
+  if (s.units) W.units = s.units;
+  if (s.tiles) W.tiles = s.tiles;
+  if (s.art) W.wallArt = s.art;
+  EDIT.touched = true;
+  editRebuild();
+}
+function editPushUndo() {
+  EDIT.undo.push(editSnapshotNow());
+  if (EDIT.undo.length > EDIT.undoMax) EDIT.undo.shift();
+  EDIT.redo.length = 0;
+  syncEditButtons();
+}
+function editUndo() {
+  if (!EDIT.undo.length) { toast("没有可撤销的操作"); return; }
+  var s = EDIT.undo.pop();
+  EDIT.redo.push(editSnapshotNow());
+  if (EDIT.redo.length > EDIT.undoMax) EDIT.redo.shift();
+  editApplySnapshot(s);
+  syncEditButtons();
+}
+function editRedo() {
+  if (!EDIT.redo.length) { toast("没有可重做的操作"); return; }
+  var s = EDIT.redo.pop();
+  EDIT.undo.push(editSnapshotNow());
+  if (EDIT.undo.length > EDIT.undoMax) EDIT.undo.shift();
+  editApplySnapshot(s);
+  syncEditButtons();
+}
+function editDefaultSize(tool) {
+  if (tool === "low") return { w: 128, h: 24 };
+  if (tool === "wall") return { w: 160, h: 96 };
+  return { w: 420, h: 340 };
+}
+function editRectFrom(x0, y0, x1, y1) {
+  /* 最小边长 24：既挡住误点产生的碎片，又能放下 26 厚的半墙 */
+  var MIN = 24;
+  var ax = clamp(editSnap(Math.min(x0, x1), "x"), 0, CFG.world.w - MIN);
+  var ay = clamp(editSnap(Math.min(y0, y1), "y"), 0, CFG.world.h - MIN);
+  var bx = clamp(editSnap(Math.max(x0, x1), "x"), ax + MIN, CFG.world.w);
+  var by = clamp(editSnap(Math.max(y0, y1), "y"), ay + MIN, CFG.world.h);
+  return { x: ax, y: ay, w: bx - ax, h: by - ay };
+}
+var RECT_TOOLS = { house: 1, wall: 1, destWall: 1, low: 1, slowZone: 1, burnZone: 1, spawner: 1, hold: 1, tile: 1, wavezone: 1, prison: 1, prisondoor: 1, safezone: 1 };
+function editPendingRect() {
+  if (!RECT_TOOLS[EDIT.tool]) return null;
+  if (EDIT.mode === "point" && EDIT.tool !== "wavezone" && EDIT.tool !== "prison" && EDIT.tool !== "prisondoor") {
+    var d = editDefaultSize(EDIT.tool);
+    return editRectFrom(EDIT.curX - d.w / 2, EDIT.curY - d.h / 2, EDIT.curX + d.w / 2, EDIT.curY + d.h / 2);
+  }
+  if (EDIT.dragging) return editRectFrom(EDIT.startX, EDIT.startY, EDIT.curX, EDIT.curY);
+  if (EDIT.hasCorner) return editRectFrom(EDIT.cornerX, EDIT.cornerY, EDIT.curX, EDIT.curY);
+  return null;
+}
+function hexToHsl(hex) {
+  var h = String(hex || "#3a4a56").replace("#", "");
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  var r = parseInt(h.slice(0, 2), 16) / 255, g = parseInt(h.slice(2, 4), 16) / 255, b = parseInt(h.slice(4, 6), 16) / 255;
+  var mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  var hue = 0, sat = 0, lit = (mx + mn) / 2;
+  if (d) {
+    sat = lit > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+    if (mx === r) hue = (g - b) / d + (g < b ? 6 : 0);
+    else if (mx === g) hue = (b - r) / d + 2;
+    else hue = (r - g) / d + 4;
+    hue *= 60;
+  }
+  return [Math.round(hue), Math.round(sat * 100), Math.round(lit * 100)];
+}
+function paintObstacle(o, hex) {
+  if (!o) return;
+  var c = hexToHsl(hex);
+  o.hue = c[0]; o.sat = c[1]; o.lit = c[2];
+}
+function editCommit(r) {
+  if (!r) return;
+  editPushUndo();
+  if (EDIT.tool === "house" && r.w >= 240 && r.h >= 240) {
+    var hb = W.obstacles.length;
+    if (!addBuilding(r.x, r.y, r.w, r.h, (r.w * r.h > 420000) ? 3 : 2, true)) {
+      W.obstacles.push(makeObstacle(r.x, r.y, r.w, r.h, "wall"));
+    }
+    if (EDIT.colorSet) for (var hc = hb; hc < W.obstacles.length; hc++) paintObstacle(W.obstacles[hc], EDIT.tileColor);
+  } else if (EDIT.tool === "low") {
+    var lw = makeObstacle(r.x, r.y, r.w, r.h, "low");
+    if (EDIT.colorSet) paintObstacle(lw, EDIT.tileColor);
+    W.obstacles.push(lw);
+  } else if (EDIT.tool === "destWall") {
+    var dw = makeObstacle(r.x, r.y, r.w, r.h, "wall");
+    dw.destructible = true; dw.maxHp = 240; dw.hp = 240;
+    if (EDIT.colorSet) paintObstacle(dw, EDIT.tileColor);
+    W.obstacles.push(dw);
+  } else if (EDIT.tool === "tile") {
+    if (!W.tiles) W.tiles = [];
+    var eff = EDIT.tileEffect || "none";
+    var newHp = EDIT.tileHp || 0, group = null;
+    if (newHp > 0 && EDIT.tileSolid) {
+      for (var ti0 = 0; ti0 < W.tiles.length; ti0++) {
+        var et = W.tiles[ti0];
+        if (!et.solid || !et.maxHp || et.pattern !== (EDIT.tilePattern || "solid") || et.color !== (EDIT.tileColor || "#3a4a56")) continue;
+        var touch = !(r.x > et.x + et.w + 2 || r.x + r.w < et.x - 2 || r.y > et.y + et.h + 2 || r.y + r.h < et.y - 2);
+        if (touch) { group = et.group || null; newHp = et.hp; break; }
+      }
+    }
+    if (newHp > 0 && !group) group = "tg" + (++TILE_GROUP_SEQ);
+    W.tiles.push({ x: r.x, y: r.y, w: r.w, h: r.h, color: EDIT.tileColor || "#3a4a56",
+      alpha: 0.5, slow: eff === "slow" ? 0.35 : 0, dps: eff === "burn" ? 4 : 0,
+      solid: !!EDIT.tileSolid, pierce: !!EDIT.tilePierce,
+      hp: newHp, maxHp: newHp, pattern: EDIT.tilePattern || "solid", group: group });
+    if (EDIT.tileSolid) {
+      var tob = makeObstacle(r.x, r.y, r.w, r.h, EDIT.tilePierce ? "low" : "wall");
+      tob.tile = true;
+      paintObstacle(tob, EDIT.tileColor);
+      if (newHp > 0) { tob.destructible = true; tob.maxHp = newHp; tob.hp = newHp; tob.group = group; }
+      W.obstacles.push(tob);
+    }
+  } else if (EDIT.tool === "hold") {
+    if (!W.holds) W.holds = [];
+    W.holds.push({ x: r.x, y: r.y, w: r.w, h: r.h, r: Math.min(r.w, r.h) / 2, owner: null, prog: 0 });
+  } else if (EDIT.tool === "spawner") {
+    if (!W.spawners) W.spawners = [];
+    W.spawners.push({ x: r.x, y: r.y, w: r.w, h: r.h, kind: "zombie", interval: 3, limit: 20, count: 0, t: 0 });
+  } else if (EDIT.tool === "slowZone" || EDIT.tool === "burnZone") {
+    if (!W.zones) W.zones = [];
+    W.zones.push({ x: r.x, y: r.y, w: r.w, h: r.h,
+      type: EDIT.tool === "burnZone" ? "burn" : "slow",
+      slow: EDIT.tool === "slowZone" ? 0.45 : 0, dps: EDIT.tool === "burnZone" ? 6 : 0 });
+  } else {
+    var wf = makeObstacle(r.x, r.y, r.w, r.h, "wall");
+    if (EDIT.colorSet) paintObstacle(wf, EDIT.tileColor);
+    W.obstacles.push(wf);
+  }
+  EDIT.touched = true;
+  editRebuild();
+}
+function editEraseAt(wx, wy) {
+  var r = 18, changed = false, i, o;
+  if (editEraseLevel(wx - r, wy - r, wx + r, wy + r, true) > 0) { EDIT.touched = true; editRebuild(); toast("已删除关卡要素"); return; }
+  var keep = [], keepDoors = [], keepUnits = [];
+  for (i = 0; i < W.obstacles.length; i++) {
+    o = W.obstacles[i];
+    var nx = clamp(wx, o.x, o.x + o.w), ny = clamp(wy, o.y, o.y + o.h);
+    if (o.prison) { keep.push(o); continue; }   /* 封锁大门不可删除 */
+    if (dist2(wx, wy, nx, ny) <= r * r) { changed = true; continue; }
+    keep.push(o);
+  }
+  for (i = 0; i < W.doors.length; i++) {
+    var d = W.doors[i];
+    if (d.prison) { keepDoors.push(d); continue; }   /* 封锁大门的门记录也不可删除 */
+    var dx = clamp(wx, d.x, d.x + d.w), dy = clamp(wy, d.y, d.y + d.h);
+    if (dist2(wx, wy, dx, dy) <= r * r) { changed = true; continue; }
+    keepDoors.push(d);
+  }
+  var keepTiles = [];
+  if (W.tiles) {
+    for (i = 0; i < W.tiles.length; i++) {
+      var tl = W.tiles[i];
+      if (wx >= tl.x - 4 && wx <= tl.x + tl.w + 4 && wy >= tl.y - 4 && wy <= tl.y + tl.h + 4) { changed = true; continue; }
+      keepTiles.push(tl);
+    }
+  }
+  var keepHolds = [];
+  if (W.holds) {
+    for (i = 0; i < W.holds.length; i++) {
+      var hd = W.holds[i];
+      if (wx >= hd.x - 4 && wx <= hd.x + hd.w + 4 && wy >= hd.y - 4 && wy <= hd.y + hd.h + 4) { changed = true; continue; }
+      keepHolds.push(hd);
+    }
+  }
+  var keepSpawners = [];
+  if (W.spawners) {
+    for (i = 0; i < W.spawners.length; i++) {
+      var sp = W.spawners[i];
+      if (wx >= sp.x - 4 && wx <= sp.x + sp.w + 4 && wy >= sp.y - 4 && wy <= sp.y + sp.h + 4) { changed = true; continue; }
+      keepSpawners.push(sp);
+    }
+  }
+  var keepZones = [];
+  if (W.zones) {
+    for (i = 0; i < W.zones.length; i++) {
+      var zn = W.zones[i];
+      if (wx >= zn.x - 4 && wx <= zn.x + zn.w + 4 && wy >= zn.y - 4 && wy <= zn.y + zn.h + 4) { changed = true; continue; }
+      keepZones.push(zn);
+    }
+  }
+  for (i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (!u.dead && dist2(wx, wy, u.x, u.y) <= (r + 8) * (r + 8)) { changed = true; continue; }
+    keepUnits.push(u);
+  }
+  if (!changed) return;
+  editPushUndo();
+  if (keepUnits.length !== W.units.length) EDIT.unitsEdited = true;
+  W.obstacles = keep; W.doors = keepDoors; W.units = keepUnits;
+  if (W.zones) W.zones = keepZones;
+  if (W.spawners) W.spawners = keepSpawners;
+  if (W.holds) W.holds = keepHolds;
+  if (W.tiles) W.tiles = keepTiles;
+  EDIT.touched = true;
+  editRebuild();
+}
+/* 框选区域删除：把矩形内的障碍、门、单位一次清掉 */
+function editEraseArea(x0, y0, x1, y1) {
+  var ax = Math.min(x0, x1), ay = Math.min(y0, y1), bx = Math.max(x0, x1), by = Math.max(y0, y1);
+  var i, keep = [], keepDoors = [], keepUnits = [], removedO = 0, removedU = 0;
+  for (i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    if (o.prison) { keep.push(o); continue; }   /* 封锁大门不可框选删除 */
+    if (o.x >= ax && o.x + o.w <= bx && o.y >= ay && o.y + o.h <= by) { removedO++; continue; }
+    keep.push(o);
+  }
+  for (i = 0; i < W.doors.length; i++) {
+    var d = W.doors[i];
+    if (d.prison) { keepDoors.push(d); continue; }   /* 封锁大门不可框选删除 */
+    if (d.x >= ax && d.x + d.w <= bx && d.y >= ay && d.y + d.h <= by) continue;
+    keepDoors.push(d);
+  }
+  var keepTiles2 = [];
+  if (W.tiles) {
+    for (i = 0; i < W.tiles.length; i++) {
+      var tl2 = W.tiles[i];
+      if (tl2.x >= ax && tl2.x + tl2.w <= bx && tl2.y >= ay && tl2.y + tl2.h <= by) { removedO++; continue; }
+      keepTiles2.push(tl2);
+    }
+  }
+  var keepHolds2 = [];
+  if (W.holds) {
+    for (i = 0; i < W.holds.length; i++) {
+      var hd2 = W.holds[i];
+      if (hd2.x >= ax && hd2.x + hd2.w <= bx && hd2.y >= ay && hd2.y + hd2.h <= by) { removedO++; continue; }
+      keepHolds2.push(hd2);
+    }
+  }
+  var keepSpawners2 = [];
+  if (W.spawners) {
+    for (i = 0; i < W.spawners.length; i++) {
+      var sp2 = W.spawners[i];
+      if (sp2.x >= ax && sp2.x + sp2.w <= bx && sp2.y >= ay && sp2.y + sp2.h <= by) { removedO++; continue; }
+      keepSpawners2.push(sp2);
+    }
+  }
+  var keepZones2 = [];
+  if (W.zones) {
+    for (i = 0; i < W.zones.length; i++) {
+      var zn2 = W.zones[i];
+      if (zn2.x >= ax && zn2.x + zn2.w <= bx && zn2.y >= ay && zn2.y + zn2.h <= by) { removedO++; continue; }
+      keepZones2.push(zn2);
+    }
+  }
+  for (i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (!u.dead && u.x >= ax && u.x <= bx && u.y >= ay && u.y <= by) { removedU++; continue; }
+    keepUnits.push(u);
+  }
+  var removedL = editEraseLevel(x0, y0, x1, y1, false);
+  if (!removedO && !removedU && !removedL) { toast("框选范围内没有可删除的内容"); return; }
+  editPushUndo();
+  if (removedU) EDIT.unitsEdited = true;
+  W.obstacles = keep; W.doors = keepDoors; W.units = keepUnits;
+  if (W.zones) W.zones = keepZones2;
+  if (W.spawners) W.spawners = keepSpawners2;
+  if (W.holds) W.holds = keepHolds2;
+  if (W.tiles) W.tiles = keepTiles2;
+  EDIT.touched = true;
+  editRebuild();
+  toast("框选删除：障碍 -" + removedO + "，单位 -" + removedU);
+}
+function unitAt(wx, wy, radius) {
+  var best = null, bd = radius * radius;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead) continue;
+    var d = dist2(wx, wy, u.x, u.y);
+    if (d < bd) { bd = d; best = u; }
+  }
+  return best;
+}
+/* 编辑器里能直接放置的单位。
+   这里原本是一张手写白名单，前后漏过两轮：先是狙击手和盾兵，后来又漏了医疗兵、
+   奔跑者、舔舐者、自爆丧尸。根源不是"又忘了改"，而是这张表本身要和 CFG.unit 同步维护。
+   改成直接查 CFG.unit：只要是个兵种就能放，以后再加兵种也不用回来改这里。 */
+function isUnitTool(t) {
+  return isUnitKind(t);
+}
+/* 在地面放置单位。批量档位大于 1 时绕着点击点铺开一次放多个。
+   编辑器是纯摆场子，不经手资源，所以不做任何费用检查 */
+function editPlaceUnit(kind, wx, wy) {
+  if (kind === "militia") { toast("民兵不能单独放置，只能在战斗中由平民转化"); return; }
+  var want = batchCount();
+  if (want <= 1) {
+    if (blockedForPlacement(wx, wy, 12)) { toast("这里放不下单位"); return; }
+    editPushUndo();
+    var u = addUnit(kind, wx, wy);
+    if (isHuman(u)) assignPost(u);
+    EDIT.touched = true;
+    EDIT.unitsEdited = true;
+    editRebuild();
+    toast("已放置" + CFG.unit[kind].name);
+    return;
+  }
+  var spots = findSpots(wx, wy, want);
+  var real = Math.min(want, spots.length);
+  if (real <= 0) { toast("这附近放不下单位，换个空旷些的位置"); return; }
+  editPushUndo();
+  for (var i = 0; i < real; i++) {
+    var nu = addUnit(kind, spots[i].x, spots[i].y);
+    if (isHuman(nu)) assignPost(nu);
+  }
+  EDIT.touched = true;
+  EDIT.unitsEdited = true;
+  editRebuild();
+  toast("已放置 " + real + " 个" + CFG.unit[kind].name +
+    (real < want ? "（附近只有这么大地方，其余放不下）" : ""));
+}
+/* 门：点门封门，点墙开门 */
+function editDoorAt(wx, wy) {
+  var i, o, d;
+  for (i = 0; i < W.doors.length; i++) {
+    d = W.doors[i];
+    if (d.prison) continue;                      /* 封锁大门不能封上 */
+    if (wx >= d.x - 8 && wx <= d.x + d.w + 8 && wy >= d.y - 8 && wy <= d.y + d.h + 8) {
+      editPushUndo();
+      W.obstacles.push(makeObstacle(d.x, d.y, d.w, d.h, "wall"));
+      W.doors.splice(i, 1);
+      EDIT.touched = true;
+      editRebuild();
+      toast("已封门");
+      return;
+    }
+  }
+  for (i = 0; i < W.obstacles.length; i++) {
+    o = W.obstacles[i];
+    if (o.kind !== "wall") continue;
+    if (wx < o.x || wx > o.x + o.w || wy < o.y || wy > o.y + o.h) continue;
+    var ds = 96, horizontal = o.w >= o.h;
+    var len = horizontal ? o.w : o.h;
+    if (len < ds * 2.1) { toast("这面墙太短，开不下门"); return; }
+    var pos = clamp((horizontal ? wx - o.x : wy - o.y) - ds / 2, 8, len - ds - 8);
+    editPushUndo();
+    var seg1, seg2;
+    if (horizontal) {
+      seg1 = makeObstacle(o.x, o.y, pos, o.h, "wall");
+      seg2 = makeObstacle(o.x + pos + ds, o.y, o.w - pos - ds, o.h, "wall");
+      W.doors.push({ x: o.x + pos, y: o.y, w: ds, h: o.h, vertical: false });
+    } else {
+      seg1 = makeObstacle(o.x, o.y, o.w, pos, "wall");
+      seg2 = makeObstacle(o.x, o.y + pos + ds, o.w, o.h - pos - ds, "wall");
+      W.doors.push({ x: o.x, y: o.y + pos, w: o.w, h: ds, vertical: true });
+    }
+    seg1.hue = o.hue; seg1.sat = o.sat; seg1.lit = o.lit;
+    seg2.hue = o.hue; seg2.sat = o.sat; seg2.lit = o.lit;
+    W.obstacles[i] = seg1;
+    W.obstacles.push(seg2);
+    EDIT.touched = true;
+    editRebuild();
+    toast("已开门");
+    return;
+  }
+  toast("请点在墙面或已有的门上");
+}
+/* 坚守点位：先点选一名人类，再点一处作为他的点位 */
+function editDefendAt(wx, wy) {
+  if (!EDIT.selUnit || EDIT.selUnit.dead) {
+    var u = unitAt(wx, wy, 22);
+    if (u && isHuman(u)) {
+      EDIT.selUnit = u;
+      toast("已选中" + CFG.unit[u.kind].name + "，再点一处设为其坚守点位");
+    } else toast("请先点选一名人类单位");
+    return;
+  }
+  EDIT.selUnit.defend = { x: Math.round(wx), y: Math.round(wy) };
+  EDIT.selUnit.retaking = 1;
+  EDIT.touched = true;
+  toast("已设置坚守点位");
+  EDIT.selUnit = null;
+}
+/* 拖动移动已有单位 */
+function editGrabUnit(wx, wy) {
+  var u = unitAt(wx, wy, 24);
+  if (!u) { toast("没点到单位"); return; }
+  editPushUndo();
+  EDIT.grabbed = u;
+}
+function editGrabRelease() {
+  if (!EDIT.grabbed) return;
+  EDIT.grabbed = null;
+  EDIT.touched = true;
+  EDIT.unitsEdited = true;
+  editRebuild();
+}
+/* 地形变化后重建导航、防线岗位，并把被新墙埋住的人推到最近可通行处 */
+function editRebuild() {
+  NAV.build(CFG.world, W.obstacles, 9);
+  buildPosts();
+  var i, u;
+  for (i = 0; i < W.units.length; i++) { u = W.units[i]; if (!u.dead) u.post = null; }
+  for (i = 0; i < W.units.length; i++) {
+    u = W.units[i];
+    if (u.dead || !isHuman(u)) continue;
+    var cx = Math.floor(u.x / NAV.tile), cy = Math.floor(u.y / NAV.tile);
+    if (NAV.b(cx, cy)) {
+      var free = NAV.nearestFree(cx, cy);
+      if (free) { u.x = (free[0] + 0.5) * NAV.tile; u.y = (free[1] + 0.5) * NAV.tile; }
+    }
+    assignPost(u);
+  }
+}
+function editCellSize() {
+  var n = parseInt(EDIT.snapMode, 10);
+  if (!n || n < 32) n = 32;
+  return n;
+}
+function editEraseCell(wx, wy) {
+  if (!EDIT.active) return;
+  var CS = editCellSize();
+  var cx = Math.floor(wx / CS), cy = Math.floor(wy / CS);
+  if (cx === EDIT.cellLastCX && cy === EDIT.cellLastCY) return;
+  EDIT.cellLastCX = cx; EDIT.cellLastCY = cy;
+  var x = cx * CS, y = cy * CS;
+  for (var i = W.obstacles.length - 1; i >= 0; i--) {
+    var o = W.obstacles[i];
+    if (o.x < x + CS && o.x + o.w > x && o.y < y + CS && o.y + o.h > y) W.obstacles.splice(i, 1);
+  }
+  if (W.tiles) {
+    for (var t = W.tiles.length - 1; t >= 0; t--) {
+      var tl = W.tiles[t];
+      if (tl.x < x + CS && tl.x + tl.w > x && tl.y < y + CS && tl.y + tl.h > y) W.tiles.splice(t, 1);
+    }
+  }
+  EDIT.touched = true;
+}
+function editPaintCell(wx, wy) {
+  if (!EDIT.active) return;
+  var CS = editCellSize();
+  var cx = Math.floor(wx / CS), cy = Math.floor(wy / CS);
+  if (cx === EDIT.cellLastCX && cy === EDIT.cellLastCY) return;
+  EDIT.cellLastCX = cx; EDIT.cellLastCY = cy;
+  var x = cx * CS, y = cy * CS;
+  var kind = EDIT.tool === "low" ? "low" : "wall";
+  for (var i = 0; i < W.obstacles.length; i++) {
+    var o = W.obstacles[i];
+    if (o.x === x && o.y === y && o.w === CS && o.h === CS) return;
+  }
+  var o2 = makeObstacle(x, y, CS, CS, kind);
+  if (EDIT.tool === "destWall") { o2.destructible = true; o2.maxHp = 240; o2.hp = 240; }
+  W.obstacles.push(o2);
+  EDIT.touched = true;
+}
+function editPointerDown(wx, wy) {
+  EDIT.curX = wx; EDIT.curY = wy; EDIT.hover = true;
+  var t = EDIT.tool;
+  if (t === "pan") return;      /* 平移工具：这一下留给地图拖动，不画任何东西 */
+  if (t === "erase") { EDIT.dragging = true; EDIT.startX = wx; EDIT.startY = wy; return; }
+  if (t === "spawn") { EDIT.dragging = true; EDIT.startX = wx; EDIT.startY = wy; return; }
+  if (t === "door") { editDoorAt(wx, wy); return; }
+  if (t === "mound") { editAddMound(wx, wy); return; }
+  if (t === "squadpt") { editSetPoint("squad", wx, wy); return; }
+  if (t === "evacpt") { editSetPoint("evac", wx, wy); return; }
+  if (t === "safezone" || t === "wavezone" || t === "prison" || t === "prisondoor" || t === "route") {
+    EDIT.dragging = true; EDIT.startX = wx; EDIT.startY = wy; return;
+  }
+  if (t === "defend") { editDefendAt(wx, wy); return; }
+  if (t === "move") { editGrabUnit(wx, wy); return; }
+  if (isUnitTool(t)) { editPlaceUnit(t, wx, wy); return; }
+  /* 点阵模式：像填空一样逐格铺墙，不做自由矩形 */
+  if (EDIT.mode === "cell" && t === "erase") {
+    editPushUndo();
+    EDIT.cellPainting = true;
+    EDIT.cellLastCX = -999; EDIT.cellLastCY = -999;
+    editEraseCell(wx, wy);
+    return;
+  }
+  if (EDIT.mode === "cell" && (t === "wall" || t === "low" || t === "destWall")) {
+    editPushUndo();
+    EDIT.cellPainting = true;
+    EDIT.cellLastCX = -999; EDIT.cellLastCY = -999;
+    editPaintCell(wx, wy);
+    return;
+  }
+  /* 矩形类工具：房屋 / 实心墙 / 矮墙 */
+  if (EDIT.mode === "point") { editCommit(editPendingRect()); return; }
+  if (EDIT.mode === "drag") { EDIT.dragging = true; EDIT.startX = wx; EDIT.startY = wy; return; }
+  if (!EDIT.hasCorner) { EDIT.hasCorner = true; EDIT.cornerX = wx; EDIT.cornerY = wy; }
+  else {
+    var r = editRectFrom(EDIT.cornerX, EDIT.cornerY, wx, wy);
+    EDIT.hasCorner = false;
+    editCommit(r);
+  }
+}
+function editPointerMove(wx, wy) {
+  EDIT.curX = wx; EDIT.curY = wy; EDIT.hover = true;
+  if (EDIT.tool === "pan") return;   /* 平移工具：拖动由地图处理，编辑逻辑不跟 */
+  if (EDIT.grabbed) { EDIT.grabbed.x = wx; EDIT.grabbed.y = wy; EDIT.grabbed.vx = 0; EDIT.grabbed.vy = 0; }
+  if (EDIT.cellPainting) {
+    if (EDIT.tool === "erase") editEraseCell(wx, wy);
+    else editPaintCell(wx, wy);
+  }
+}
+function editPointerUp(wx, wy) {
+  if (EDIT.cellPainting) {
+    EDIT.cellPainting = false;
+    EDIT.touched = true;
+    editRebuild();
+    return;
+  }
+  if (EDIT.grabbed) { editGrabRelease(); return; }
+  if (!EDIT.dragging) return;
+  EDIT.dragging = false;
+  var t = EDIT.tool;
+  var dx = wx - EDIT.startX, dy = wy - EDIT.startY;
+  var far = (dx * dx + dy * dy) > 400;
+  if (t === "erase") {
+    if (far) editEraseArea(EDIT.startX, EDIT.startY, wx, wy);
+    else editEraseAt(wx, wy);
+    return;
+  }
+  if (t === "spawn") {
+    if (far) { EDIT.spawn = editRectFrom(EDIT.startX, EDIT.startY, wx, wy); toast("已设定丧尸出生区"); }
+    return;
+  }
+  if (t === "route") {
+    /* 拖一下 = 框编组范围；点一下 = 加/删检查点 */
+    if (far) editRouteBox(EDIT.startX, EDIT.startY, wx, wy);
+    else editRouteClick(wx, wy);
+    return;
+  }
+  if (t === "safezone") { if (far) editAddSafeZone(EDIT.startX, EDIT.startY, wx, wy); return; }
+  if (t === "wavezone") { if (far) editAddZone(EDIT.startX, EDIT.startY, wx, wy); return; }
+  if (t === "prison") { if (far) editSetPrison(EDIT.startX, EDIT.startY, wx, wy); return; }
+  if (t === "prisondoor") { if (far) editAddPrisonDoor(EDIT.startX, EDIT.startY, wx, wy); return; }
+  if (!far) { toast("拖动距离太短，可切到「单击」模式直接落笔"); return; }
+  editCommit(editRectFrom(EDIT.startX, EDIT.startY, wx, wy));
+}
+function syncEditButtons() {
+  var i, b;
+  var ts = document.querySelectorAll(".etool");
+  for (i = 0; i < ts.length; i++) {
+    b = ts[i];
+    b.className = "etool" + (b.getAttribute("data-tool") === EDIT.tool ? " on" : "");
+  }
+  var ms = document.querySelectorAll(".emode");
+  for (i = 0; i < ms.length; i++) {
+    b = ms[i];
+    b.className = "emode" + (b.getAttribute("data-mode") === EDIT.mode ? " on" : "");
+  }
+  /* 下拉菜单跟着当前工具走：不是单位工具时就显示回占位项 */
+  var us = $("editUnitSel");
+  if (us) us.value = isUnitTool(EDIT.tool) ? EDIT.tool : "";
+  var ub = $("eUndo"), rb = $("eRedo");
+  if (ub) ub.disabled = !EDIT.undo.length;
+  if (rb) rb.disabled = !EDIT.redo.length;
+}
+/* 编辑栏分组：二十多个按钮一行放不下，按用途分成五组，一次只摊开一组。
+   标签永远可见，所以"还有哪些工具"一眼就能看到，不会藏起来 */
+var EDIT_GROUP = "terrain";
+function setEditGroup(g) {
+  EDIT_GROUP = g;
+  var bar = $("editbar");
+  if (!bar || !bar.querySelectorAll) return;
+  var i, els = bar.querySelectorAll("[data-g]");
+  for (i = 0; i < els.length; i++) {
+    els[i].style.display = (els[i].getAttribute("data-g") === g) ? "" : "none";
+  }
+  els = bar.querySelectorAll("[data-gtab]");
+  for (i = 0; i < els.length; i++) {
+    els[i].className = "etab" + (els[i].getAttribute("data-gtab") === g ? " on" : "");
+  }
+}
+function startEditor() {
+  HOME_PANEL = false; START_PANEL = false;
+  setHomeBoard(false);
+  var _eb = document.getElementById("editbar");
+  if (_eb && window.innerWidth < 900) {
+    _eb.className = "bar compact";
+    var _dr = document.getElementById("eDrawer"); if (_dr) _dr.textContent = "工具 ▾";
+  } else if (_eb) {
+    _eb.className = "bar";
+  }
+  /* 进编辑器之前必须回到干净场景，否则编辑到的是上一局的残局 */
+  resetForSetup();
+  var wi = document.getElementById("eWorkInfo");
+  if (wi) wi.textContent = (MAP_PRESETS[CFG.mapPreset] && MAP_PRESETS[CFG.mapPreset].name) || "自定义地图";
+  EDIT.active = true;
+  CFG.fog.on = false;   /* 编辑器必须能看见全图，不能被战争迷雾遮住 */
+  EDIT.hasCorner = false; EDIT.dragging = false;
+  hideOverlay();
+  $("bottom").className = "bar hide";
+  $("top").className = "bar hide";
+  $("editbar").style.display = "flex";
+  syncEditButtons();
+  syncSnapBtn();
+  toast("左键绘制/编辑 · 右键拖动平移 · 滚轮缩放 · 手机请先点「✥ 移动镜头」再单指拖动");
+}
+function finishEditor() {
+  /* 只有真的动过单位才记蓝图；只是进去看一眼就退出，不该把这次随机生成的布局冻结下来 */
+  if (EDIT.active && EDIT.unitsEdited) snapshotEditUnits();
+  EDIT.active = false;
+  EDIT.hasCorner = false; EDIT.dragging = false;
+  $("editbar").style.display = "none";
+  $("bottom").className = "bar";
+  $("top").className = "bar";
+  showStartPanel();
+}
+function chaosPanelHtml() {
+  var n = START.chaosCiv || CFG.chaos.defCiv;
+  return "<p class='warn'><b>胜负条件</b>：丧尸全灭即胜利（开启波次模式时改为全部波次通关）；人类全灭即失败。</p>" +
+    "<h3>场上人口</h3>" +
+    "<p>平民总数：<input type='range' id='chaosCivRange' min='" + CFG.chaos.minCiv + "' max='" + CFG.chaos.maxCiv +
+    "' step='10' value='" + n + "' style='width:220px;vertical-align:middle'> <b id='chaosCivVal'>" + n + "</b> 名</p>" +
+    "<p style='color:#9fb4dd;font-size:12.5px'>平民会随机散布在全图。开局有十秒倒计时，倒计时期间谁都不能动；" +
+    "时间一到，全场身份重新洗牌：一部分平民变成丧尸与奔跑者，一部分变成各兵种士兵，" +
+    "还会凭空站出一只母体（平民每多 200 名就多一只）。</p>" +
+    "<p><label><input type='checkbox' id='optHero'" + (START.heroMode ? " checked" : "") + "> " +
+    "<b class='heroLabel'>英雄模式</b></label></p>" +
+    startFooterHtml("进入战场");
+}
+function applyDifficultyPreset(id) {
+  START.difficulty = id;
+  if (id === "custom") return;
+  START.heroMode = false; START.reinforce = false; START.emperor = false;
+  START.waveMode = false; START.waveCount = 5; START.waveFirst = 30; START.waveGap = 45;
+  START.waveSize = 40; START.waveScale = false; START.bossWave = false; START.bossEvery = 10;
+  START.doubleBoss = false; START.postDuty = false;
+  if (id === "normal") {
+    START.heroMode = true; START.reinforce = true; START.waveMode = true;
+    START.waveCount = 10; START.waveFirst = 50; START.waveGap = 180; START.waveSize = 150;
+    START.waveScale = true; START.bossWave = true; START.bossEvery = 9;
+  } else if (id === "hard") {
+    START.heroMode = true; START.reinforce = true; START.waveMode = true;
+    START.waveCount = 20; START.waveFirst = 30; START.waveGap = 180; START.waveSize = 300;
+    START.waveScale = true; START.bossWave = true; START.bossEvery = 4;
+  } else if (id === "extreme") {
+    START.heroMode = true; START.reinforce = true; START.waveMode = true;
+    START.waveCount = 50; START.waveFirst = 30; START.waveGap = 120; START.waveSize = 400;
+    START.waveScale = true; START.bossWave = true; START.bossEvery = 4; START.doubleBoss = true;
+  }
+}
+function difficultyIntroHtml() {
+  var d = START.difficulty || "normal";
+  var text = {
+    simple: "最基础的版本，您即使什么都不做也可以轻松取胜。",
+    normal: "常规难度，只要进行些许干预方可取胜。",
+    hard: "严峻的挑战，请谨慎地规划好获取的资源。",
+    extreme: "专为挑战者而准备，需要较强的资源规划和游戏理解。",
+    custom: "自定义全部关卡参数。"
+  }[d] || "";
+  return "<p class='diffIntro'>" + text + "</p>";
+}
+function difficultySummaryHtml() {
+  var d = START.difficulty || "simple";
+  if (d === "custom") return "<p class='netTip'>详细设置已展开。</p>";
+  if (d === "simple") return "<p class='netTip'><b>简单</b>：默认防线设置，不启用英雄、支援或波次模式。</p>";
+  var name = d === "normal" ? "普通" : (d === "hard" ? "困难" : "极限");
+  return "<p class='netTip'><b>" + name + "</b>：" +
+    (START.heroMode ? "英雄模式 · " : "") + "支援部队 · 波次 " + (START.waveCount | 0) + " 波 · " +
+    "每波 " + (START.waveSize | 0) + " 个 · " + (START.waveScale ? "递增强度 · " : "") +
+    (START.bossWave ? "首领每 " + (START.bossEvery | 0) + " 波" + (START.doubleBoss ? " · 双首领" : "") : "无首领波次") + "</p>";
+}
+function startFooterHtml(label) {
+  return "<div class='startCta'>" +
+    "<div class='startMeta'>" +
+      "<span class='startWarn'>⚠ 大量单位可能会引起设备卡顿，请量力而行</span>" +
+      "<button id='goEdit' class='startEdit'>编辑地形</button>" +
+    "</div>" +
+    "<button id='goStart' class='primary startBig'>▶ " + (label || "进入战场") + "</button>" +
+  "</div>";
+}
+function defensePanelHtml() {
+  var html = "<p class='warn'><b>胜负条件</b>：丧尸全灭即胜利" +
+    (START.waveMode ? "（已开启波次模式，改为把 " + (START.waveCount | 0) + " 波全部打完）" : "") +
+    "；<b>平民全部阵亡即游戏失败</b>。</p>" +
+    "<h3>地图</h3><p><select id='mapSel'>";
+  var mk;
+  for (mk in MAP_PRESETS) {
+    html += "<option value='" + mk + "'" + (CFG.mapPreset === mk ? " selected" : "") + ">" +
+      MAP_PRESETS[mk].name + "（" + MAP_PRESETS[mk].w + " × " + MAP_PRESETS[mk].h + "）</option>";
+  }
+  html += "</select></p><p style='color:#9fb4dd;font-size:12.5px;margin:-4px 0 8px'>" +
+    "平原最开阔、建筑稀少；城镇是最经典的攻防图；室内到处是隔断，走廊很窄；" +
+    "H 型通道是左右两间封闭长房，中间一条走廊贯通，适合看两边在走廊里对射。</p>";
+  var sq = mapSquadOf(CFG.mapPreset), sqParts = [];
+  for (var sk in sq) if (Object.prototype.hasOwnProperty.call(sq, sk)) {
+    sqParts.push((CFG.unit[sk] && CFG.unit[sk].name ? CFG.unit[sk].name : sk) + "×" + sq[sk]);
+  }
+  html += "<p class='netTip' style='margin:-2px 0 8px'><b>默认编制</b>：" + sqParts.join(" · ") + "</p>" +
+    "<h3>丧尸规模</h3><p><select id='sizeSel'><option value='base'>默认规模</option>";
+  var i, v;
+  for (i = 0; i < CFG.start.addSteps.length; i++) {
+    v = CFG.start.addSteps[i];
+    html += "<option value='add:" + v + "'>+" + Math.round(v * 100) + "% 丧尸</option>";
+  }
+  for (i = 0; i < CFG.start.multSteps.length; i++) {
+    v = CFG.start.multSteps[i];
+    html += "<option value='mult:" + v + "'>×" + v + " 丧尸</option>";
+  }
+  html += "</select></p><p id='preview'></p>" +
+    "<p><label><input type='checkbox' id='optHero'" + (START.heroMode ? " checked" : "") + "> " +
+    "<b class='heroLabel'>英雄模式</b></label></p>";
+
+  html += "<details><summary>支援部队 · 三轮免费增援</summary>" +
+    "<p><label><input type='checkbox' id='optReinforce'" + (START.reinforce ? " checked" : "") + "> " +
+    "<b>开启支援部队</b></label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>右上角依次出现三轮倒计时：90 秒支援小队索降；" +
+    "再过 30 秒特化部队空降；最后 90 秒军团主力轨道空投。</span></p>" +
+    "<p><label><input type='checkbox' id='optEmperor'" + (START.emperor ? " checked" : "") + "> " +
+    "<b>帝皇之力</b></label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>勾选后，第三轮「军团主力」替换为「帝皇特使降临」。</span></p></details>";
+
+  html += "<details><summary>波次来袭 · 让丧尸分批涌进来</summary>" +
+    "<p><label><input type='checkbox' id='optWave'" + (START.waveMode ? " checked" : "") + "> " +
+    "<b>开启波次模式</b></label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>开启后开局不再铺满丧尸（上面的规模设置随之失效），" +
+    "改由出生区按下面的节奏分批涌入，每一波的兵种混编与底栏「投放」一致。<br>" +
+    "<b>胜负条件也随之改变</b>：要把设定的波次全部打完才算赢，前一波打完、后一波还没到时场上会短暂空下来，这段时间不算胜利。<br>" +
+    "另外，<b>把当前这一波的丧尸清光就会立刻召唤下一波</b>，不必干等间隔时间。</span></p>" +
+    "<p>波次数量：<input type='range' id='wCount' min='1' max='50' step='1' value='" + (START.waveCount | 0) + "' style='width:150px;vertical-align:middle'> <b id='wCountV'>" + (START.waveCount | 0) + "</b> 波</p>" +
+    "<p>首波延迟：<input type='range' id='wFirst' min='5' max='180' step='5' value='" + (START.waveFirst | 0) + "' style='width:150px;vertical-align:middle'> <b id='wFirstV'>" + (START.waveFirst | 0) + "</b> 秒</p>" +
+    "<p>波次间隔：<input type='range' id='wGap' min='5' max='180' step='5' value='" + (START.waveGap | 0) + "' style='width:150px;vertical-align:middle'> <b id='wGapV'>" + (START.waveGap | 0) + "</b> 秒</p>" +
+    "<p>每波数量：<input type='range' id='wSize' min='10' max='1000' step='10' value='" + (START.waveSize | 0) + "' style='width:150px;vertical-align:middle'> <b id='wSizeV'>" + (START.waveSize | 0) + "</b> 只</p>" +
+    "<p><label><input type='checkbox' id='optWaveScale'" + (START.waveScale ? " checked" : "") + "> <b>递增强度</b></label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>每波数量小幅增加；第 2 波起混入奔跑者，第 4 波起混入舔舐者，第 6 波起混入爆裂体。</span></p>" +
+    "<p id='wavePreview' style='color:#9fb4dd;font-size:12.5px'></p>" +
+    "<p><label><input type='checkbox' id='optBossWave'" + (START.bossWave ? " checked" : "") + "> " +
+    "<b>首领波次</b></label><br><span style='color:#9fb4dd;font-size:12.5px'>开启后每若干波从首领池等概率随机抽取一名首领空投。</span></p>" +
+    "<p>首领间隔：每 <input type='range' id='wBossEvery' min='1' max='20' step='1' value='" + (START.bossEvery | 0 || 10) + "' style='width:130px;vertical-align:middle'> <b id='wBossEveryV'>" + (START.bossEvery | 0 || 10) + "</b> 波出现一只</p>" +
+    "<p><label><input type='checkbox' id='optDoubleBoss'" + (START.doubleBoss ? " checked" : "") + "> <b>双首领</b></label><br><span style='color:#9fb4dd;font-size:12.5px'>首领波次一次出现两名不同首领。</span></p>" +
+    "<p id='bossWavePreview' style='color:#9fb4dd;font-size:12.5px'></p></details>";
+
+  html += "<details><summary>士兵自动值守防线岗位（默认关闭）</summary>" +
+    "<p><label><input type='checkbox' id='optPost'" + (START.postDuty ? " checked" : "") + "> " +
+    "让士兵自动值守防线岗位</label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>关闭时士兵不守自动岗位，只认你在编辑器里手动指定的坚守点位。</span></p></details>";
+
+  html += "<details><summary>画面选项</summary>" +
+    "<p style='font-size:12px;color:#9fb4dd'><label><input type='checkbox' id='optFog'" +
+    (START.fogMode !== undefined ? (START.fogMode ? " checked" : "") :
+      (START.gameMode === "escort" ? " checked" : "")) + "> " +
+    "战争迷雾<span style='opacity:.7'>（实验性功能）</span></label><br>" +
+    "<span style='opacity:.75'>只显示每个人类朝向前方与贴身感知范围内的战场；敌人看不见就不画出来。" +
+    "防线模式默认关闭，护送模式默认开启。</span></p></details>";
+  var footer = startFooterHtml("进入战场");
+  var diffs = [["simple", "简单"], ["normal", "普通"], ["hard", "困难"], ["extreme", "极限"], ["custom", "自定义"]];
+  var bar = "<div class='diffPresets'><b>难度预设</b><div>";
+  for (var di = 0; di < diffs.length; di++) {
+    bar += "<button type='button' data-diff='" + diffs[di][0] + "'" +
+      (START.difficulty === diffs[di][0] ? " class='on'" : "") + ">" + diffs[di][1] + "</button>";
+  }
+  bar += "</div></div>";
+  var showDetail = START.difficulty === "custom";
+  var sizePos = html.indexOf("<h3>丧尸规模</h3>");
+  var heroPos = html.indexOf("<p><label><input type='checkbox' id='optHero'");
+  var topHtml = html, sizeHtml = "", detailHtml = html;
+  if (sizePos >= 0 && heroPos > sizePos) {
+    topHtml = html.slice(0, sizePos);
+    sizeHtml = html.slice(sizePos, heroPos);
+    detailHtml = html.slice(heroPos);
+  }
+  var showSize = START.difficulty === "simple" || START.difficulty === "custom";
+  return bar + difficultyIntroHtml() + difficultySummaryHtml() + topHtml +
+    (showSize ? sizeHtml : "") +
+    "<div id='detailSettings' style='display:" + (showDetail ? "block" : "none") + "'>" + detailHtml + "</div>" + footer;
+}
+function escortPanelHtml() {
+  var n = START.civCount || 8;
+  var econ = n * CFG.escort.econPerCivilian;
+  var html = "<p class='warn'><b>护送模式</b>：武装小队从地图<b>最右侧</b>出发，穿过中部休眠的丧尸堆，" +
+    "摸到<b>最左侧</b>关押平民的房屋大门解除封锁，再把平民带回出生点撤离。<br>" +
+    "丧尸在你惊动它们之前不会行动（靠近会惊醒、开枪会引来）；撤离一名人类得 1 分；所有人类阵亡即失败。</p>" +
+    "<h3>营救规模</h3>" +
+    "<p>拯救平民：<input type='range' id='civRange' min='1' max='" + CFG.escort.maxCivilians +
+    "' step='1' value='" + n + "' style='width:150px;vertical-align:middle'> " +
+    "<b id='civVal'>" + n + "</b> 名 · 获得经济 <b id='econVal'>" + econ + "</b>（每名平民 " + CFG.escort.econPerCivilian + "）</p>" +
+    "<h3>购买营救小队</h3><div id='shop'>";
+  var keys = ["rifle", "mg", "shield", "sniper", "medic", "cryo", "flame", "tesla", "laser"];
+  for (var i = 0; i < keys.length; i++) {
+    var k = keys[i], cu = CFG.unit[k];
+    var cnt = (START.squad && START.squad[k]) | 0;
+    html += "<div class='buyrow'><span style='color:" + cu.color + ";min-width:64px;display:inline-block'>" + cu.name + "</span>" +
+      "<span class='price'>" + CFG.econ.cost[k] + "</span>" +
+      "<button class='buybtn' data-buy='" + k + "' data-dir='-1'>−</button>" +
+      "<span class='cnt' data-cnt='" + k + "'>" + cnt + "</span>" +
+      "<button class='buybtn' data-buy='" + k + "' data-dir='1'>＋</button></div>";
+  }
+  html += "</div><h3>支援部队</h3>" +
+    "<p><label><input type='checkbox' id='optReinforce'" + (START.reinforce ? " checked" : "") + "> " +
+    "<b>开启支援部队</b></label><br>" +
+    "<span style='color:#9fb4dd;font-size:12.5px'>开启后依次出现三轮倒计时：支援小队索降、特化部队空降、军团主力轨道空投。</span></p>" +
+    "<p><label><input type='checkbox' id='optEmperor'" + (START.emperor ? " checked" : "") + "> " +
+    "<b>帝皇之力</b></label><br><span style='color:#9fb4dd;font-size:12.5px'>勾选后第三轮替换为帝皇特使降临。</span></p>" +
+    "<p id='preview2'></p>" + startFooterHtml("开始护送");
+  return html;
+}
+function refreshEscortPanel() {
+  var keys = ["rifle", "mg", "shield", "sniper", "medic", "cryo", "flame", "tesla", "laser"], i, cnt = 0, armedN = 0;
+  for (i = 0; i < keys.length; i++) {
+    var el = panelEl.querySelector("[data-cnt='" + keys[i] + "']");
+    var c = (START.squad && START.squad[keys[i]]) | 0;
+    if (el) el.textContent = c;
+    cnt += c;
+    /* 能解封大门的人：拿枪的，加上医疗兵 */
+    armedN += c;
+  }
+  var n = START.civCount || 8;
+  var econ = n * CFG.escort.econPerCivilian;
+  var used = squadCostOf(START.squad);
+  var left = econ - used;
+  var cv = document.getElementById("civVal"); if (cv) cv.textContent = n;
+  var ev = document.getElementById("econVal"); if (ev) ev.textContent = econ;
+  var pv = document.getElementById("preview2");
+  if (pv) {
+    pv.innerHTML = "小队编制 <b>" + cnt + "</b> 人 · 已花费 <b>" + used + "</b> · 剩余经济 <b style='color:" +
+      (left < 0 ? "#ff9a9a" : "#ffd479") + "'>" + left + "</b>" +
+      (left < 0 ? " <span style='color:#ff9a9a'>（超支，请减少购买）</span>"
+        : armedN === 0 ? " <span style='color:#ff9a9a'>（至少要买一名武装单位）</span>" : "");
+  }
+}
+function trimSquad() {
+  var n = START.civCount || 8;
+  var econ = n * CFG.escort.econPerCivilian;
+  /* 超支时从最贵的开始裁，医疗兵最便宜放最后 */
+  var order = ["sniper", "shield", "mg", "rifle", "laser", "tesla", "flame", "cryo", "medic"];
+  var guard = 0;
+  while (squadCostOf(START.squad) > econ && guard++ < 400) {
+    var removed = false;
+    for (var i = 0; i < order.length && !removed; i++) {
+      if (((START.squad || {})[order[i]] | 0) > 0) { START.squad[order[i]]--; removed = true; }
+    }
+    if (!removed) break;
+  }
+}
+function bindDefenseGroups() {
+  /* 地图选择：开局第一件该定下来的事，不该藏在设置面板里 */
+  var mapSel = document.getElementById("mapSel");
+  if (mapSel) {
+    mapSel.addEventListener("change", function () {
+      var id = this.value;
+      if (!MAP_PRESETS[id]) return;
+      CFG.mapPreset = id;
+      try { localStorage.setItem("zombieSandbox.map", id); } catch (e) {}
+      /* 立刻按新地图重摆场景，让人在开局前就能看到换图的效果 */
+      resetForSetup();
+      showStartPanel();
+    });
+  }
+  /* 丧尸规模：以前是十几个按钮平铺，现在收进一个下拉 */
+  var sizeSel = document.getElementById("sizeSel");
+  if (sizeSel) {
+    sizeSel.addEventListener("change", function () {
+      var v = this.value || "base";
+      if (v.indexOf("add:") === 0) { START.mode = "add"; START.add = parseFloat(v.slice(4)) || 0; }
+      else if (v.indexOf("mult:") === 0) { START.mode = "mult"; START.mult = parseFloat(v.slice(5)) || 1; }
+      else { START.mode = ""; }
+      refreshStartPanel();
+    });
+  }
+  function bindGroup(attr, kind) {
+    var btns = panelEl.querySelectorAll("[" + attr + "]");
+    for (var j = 0; j < btns.length; j++) {
+      (function (b) {
+        b.addEventListener("click", function () {
+          var val = parseFloat(b.getAttribute(attr));
+          if (START.mode === kind && Math.abs((kind === "add" ? START.add : START.mult) - val) < 1e-6) {
+            START.mode = "";
+          } else {
+            START.mode = kind;
+            if (kind === "add") START.add = val; else START.mult = val;
+          }
+          refreshStartPanel();
+        });
+      })(btns[j]);
+    }
+  }
+  bindGroup("data-add", "add");
+  bindGroup("data-mult", "mult");
+}
+/* ============================================================================
+   兵种数据：临时改血量 / 体型 / 速度 / 火力，改完立刻作用于场上和之后投放的单位。
+   重要：这些改动只活在内存里，不写 localStorage、不进存档、更不上传任何地方。
+   刷新页面或重新打开链接，全部回到代码里写死的预设。
+   ============================================================================ */
+var UNIT_TUNE = { kind: "rifle", base: null, side: "human" };
+var TUNE_ORDER = ["rifle", "militia", "mg", "sniper", "shield", "medic", "cryo", "flame", "tesla", "laser",
+                   "civilian", "zombie", "runner", "licker", "mother"];
+var TUNE_KIND_NAMES = { rifle: "步枪兵", militia: "民兵", mg: "机枪兵", sniper: "狙击手", shield: "盾兵",
+  medic: "医疗兵", cryo: "液氮兵", flame: "喷火兵", tesla: "磁爆兵", laser: "激光兵",
+  civilian: "平民", zombie: "普通丧尸", runner: "奔跑者", licker: "舔舐者", mother: "母体" };
+function tuneKindName(k) {
+  var c = CFG.unit && CFG.unit[k];
+  return (c && c.name) || TUNE_KIND_NAMES[k] || k;
+}
+
+/* 字段表：第一项是 CFG 里的路���，改完直接写回内存。全表声明式，
+   想加一个可调项只要在这里补一行 */
+/* 特殊机制字段：按兵种分别列，不再套用通用枪械字段。
+   激光没有散布，调的是光束直径与过热；其余兵种同理。 */
+var SPECIAL_TUNE = {
+  laser: [
+    ["laser.width", "激光直径", 2, 40, 1],
+    ["laser.dmg", "每跳伤害", 0, 10, 0.1],
+    ["laser.range", "射程", 100, 3000, 10],
+    ["laser.charge", "蓄力时间", 0.2, 6, 0.1],
+    ["laser.beamT", "横扫周期", 0.5, 8, 0.1],
+    ["laser.sweepDeg", "横扫角度", 5, 360, 1],
+    ["laser.heatMax", "过热上限（秒）", 1, 20, 0.5],
+    ["laser.heatCool", "过热冷却（每秒）", 0.5, 20, 0.5],
+    ["laser.playerReload", "过热换弹（秒）", 0.5, 10, 0.5],
+    ["laser.splashR", "撞墙溅射半径", 0, 300, 5],
+    ["laser.splashDmg", "撞墙溅射伤害", 0, 10, 0.1],
+    ["laser.taper", "出膛过渡", 0, 60, 1],
+    ["laser.turnRate", "转向阻尼", 0.2, 10, 0.1]
+  ],
+  flame: [
+    ["flame.range", "喷火距离", 100, 2000, 10],
+    ["flame.coneDeg", "扇形角度", 1, 120, 1],
+    ["flame.tick", "结算间隔", 0.02, 1, 0.01],
+    ["flame.ammoPerTick", "每跳耗弹", 1, 20, 1],
+    ["flame.directDmg", "直流伤害", 0, 10, 0.1],
+    ["flame.directEvery", "直流间隔", 0.02, 2, 0.01],
+    ["flame.wallDmg", "火坑伤害", 0, 20, 0.1],
+    ["flame.igniteT", "点燃时长", 0.5, 20, 0.5],
+    ["flame.sweepRate", "转向速度", 0.2, 10, 0.1],
+    ["unit.flame.gun.mag", "弹匣容量", 1, 400, 1],
+    ["flame.reload", "换弹时间", 0.1, 15, 0.1]
+  ],
+  tesla: [
+    ["tesla.dmg", "单发伤害", 0, 10, 0.01],
+    ["tesla.chainMax", "连锁上限", 1, 50, 1],
+    ["tesla.chainR", "连锁半径", 20, 600, 5],
+    ["tesla.arcLife", "麻痹时长", 0.05, 1, 0.01],
+    ["tesla.burst", "连发次数", 1, 20, 1],
+    ["tesla.burstGap", "连发间隔", 0.02, 1, 0.01],
+    ["tesla.cooldown", "冷却时间", 0, 10, 0.1],
+    ["unit.tesla.gun.r", "索敌范围", 100, 1500, 10],
+    ["unit.tesla.gun.mag", "弹匣容量", 1, 100, 1],
+    ["tesla.reload", "换弹时间", 0.1, 15, 0.1]
+  ],
+  cryo: [
+    ["unit.cryo.gun.mag", "弹匣瓶数", 1, 5, 1],
+    ["cryo.reload", "换弹时间", 0.5, 10, 0.1],
+    ["cryo.throwEvery", "投掷间隔", 0.05, 3, 0.05],
+    ["cryo.radius", "寒冷圈半径", 20, 600, 5],
+    ["cryo.fieldLife", "寒冷圈时长", 0.5, 10, 0.5],
+    ["cryo.fieldGrow", "铺开时间", 0.02, 2, 0.02],
+    ["cryo.slowStart", "初始减速", 0, 1, 0.05],
+    ["cryo.freezeAt", "冻到底时间", 0.5, 20, 0.5],
+    ["cryo.slowFloor", "减速下限", 0, 1, 0.01],
+    ["cryo.afterT", "回暖时间", 0.5, 10, 0.5],
+    ["cryo.dmg", "圈内伤害", 0, 10, 0.1],
+    ["cryo.dmgEvery", "伤害间隔", 0.1, 5, 0.1],
+    ["unit.cryo.gun.r", "投掷距离", 100, 2000, 10]
+  ]
+};
+/* 字段上限表：同一逻辑字段在滑条、写入、重置时共用一套范围 */
+var UNIT_LIMITS = {
+  hp:          { min: 1,    max: 900,  step: 1 },
+  radius:      { min: 3,    max: 26,   step: 0.5 },
+  vmax:        { min: 30,   max: 420,  step: 2 },
+  acc:         { min: 60,   max: 1400, step: 10 },
+  dmg:         { min: 0,    max: 200,  step: 1 },
+  range:       { min: 40,   max: 3000, step: 10 },
+  interval:    { min: 0.02, max: 4,    step: 0.01 },
+  spread:      { min: 0,    max: 45,   step: 0.5 },
+  mag:         { min: 1,    max: 400,  step: 1 },
+  reload:      { min: 0.1,  max: 15,   step: 0.1 },
+  fear:        { min: 0,    max: 900,  step: 5 },
+  recoil:      { min: 0,    max: 5,    step: 0.1 },
+  shieldHp:    { min: 0.5,  max: 60,   step: 0.5 },
+  shieldRegen: { min: 0.5,  max: 60,   step: 0.5 }
+};
+function unitLimitFor(path) {
+  if (/^(laser|flame|tesla|cryo)\./.test(path)) return null;
+  if (/^unit\.[^.]+\.r$/.test(path)) return UNIT_LIMITS.radius;
+  if (/^unit\.[^.]+\.hp$/.test(path)) return UNIT_LIMITS.hp;
+  if (/^unit\.[^.]+\.vmax$/.test(path)) return UNIT_LIMITS.vmax;
+  if (/^unit\.[^.]+\.acc$/.test(path)) return UNIT_LIMITS.acc;
+  if (/^fearRBy\./.test(path)) return UNIT_LIMITS.fear;
+  if (/^recoilBy\./.test(path)) return UNIT_LIMITS.recoil;
+  if (/^shield\.hp$/.test(path)) return UNIT_LIMITS.shieldHp;
+  if (/^shield\.regen$/.test(path)) return UNIT_LIMITS.shieldRegen;
+  if (/\.dmg$/.test(path)) return UNIT_LIMITS.dmg;
+  if (/\.r$/.test(path)) return UNIT_LIMITS.range;
+  if (/\.interval$/.test(path)) return UNIT_LIMITS.interval;
+  if (/\.spreadDeg$/.test(path)) return UNIT_LIMITS.spread;
+  if (/\.mag$/.test(path)) return UNIT_LIMITS.mag;
+  if (/\.reload$/.test(path)) return UNIT_LIMITS.reload;
+  return null;
+}
+var TUNE_BODY = [
+  ["hp",   "血量",     1,  900,  1],
+  ["r",    "体型半径", 3,  26,   0.5],
+  ["vmax", "最高速度", 30, 420,  2],
+  ["acc",  "加速度",   60, 1400, 10]
+];
+var TUNE_GUN = [
+  ["dmg",       "单发伤害", 1,    80,  1],
+  ["r",         "射程",     60,   3000, 10],
+  ["interval",  "射击间隔", 0.02, 4,   0.01],
+  ["spreadDeg", "散射角",   0,    45,  0.5],
+  ["mag",       "弹匣容量", 1,    400, 1],
+  ["reload",    "换弹时间", 0.1,  15,  0.1]
+];
+var TUNE_NEAR = [
+  ["dmg",       "速射伤害", 1,    80,  1],
+  ["r",         "速射半径", 40,   700, 10],
+  ["interval",  "速射间隔", 0.02, 1,   0.01],
+  ["spreadDeg", "速射散射", 0,    45,  0.5]
+];
+var TUNE_MG = [
+  ["widthMul", "弹道粗细", 1, 8, 0.5],
+  ["hits",     "穿透目标", 1, 10, 1],
+  ["maxHits",  "最大穿透", 1, 20, 1]
+];
+var TUNE_SNIPER = [
+  ["widthMul",   "弹道粗细",   1,   12,  0.5],
+  ["wallPierce", "穿墙层数",   0,   99,  1],
+  ["speedMul",   "弹速倍数",   1,   10,  0.5],
+  ["guards",     "随行平民",   0,   6,   1],
+  ["huntAfter",  "主动出击等待", 0.5, 60, 0.5]
+];
+var TUNE_GLOBAL = [
+  ["bullet.speed",     "子弹飞行速度（全局）", 500, 20000, 100],
+  ["recoil.unit",      "后坐力基准（全局）",   0,   200,   5],
+  ["recoil.counterMul", "后坐力抵消（全局）",  0,   2,     0.05],
+  ["cruiseMul",        "巡航速度比例（全局）", 0.3, 1,     0.02],
+  ["strayDist",        "掉队判定距离（全局）", 120, 1200,  20],
+  ["bullet.len",       "子弹长度（全局）",     10,  300,   5],
+  ["speedScale",       "全局速度比例（全局）", 0.3, 2,     0.05]
+];
+/* 这几项是全队共用的，导出种子时只留一份 */
+var TUNE_GLOBAL_PATHS = ["bullet.speed", "bullet.len", "recoil.unit", "recoil.counterMul",
+  "cruiseMul", "strayDist", "speedScale"];
+var TUNE_SHIELD = [
+  ["hp",         "护盾耐久",   0.5, 60, 0.5],
+  ["regen",      "护盾恢复",   0.5, 60, 0.5],
+  ["blastPush",  "破盾推力",   0,   400, 5],
+  ["blastPushDet", "自爆推力", 0,   400, 5],
+  ["detonateDmg", "自爆伤害",  0,   40,  1]
+];
+/* 某个兵种的枪械参数在 CFG 里的位置：预设兵种共享全局表，
+   自定义兵种则指向它自己的 unit.<id>.gun，互不牵连 */
+function gunCfgKeyOf(kind) {
+  if (kind === "rifle") return "far";
+  if (kind === "mg") return "mg";
+  if (kind === "sniper") return "sniper";
+  if (kind === "shield") return "pistol";
+  var c = CFG.unit[kind];
+  if (c && c.gun) return "unit." + kind + ".gun";
+  return null;
+}
+function cfgPathHas(path) {
+  var seg = path.split("."), o = CFG, i;
+  for (i = 0; i < seg.length; i++) {
+    if (o === undefined || o === null) return false;
+    if (!(seg[i] in Object(o))) return false;
+    o = o[seg[i]];
+  }
+  return typeof o === "number";
+}
+/* 盾兵的手枪弹匣原本是写死的 12，补一条配置字段好让面板能调 */
+var TUNE_BASE_KINDS = ["rifle", "militia", "mg", "sniper", "shield", "medic", "cryo", "flame", "tesla", "laser",
+                       "civilian", "zombie", "runner", "licker", "mother"];
+function tuneEnsureFields() {
+  if (CFG.shield.mag === undefined) CFG.shield.mag = 12;
+  if (!CFG.fearRBy) CFG.fearRBy = {};
+  if (!CFG.recoilBy) CFG.recoilBy = {};
+  /* 预设兵种的后坐力倍率也搬进覆盖表：
+     这样"改后坐力"和"恢复默认"走的是同一套路径，不会出现把倍率恢复成 0 的坑 */
+  if (!UNIT_TUNE.base) {
+    for (var i = 0; i < TUNE_BASE_KINDS.length; i++) {
+      var k = TUNE_BASE_KINDS[i];
+      if (CFG.recoilBy[k] === undefined) CFG.recoilBy[k] = CFG.recoil[k] || 0;
+    }
+  }
+}
+/* 某个兵种当前可调的完整字段列表（含恐惧半径） */
+function tuneFieldList(kind) {
+  tuneEnsureFields();
+  var out = [], i, gk, t;
+  for (i = 0; i < TUNE_BODY.length; i++) {
+    t = TUNE_BODY[i];
+    out.push(["unit." + kind + "." + t[0], t[1], t[2], t[3], t[4]]);
+  }
+  out.push(["fearRBy." + kind, "恐惧半径", 0, 900, 5]);
+  if (SPECIAL_TUNE[kind]) {
+    var sp = SPECIAL_TUNE[kind];
+    for (i = 0; i < sp.length; i++) out.push(sp[i]);
+    return out;
+  }
+  gk = gunCfgKeyOf(kind);
+  if (gk) {
+    for (i = 0; i < TUNE_GUN.length; i++) {
+      t = TUNE_GUN[i];
+      if (t[0] === "reload" && kind === "shield") continue;   /* 手枪没有换弹字段 */
+      out.push([gk + "." + t[0], t[1], t[2], t[3], t[4]]);
+    }
+    out.push(["recoilBy." + kind, "后坐力倍率", 0, 5, 0.1]);
+    for (i = 0; i < TUNE_GLOBAL.length; i++) {
+      t = TUNE_GLOBAL[i];
+      out.push([t[0], t[1], t[2], t[3], t[4]]);
+    }
+  }
+  if (kind === "rifle") {
+    for (i = 0; i < TUNE_NEAR.length; i++) {
+      t = TUNE_NEAR[i];
+      out.push(["near." + t[0], t[1], t[2], t[3], t[4]]);
+    }
+  }
+  if (kind === "mg") {
+    for (i = 0; i < TUNE_MG.length; i++) {
+      t = TUNE_MG[i];
+      out.push(["mg." + t[0], t[1], t[2], t[3], t[4]]);
+    }
+  }
+  if (kind === "sniper") {
+    for (i = 0; i < TUNE_SNIPER.length; i++) {
+      t = TUNE_SNIPER[i];
+      out.push(["sniper." + t[0], t[1], t[2], t[3], t[4]]);
+    }
+  }
+  if (kind === "shield") {
+    for (i = 0; i < TUNE_SHIELD.length; i++) {
+      t = TUNE_SHIELD[i];
+      out.push(["shield." + t[0], t[1], t[2], t[3], t[4]]);
+    }
+  }
+  for (i = 0; i < out.length; i++) {
+    var lim = unitLimitFor(out[i][0]);
+    if (lim) { out[i][2] = lim.min; out[i][3] = lim.max; out[i][4] = lim.step; }
+  }
+  return out;
+}
+function cfgPathGet(path) {
+  var seg = path.split("."), o = CFG, i;
+  for (i = 0; i < seg.length; i++) {
+    if (!o) return 0;
+    o = o[seg[i]];
+  }
+  return (typeof o === "number") ? o : 0;
+}
+function cfgPathSet(path, v) {
+  var seg = path.split("."), o = CFG, i;
+  for (i = 0; i < seg.length - 1; i++) {
+    if (!o) return;
+    o = o[seg[i]];
+  }
+  if (o) o[seg[seg.length - 1]] = v;
+}
+/* 字段归属：移动 / 武器 / 生存 / 特殊 / 全局。
+   全局项（子弹速度等）不属于任何单一兵种，单兵种重置不碰 */
+function tuneGroupForPath(kind, path) {
+  if (kind === "laser" && /^laser\.(width|heatMax|heatCool|playerReload|charge|beamT|taper|splashR|splashDmg|turnRate|sweepDeg|sweepsBeforeCd|ringScale|ringAlpha)$/.test(path)) return "special";
+  if (kind === "flame" && /^flame\.(coneDeg|directDmg|directEvery|wallDmg|wallTick|wallLife|igniteT|igniteDmg|igniteEvery|sweepRate|sweepWobble|tick|ammoPerTick)$/.test(path)) return "special";
+  if (kind === "tesla" && /^tesla\.(chainMax|chainR|arcLife|burst|burstGap|cooldown|packedR|packedCost)$/.test(path)) return "special";
+  if (kind === "cryo" && /^(cryo\.(throwEvery|radius|fieldLife|fieldGrow|slowStart|freezeAt|slowFloor|afterT|warmSec|dmg|dmgEvery)|unit\.cryo\.gun\.r)$/.test(path)) return "special";
+  if (path.indexOf("unit.") === 0) {
+    var f0 = path.split(".").pop();
+    if (f0 === "mag" || f0 === "reload") return "weapon";
+  }
+  if (path.indexOf("unit.") === 0) {
+    var f = path.split(".").pop();
+    if (f === "hp") return "survival";
+    if (f === "r" || f === "vmax" || f === "acc") return "mobility";
+    return "other";
+  }
+  if (path.indexOf("fearRBy.") === 0 || path.indexOf("recoilBy.") === 0) return "mobility";
+  if (path.indexOf("shield.") === 0) return (path === "shield.hp" || path === "shield.regen") ? "survival" : "special";
+  if (path.indexOf("near.") === 0 || path.indexOf("mg.") === 0 || path.indexOf("sniper.") === 0) return "weapon";
+  if (path.indexOf("bullet.") === 0 || path.indexOf("recoil.") === 0 ||
+      path === "cruiseMul" || path === "strayDist" || path === "speedScale") return "global";
+  return "weapon";
+}
+function unitTuneKindPaths(kind) {
+  var out = [], fs = tuneFieldList(kind), i;
+  for (i = 0; i < fs.length; i++) {
+    if (tuneGroupForPath(kind, fs[i][0]) !== "global") out.push(fs[i][0]);
+  }
+  return out;
+}
+var BASE_UNIT = {};
+function unitTuneKindBase(kind) {
+  if (!UNIT_TUNE.kindBase) UNIT_TUNE.kindBase = {};
+  if (UNIT_TUNE.kindBase[kind]) return UNIT_TUNE.kindBase[kind];
+  tuneEnsureFields();
+  var paths = unitTuneKindPaths(kind), b = {}, i, v;
+  for (i = 0; i < paths.length; i++) {
+    v = cfgPathGet(paths[i]);
+    if (typeof v !== "number" || !isFinite(v)) v = 0;
+    b[paths[i]] = v;
+  }
+  Object.freeze(b);
+  UNIT_TUNE.kindBase[kind] = b;
+  BASE_UNIT[kind] = b;
+  return b;
+}
+function unitTuneBase() {
+  var b = UNIT_TUNE.base;
+  if (b) return b;
+  tuneEnsureFields();
+  b = {};
+  var i, j, fs;
+  for (i = 0; i < TUNE_ORDER.length; i++) {
+    fs = unitTuneKindBase(TUNE_ORDER[i]);
+    for (j in fs) if (Object.prototype.hasOwnProperty.call(fs, j)) b[j] = fs[j];
+  }
+  /* 全局项单独快照：它们不属于某个兵种，但「恢复全部」要一起还原 */
+  if (!UNIT_TUNE.globalBase) {
+    UNIT_TUNE.globalBase = {};
+    for (i = 0; i < TUNE_GLOBAL_PATHS.length; i++) {
+      var gp = TUNE_GLOBAL_PATHS[i], gv = cfgPathGet(gp);
+      UNIT_TUNE.globalBase[gp] = (typeof gv === "number" && isFinite(gv)) ? gv : 0;
+    }
+  }
+  for (j in UNIT_TUNE.globalBase) if (Object.prototype.hasOwnProperty.call(UNIT_TUNE.globalBase, j)) b[j] = UNIT_TUNE.globalBase[j];
+  Object.freeze(b);
+  UNIT_TUNE.base = b;
+  return b;
+}
+/* 分区重置：只写回白名单里的路径，其他字段保持不动 */
+function unitTuneResetGroup(kind, group) {
+  var b = unitTuneKindBase(kind), p, n = 0;
+  for (p in b) {
+    if (!Object.prototype.hasOwnProperty.call(b, p)) continue;
+    if (group && tuneGroupForPath(kind, p) !== group) continue;
+    cfgPathSet(p, b[p]); n++;
+  }
+  applyUnitTune(kind);
+  applySpeedScale();
+  return n;
+}
+function unitTuneResetKind(kind) {
+  return unitTuneResetGroup(kind, null);
+}
+function unitTuneResetField(kind, path) {
+  var b = unitTuneKindBase(kind);
+  if (!Object.prototype.hasOwnProperty.call(b, path)) return false;
+  cfgPathSet(path, b[path]);
+  if (path === "speedScale") applySpeedScale();
+  applyUnitTune(kind);
+  return true;
+}
+/* 全局速度比例变了：场上每一个单位都要按新的比例重算最高速 */
+function applySpeedScale() {
+  var sc = CFG.speedScale || 1;
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead) continue;
+    var c = CFG.unit[u.kind];
+    if (!c) continue;
+    u.vmax = c.vmax * sc;
+    u.vmaxCur = u.vmax;
+  }
+}
+/* 把改动作用到场上已经存在的同兵种单位（血量按当前百分比等比缩放） */
+function applyUnitTune(kind) {
+  var c = CFG.unit[kind];
+  if (!c) return;
+  var nm = magOf(kind);
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead || u.kind !== kind) continue;
+    var hm = (u.maxHp > 0) ? (u.hp / u.maxHp) : 1;
+    u.r = c.r * (u.hero ? CFG.hero.sizeMul : 1);
+    u.vmax = c.vmax * (CFG.speedScale || 1) * ((u.hero === "civilian" || u.hero === "militia") ? CFG.hero.civSpeedMul : 1);
+    u.vmaxCur = u.vmax;
+    u.acc = c.acc;
+    u.maxHp = c.hp;
+    u.hp = Math.max(0.5, Math.min(u.maxHp, u.maxHp * hm));
+    if (nm > 0) { u.magSize = nm; if (u.mag > nm) u.mag = nm; }
+    if (kind === "shield" && !u.shieldBroken) {
+      var sratio = (u.shieldHp > 0 && u.maxShieldHp > 0) ? (u.shieldHp / u.maxShieldHp) : 1;
+      u.maxShieldHp = CFG.shield.hp;
+      u.shieldHp = u.maxShieldHp * sratio;
+    }
+  }
+}
+/* 预设快照必须在任何人动手之前就拍下来，否则第一次"恢复默认"
+   会把当时已经被改过的值当成预设存进去，等于恢复不回去 */
+unitTuneBase();
+
+
+/* ============================================================================
+   2.3 实机演示沙盒（原型）
+   真正的模拟在独立的 W 上跑：每次 step 临时切换全局 W/RNG/CAM，跑完立刻还原。
+   演示世界与主战场互不影响；渲染先用简化画法读取真实单位/子弹位置。
+   ============================================================================ */
+var DEMO = { world: null, rng: 0, kind: "rifle", snap: null, target: null, healT: 0 };
+function demoBuild(kind) {
+  var savedW = W, savedRng = RNG.s;
+  var sx = CAM.x, sy = CAM.y, sz = CAM.zoom;
+  try {
+    resetWorld(20261108);
+    var d = W;
+    d.units.length = 0; d.posts.length = 0; d.obstacles.length = 0; d.doors.length = 0;
+    d.bullets.length = 0; d.tongues.length = 0; d.heals.length = 0; d.firePatches.length = 0;
+    d.flameParts.length = 0; d.teslaArcs.length = 0; d.supportOps.length = 0; d.over = false; d.result = "";
+    d.hadCivilians = false; d.resources = 99999; d.t = 0; d.mode = "defense"; d.phase = "infiltrate";
+    var shooter = addUnit(kind, 420, 300);
+    if (shooter) { shooter.hp = shooter.maxHp = Math.max(60, shooter.maxHp); }
+    var z = addUnit("zombie", 640, 300);
+    if (z) { z.hp = z.maxHp = 60; }
+    DEMO.target = z; DEMO.healT = 0;
+    if (typeof rebuildGrids === "function") rebuildGrids();
+    DEMO.world = d;
+    DEMO.rng = RNG.s;
+    DEMO.kind = kind;
+  } finally {
+    W = savedW; RNG.s = savedRng; CAM.x = sx; CAM.y = sy; CAM.zoom = sz;
+    if (typeof rebuildGrids === "function") rebuildGrids();
+  }
+}
+function demoResetScene(kind) {
+  var d = DEMO.world;
+  if (!d) { demoBuild(kind); return; }
+  var savedW = W, savedRng = RNG.s;
+  try {
+    W = d;
+    d.units.length = 0; d.bullets.length = 0; d.tongues.length = 0; d.heals.length = 0;
+    d.firePatches.length = 0; d.flameParts.length = 0; d.teslaArcs.length = 0; d.supportOps.length = 0;
+    d.over = false; d.result = ""; d.t = 0; d.mode = "defense"; d.phase = "infiltrate";
+    var shooter = addUnit(kind, 420, 300);
+    if (shooter) shooter.hp = shooter.maxHp = Math.max(60, shooter.maxHp);
+    var z = addUnit("zombie", 640, 300);
+    if (z) z.hp = z.maxHp = 60;
+    DEMO.target = z; DEMO.healT = 0;
+    if (typeof rebuildGrids === "function") rebuildGrids();
+    DEMO.rng = RNG.s;
+  } finally { W = savedW; RNG.s = savedRng; }
+}
+function demoStep(dt) {
+  if (!DEMO.world) return false;
+  var savedW = W, savedRng = RNG.s;
+  var sx = CAM.x, sy = CAM.y, sz = CAM.zoom;
+  try {
+    W = DEMO.world; RNG.s = DEMO.rng;
+    if (typeof rebuildGrids === "function") rebuildGrids();
+    CAM.x = 480; CAM.y = 300; CAM.zoom = 1;
+    var _sfxOn = (typeof SFX !== "undefined" && SFX) ? SFX.enabled : null;
+    var _fogOn = CFG.fog.on;
+    if (typeof SFX !== "undefined" && SFX) SFX.enabled = false;
+    CFG.fog.on = false;   /* 演示必须全图可见，不能继承对局迷雾 */
+    try { stepSim(dt); } finally {
+      if (typeof SFX !== "undefined" && SFX && _sfxOn !== null) SFX.enabled = _sfxOn;
+      CFG.fog.on = _fogOn;
+    }
+    DEMO.world = W; DEMO.rng = RNG.s;
+    /* 演示固定机位：士兵与靶子都不许被 AI 推走 */
+    var shD = null, zD = null;
+    for (var ui = 0; ui < W.units.length; ui++) {
+      var du = W.units[ui];
+      if (isZombieSide(du)) { if (du === DEMO.target || !zD) zD = du; du.x = 640; du.y = 300; du.vx = 0; du.vy = 0; du.dead = false; }
+      else { shD = du; du.x = 420; du.y = 300; du.vx = 0; du.vy = 0; du.hp = du.maxHp; du.dead = false; }
+    }
+    if (!shD) {
+      shD = addUnit(DEMO.kind, 420, 300);
+      if (shD) { shD.hp = shD.maxHp = Math.max(60, shD.maxHp); }
+    }
+    if (shD) { DEMO.shooter = shD; }
+    if (!zD) {
+      zD = addUnit("zombie", 640, 300);
+      if (zD) { zD.hp = zD.maxHp = 60; }
+    }
+    DEMO.target = zD;
+    if (zD) {
+      zD.x = 640; zD.y = 300; zD.vx = 0; zD.vy = 0; zD.dead = false;
+      if (zD.hp <= 1) {
+        zD.hp = 1;
+        DEMO.healT = (DEMO.healT || 0) + dt;
+        if (DEMO.healT > 2.5) { zD.hp = zD.maxHp; DEMO.healT = 0; }
+      } else DEMO.healT = 0;
+    }
+    W.over = false; W.result = "";
+    if (typeof rebuildGrids === "function") rebuildGrids();
+    var snap = { units: [], bullets: [], t: W.t, over: W.over, result: W.result };
+    for (var i = 0; i < W.units.length; i++) {
+      var u = W.units[i];
+      snap.units.push({ kind: u.kind, x: u.x, y: u.y, r: u.r, hp: u.hp, maxHp: u.maxHp,
+        dead: u.dead, mag: u.mag, magSize: u.magSize, reloading: u.reloading, hero: u.hero });
+    }
+    for (var b = 0; b < W.bullets.length; b++) {
+      var bu = W.bullets[b];
+      snap.bullets.push({ x: bu.x, y: bu.y, vx: bu.vx, vy: bu.vy });
+    }
+    DEMO.snap = snap;
+    /* 镜头跟着演示士兵走：不再让固定镜头把单位跑出画面 */
+    var sh0 = null;
+    for (var si0 = 0; si0 < snap.units.length; si0++) {
+      if (snap.units[si0].kind !== "zombie" && !snap.units[si0].dead) { sh0 = snap.units[si0]; break; }
+    }
+    CAM.x = 480; CAM.y = 300; CAM.zoom = 1.25;
+    return true;
+  } finally {
+    W = savedW; RNG.s = savedRng; CAM.x = sx; CAM.y = sy; CAM.zoom = sz;
+    if (typeof rebuildGrids === "function") rebuildGrids();
+  }
+}
+
+/* ============================================================================
+   兵种数据面板：左边选兵种，中间拖滑块，右边实时样板动画。
+   样板是独立的小模拟器，改哪个数值右边立刻能看到效果（射速、伤害、弹匣、换弹、
+   射程、散射都直观可见）。它不碰主世界，也不消耗主世界的随机数。
+   ============================================================================ */
+var PREVIEW = { raf: 0, on: false, gen: 0, t: 0, acc: 0, shooter: null, target: null, bullets: [],
+  kills: 0, dmgDealt: 0, totalDmg: 0, lastTargetHp: -1, runT: 0, lastStats: null };
+function fmtTune(v) {
+  if (v >= 100) return String(Math.round(v));
+  if (v >= 10) return String(Math.round(v * 10) / 10);
+  return String(Math.round(v * 100) / 100);
+}
+function unitTuneRowHtml(t) {
+  var v = cfgPathGet(t[0]);
+  return "<p style='margin:5px 0'><span style='display:inline-block;width:104px;color:#9fb4dd'>" + t[1] + "</span>" +
+    "<input type='range' data-tune='" + t[0] + "' min='" + t[2] + "' max='" + t[3] + "' step='" + t[4] +
+    "' value='" + v + "' style='width:170px;vertical-align:middle'> <b data-tv='" + t[0] +
+    "' style='color:#ffd479;display:inline-block;min-width:54px'>" + fmtTune(v) + "</b>" +
+    " <button class='utR' data-ureset='" + t[0] + "' title='恢复该字段预设'>↺</button></p>";
+}
+function unitTuneBodyHtml(kind) {
+  var fs = tuneFieldList(kind), html = "", i, t;
+  var secs = [
+    { title: "基础", groups: ["survival", "mobility", "other"], rows: [] },
+    { title: "武器", groups: ["weapon"], rows: [] },
+    { title: "特殊机制", groups: ["special"], rows: [] },
+    { title: "全局", groups: ["global"], rows: [] }
+  ];
+  for (i = 0; i < fs.length; i++) {
+    t = fs[i];
+    var g = tuneGroupForPath(kind, t[0]);
+    for (var k = 0; k < secs.length; k++) {
+      if (secs[k].groups.indexOf(g) >= 0) { secs[k].rows.push(t); break; }
+    }
+  }
+  for (i = 0; i < secs.length; i++) {
+    if (!secs[i].rows.length) continue;
+    html += "<div class='tuneSec'><h3>" + secs[i].title + "</h3>";
+    for (var j = 0; j < secs[i].rows.length; j++) html += unitTuneRowHtml(secs[i].rows[j]);
+    html += "</div>";
+  }
+  return html;
+}
+function showUnitTune() {
+  if (document.getElementById("moreHost")) morePark();
+  if (document.getElementById("setDebugHost")) settingsPark();
+  panelEl.className = "";
+  panelEl.setAttribute("data-panel", "unitTune");
+  var kb = "", i;
+  for (i = 0; i < TUNE_ORDER.length; i++) {
+    kb += "<button data-ukind='" + TUNE_ORDER[i] + "'" +
+      (TUNE_ORDER[i] === UNIT_TUNE.kind ? " class='on'" : "") + ">" + tuneKindName(TUNE_ORDER[i]) + "</button>";
+  }
+  var kind = UNIT_TUNE.kind;
+  var c = CFG.unit[kind] || CFG.unit.rifle;
+  var isCustom = CUSTOM.order.indexOf(kind) >= 0;
+  var nameRow = "<p style='margin:6px 0'><span style='display:inline-block;width:92px;color:#9fb4dd'>名字</span>" +
+    "<input id='utName' value='" + String(c.name || "").replace(/'/g, "&#39;") + "' " +
+    "style='width:150px;background:#1a2136;color:#dfe6f5;border:1px solid #2c3757;border-radius:6px;padding:4px 7px'>" +
+    " <span style='color:#9fb4dd'>颜色</span> <input type='color' id='utColor' value='" + (c.color || "#dfe6f5") +
+    "' style='width:38px;height:26px;background:#1a2136;border:1px solid #2c3757;border-radius:6px;padding:0;vertical-align:middle'></p>";
+  panelEl.innerHTML = "<h2>兵种数据</h2>" +
+    "<div class='warn' style='font-size:12.5px'><b>这里的改动只在本页生效、只活在内存里。</b>" +
+    "不写浏览器存储、不进存档、也不会发到任何服务器，刷新页面或重新打开链接，" +
+    "一切都回到代码里写死的预设。想留住调整结果就复制下面的「角色种子」。</div>" +
+    "<h3>选兵种</h3><div class='opts'>" + kb + "</div>" +
+    "<div style='display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap'>" +
+    "<div style='flex:1;min-width:300px'>" + nameRow + unitTuneBodyHtml(kind) + "</div>" +
+    "<div class='utPrevBox' style='width:300px'>" +
+    "<div style='font-size:12px;color:#9fb4dd;margin-bottom:4px'>实时样板 · 用当前数值打一只丧尸</div>" +
+    "<canvas id='utPrev' width='300' height='150' style='width:100%;height:150px;background:#0b1220;" +
+    "border:1px solid #22304d;border-radius:8px;display:block'></canvas>" +
+    "<div id='utStat' style='font-size:12px;color:#9fb4dd;margin-top:6px;line-height:1.6'></div>" +
+    "</div></div>" +
+    "<p style='margin:10px 0 0'>" +
+    "<button id='utNew' title='以当前兵种为模板复制一个可以自由改装的新角色'>＋ 新建角色</button> " +
+    (isCustom ? "<button id='utDel' style='background:#3a1d1d;border-color:#6a3a3a'>删除这个角色</button> " : "") +
+    "<span style='color:#9fb4dd;font-size:12.5px'>新建出来的角色会出现在底栏投放和地形编辑器的下拉里。</span></p>" +
+    "<details style='margin-top:10px'><summary>角色种子 · 复制保存 / 粘回来还原</summary>" +
+    "<p style='color:#9fb4dd;font-size:12.5px'>这一行文本记录了你改过的全部数值和新建的角色。" +
+    "刷新不会保留改动，但只要留着这行字，粘回来就能一字不差地还原。</p>" +
+    "<textarea id='utSeed' style='width:100%;height:76px;background:#0e1422;color:#9fe0b0;" +
+    "border:1px solid #22304d;border-radius:8px;padding:8px;font-size:11.5px;font-family:monospace;resize:vertical'></textarea>" +
+    "<p style='text-align:right'><button id='utSeedGen'>生成种子</button> " +
+    "<button id='utSeedApply'>用框里的种子还原</button></p></details>" +
+    "<p style='color:#9fb4dd;font-size:12.5px'>改完立刻作用于场上现有单位，之后投放的也按新数值来（血量按当前百分比等比缩放）。</p>" +
+    "<p style='text-align:right;display:flex;gap:8px;justify-content:flex-end;align-items:center;flex-wrap:wrap'>" +
+      "<span style='color:#9fb4dd;font-size:12px'>恢复范围</span>" +
+      "<select id='utScope' style='min-width:120px'>" +
+        "<option value='kind'>本兵种</option>" +
+        "<option value='mobility'>移动</option>" +
+        "<option value='weapon'>武器</option>" +
+        "<option value='survival'>生存</option>" +
+        "<option value='special'>特殊机制</option>" +
+        "<option value='all'>全部兵种</option>" +
+      "</select>" +
+      "<button id='utResetScope'>恢复所选范围</button>" +
+      "<button id='utReset'>恢复全部预设</button>" +
+      "<button id='utClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  bindUnitTune();
+}
+function bindUnitTune() {
+  var i, els;
+  els = panelEl.querySelectorAll("[data-ukind]");
+  for (i = 0; i < els.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        UNIT_TUNE.kind = b.getAttribute("data-ukind");
+        showUnitTune();
+      });
+    })(els[i]);
+  }
+  els = panelEl.querySelectorAll("[data-ureset]");
+  for (i = 0; i < els.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        unitTuneResetField(UNIT_TUNE.kind, b.getAttribute("data-ureset"));
+        showUnitTune();
+      });
+    })(els[i]);
+  }
+  els = panelEl.querySelectorAll("[data-tune]");
+  for (i = 0; i < els.length; i++) {
+    (function (el) {
+      el.addEventListener("input", function () {
+        var path = el.getAttribute("data-tune");
+        var v = parseFloat(el.value);
+        var lim2 = unitLimitFor(path);
+        if (lim2) v = Math.max(lim2.min, Math.min(lim2.max, v));
+        cfgPathSet(path, v);
+        applyUnitTune(UNIT_TUNE.kind);
+        /* 全局速度比例要对全场生效，不能只刷当前兵种 */
+        if (path === "speedScale") applySpeedScale();
+        var lab = panelEl.querySelector("[data-tv='" + path + "']");
+        if (lab) lab.textContent = fmtTune(v);
+        previewReset();
+      });
+    })(els[i]);
+  }
+  var br = document.getElementById("bReduce");
+  if (br) br.addEventListener("click", function () { setReduceMotion(!REDUCE_MOTION); });
+  var rs = document.getElementById("utReset");
+  if (rs) rs.addEventListener("click", function () { unitTuneResetAll(); showUnitTune(); });
+  var sc = document.getElementById("utScope");
+  var rsc = document.getElementById("utResetScope");
+  if (rsc) rsc.addEventListener("click", function () {
+    var v = sc ? sc.value : "kind";
+    if (v === "all") { unitTuneResetAll(); }
+    else if (v === "kind") { unitTuneResetKind(UNIT_TUNE.kind); toast("已恢复本兵种预设"); }
+    else { unitTuneResetGroup(UNIT_TUNE.kind, v); toast("已恢复所选范围：" + ({ mobility: "移动", weapon: "武器", survival: "生存", special: "特殊机制" }[v] || v)); }
+    showUnitTune();
+  });
+  var cl = document.getElementById("utClose");
+  if (cl) cl.addEventListener("click", function () { previewStop(); closeOverlaySmart(); });
+  var nmEl = document.getElementById("utName");
+  if (nmEl) nmEl.addEventListener("change", function () {
+    var v = String(this.value || "").trim();
+    if (!v) return;
+    CFG.unit[UNIT_TUNE.kind].name = v;
+    TUNE_KIND_NAMES[UNIT_TUNE.kind] = v;
+    refreshPlaceLists();
+    showUnitTune();
+  });
+  var clEl = document.getElementById("utColor");
+  if (clEl) clEl.addEventListener("input", function () {
+    CFG.unit[UNIT_TUNE.kind].color = this.value;
+  });
+  var nw = document.getElementById("utNew");
+  if (nw) nw.addEventListener("click", function () {
+    var base = CFG.unit[UNIT_TUNE.kind].base || UNIT_TUNE.kind;
+    if (TUNE_ORDER.indexOf(UNIT_TUNE.kind) < 0) base = "rifle";
+    var id = makeCustomUnit(base);
+    if (id) { UNIT_TUNE.kind = id; showUnitTune(); }
+  });
+  var dl = document.getElementById("utDel");
+  if (dl) dl.addEventListener("click", function () {
+    removeCustomUnit(UNIT_TUNE.kind);
+    UNIT_TUNE.kind = "rifle";
+    showUnitTune();
+  });
+  var sg = document.getElementById("utSeedGen");
+  if (sg) sg.addEventListener("click", function () {
+    var ta = document.getElementById("utSeed");
+    if (ta) ta.value = tuneSeed();
+    toast("种子已生成，复制走即可");
+  });
+  var sa = document.getElementById("utSeedApply");
+  if (sa) sa.addEventListener("click", function () {
+    var ta = document.getElementById("utSeed");
+    if (!ta) return;
+    var n = applyTuneSeed(ta.value);
+    showUnitTune();
+    toast("已按种子还原 " + n + " 项");
+  });
+  previewStart();
+}
+/* ---------------- 实时样板：一个独立的小模拟器 ----------------
+   只读 CFG 里当前的值，画在面板里那个小画布上：
+   射手按当前射速/弹匣/换弹开火，目标按照当前伤害掉血，
+   射程不够子弹会在半路消失，散射角大了会打偏，都是肉眼可见的 */
+var PREVIEW_SCALE = 3;      /* 1 个画布像素 = 3 个世界单位 */
+function previewStats() {
+  var k = UNIT_TUNE.kind, c = CFG.unit[k] || CFG.unit.rifle, gk = gunCfgKeyOf(k);
+  var dmg = 0, rng = 0, iv = 1, spread = 0, magMax = 0, reload = 2.0;
+  var C2 = CFG;
+  if (k === "laser") { dmg = C2.laser.dmg; rng = C2.laser.range; iv = C2.laser.tick; magMax = 1; reload = C2.laser.playerReload; }
+  else if (k === "flame") { dmg = C2.flame.directDmg; rng = C2.flame.range; iv = C2.flame.directEvery; magMax = C2.unit.flame.gun.mag; reload = C2.flame.reload; }
+  else if (k === "tesla") { dmg = C2.tesla.dmg; rng = C2.unit.tesla.gun.r; iv = C2.tesla.burstGap; magMax = C2.unit.tesla.gun.mag; reload = C2.tesla.reload; }
+  else if (k === "cryo") { dmg = C2.cryo.dmg; rng = C2.unit.cryo.gun.r; iv = C2.cryo.throwEvery; magMax = C2.unit.cryo.gun.mag; reload = C2.cryo.reload; }
+  else if (gk) {
+    dmg = cfgPathGet(gk + ".dmg");
+    rng = cfgPathGet(gk + ".r");
+    iv = cfgPathGet(gk + ".interval") || 1;
+    spread = cfgPathGet(gk + ".spreadDeg");
+    if (gk === "pistol") { magMax = CFG.shield.mag || 12; }
+    else { magMax = cfgPathGet(gk + ".mag"); reload = cfgPathGet(gk + ".reload") || 2.0; }
+  }
+  return {
+    name: c.name, color: c.color, hp: c.hp, vmax: c.vmax, r0: c.r,
+    dmg: dmg, rng: rng, iv: iv, spread: spread, magMax: magMax, reload: reload
+  };
+}
+function previewReset() {
+  PREVIEW.kills = 0;
+  PREVIEW.dmgDealt = 0;
+  PREVIEW.totalDmg = 0;
+  PREVIEW.lastTargetHp = -1;
+  PREVIEW.t = 0;
+  PREVIEW.runT = 0;
+  PREVIEW.acc = 0;
+  PREVIEW.lastStats = null;
+  if (!DEMO.world || DEMO.kind !== UNIT_TUNE.kind) demoBuild(UNIT_TUNE.kind);
+  else demoResetScene(UNIT_TUNE.kind);
+}
+function previewStart() {
+  previewStop();
+  var myGen = ++PREVIEW.gen;
+  var cv = null;
+  try { cv = document.getElementById("utPrev"); } catch (e) { cv = null; }
+  if (!cv || !cv.getContext) return;
+  PREVIEW.on = true;
+  previewReset();
+  var last = 0;
+  function frame(ts) {
+    if (!PREVIEW.on || myGen !== PREVIEW.gen) return;
+    var dt = last ? Math.min(0.05, (ts - last) / 1000) : 0.016;
+    last = ts;
+    PREVIEW.t += dt;
+    try {
+      previewStep(dt);
+      previewDraw(cv);
+    } catch (err) {
+      PREVIEW.err = err && err.message ? err.message : "预览异常";
+      try { previewFallback(cv.getContext("2d")); } catch (e2) {}
+    }
+    if (requestAnimationFrame) PREVIEW.raf = requestAnimationFrame(frame);
+  }
+  if (requestAnimationFrame) PREVIEW.raf = requestAnimationFrame(frame);
+  else { previewStep(0.016); previewDraw(cv); }
+}
+function previewStop() {
+  PREVIEW.on = false;
+  PREVIEW.gen++;
+  if (PREVIEW.raf && typeof cancelAnimationFrame === "function") {
+    try { cancelAnimationFrame(PREVIEW.raf); } catch (e) {}
+  }
+  PREVIEW.raf = 0;
+}
+function previewStep(dt) {
+  if (!DEMO.world || DEMO.kind !== UNIT_TUNE.kind) demoBuild(UNIT_TUNE.kind);
+  /* 固定步长：演示与实战用同一套 60Hz 推进，避免帧率影响结果 */
+  PREVIEW.acc = (PREVIEW.acc || 0) + dt;
+  var steps = 0;
+  while (PREVIEW.acc >= 1 / 60 && steps < 4) {
+    demoStep(1 / 60);
+    PREVIEW.acc -= 1 / 60;
+    steps++;
+  }
+  if (steps === 0 && !DEMO.snap) demoStep(1 / 60);
+  PREVIEW.lastStats = previewStats();
+  /* 实际累计伤害：按目标血量下降累加；目标回满时重置基线，不把回血算成负伤害 */
+  if (DEMO.target) {
+    var _th = DEMO.target.hp;
+    if (PREVIEW.lastTargetHp >= 0 && _th < PREVIEW.lastTargetHp) {
+      PREVIEW.totalDmg += PREVIEW.lastTargetHp - _th;
+    }
+    PREVIEW.lastTargetHp = _th;
+  }
+  if (DEMO.snap) {
+    var dmg = 0, dead = 0;
+    for (var i = 0; i < DEMO.snap.units.length; i++) {
+      var u = DEMO.snap.units[i];
+      if (u.kind !== "zombie") continue;
+      dmg += Math.max(0, u.maxHp - u.hp);
+      if (u.dead) dead++;
+    }
+    PREVIEW.dmgDealt = Math.max(PREVIEW.dmgDealt, dmg);
+    PREVIEW.kills = dead;
+    if (DEMO.snap.over) demoResetScene(UNIT_TUNE.kind);
+  }
+}
+function previewFallback(g) {
+  g.fillStyle = "#081016"; g.fillRect(0, 0, 300, 150);
+  g.strokeStyle = "rgba(217,164,65,.12)"; g.lineWidth = 1;
+  for (var gx = 0; gx < 300; gx += 24) { g.beginPath(); g.moveTo(gx, 0); g.lineTo(gx, 150); g.stroke(); }
+  for (var gy = 0; gy < 150; gy += 24) { g.beginPath(); g.moveTo(0, gy); g.lineTo(300, gy); g.stroke(); }
+  if (!DEMO.snap) return;
+  for (var i = 0; i < DEMO.snap.units.length; i++) {
+    var u = DEMO.snap.units[i];
+    var ux = (u.x - 380) * 0.38 + 10, uy = (u.y - 200) * 0.5 + 8;
+    g.beginPath(); g.arc(ux, uy, Math.max(4, u.r * 0.55), 0, TAU);
+    g.fillStyle = u.kind === "zombie" ? "#8b3fe8" : "#dfe6f5"; g.fill();
+    if (u.kind === "zombie" && !u.dead) {
+      g.fillStyle = "rgba(0,0,0,.5)"; g.fillRect(ux - 14, uy - 14, 28, 4);
+      g.fillStyle = "#5ad07a"; g.fillRect(ux - 14, uy - 14, 28 * Math.max(0, u.hp / u.maxHp), 4);
+    }
+  }
+  g.strokeStyle = "rgba(255,220,120,.9)"; g.lineWidth = 1.5;
+  for (var b = 0; b < DEMO.snap.bullets.length; b++) {
+    var bu = DEMO.snap.bullets[b];
+    var bx = (bu.x - 380) * 0.38 + 10, by = (bu.y - 200) * 0.5 + 8;
+    g.beginPath(); g.arc(bx, by, 2, 0, TAU); g.fillStyle = "#ffe08a"; g.fill();
+  }
+}
+function previewDraw(cv) {
+  var g = null;
+  try { g = cv.getContext("2d"); } catch (e) { g = null; }
+  if (!g) return;
+  var st = PREVIEW.lastStats || previewStats();
+  /* 真实渲染：临时把画布、视口、相机与战场切到演示世界，
+     直接调用主渲染 render()，跑完立即还原；不再维护第二套简化画法 */
+  var oldCTX = CTX, oldVW = VW, oldVH = VH, oldDPR = DPR, oldW = W;
+  var oldCX = CAM.x, oldCY = CAM.y, oldCZ = CAM.zoom;
+  try {
+    CTX = g; VW = 300; VH = 150; DPR = 1; W = DEMO.world;
+    RENDER_NO_HUD = true;
+    var _drawFog = CFG.fog.on;
+    CFG.fog.on = false;
+    CAM.x = 480; CAM.y = 300; CAM.zoom = 0.70;
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, 300, 150);
+    PREVIEW.err = "";
+    try { render(); } catch (e) { PREVIEW.err = (e && e.message) || "渲染异常"; previewFallback(g); }
+  } finally {
+    CTX = oldCTX; VW = oldVW; VH = oldVH; DPR = oldDPR; W = oldW;
+    RENDER_NO_HUD = false;
+    CFG.fog.on = _drawFog;
+    CAM.x = oldCX; CAM.y = oldCY; CAM.zoom = oldCZ;
+  }
+  var dps = (st.iv > 0 && st.magMax > 0) ? (st.dmg / st.iv) : 0;
+  var realDps = PREVIEW.totalDmg / Math.max(0.5, PREVIEW.t || 0);
+  var txt = "实机演示 · 理想 DPS " + dps.toFixed(1) + " · 实际 DPS " + realDps.toFixed(1) +
+    " · 累计 " + Math.round(PREVIEW.totalDmg) + " 伤害" +
+    (PREVIEW.err ? " · 渲染已回退" : "");
+  var el = document.getElementById("utStat");
+  if (el) el.textContent = txt;
+}
+/* ---------------- 自定义兵种 ----------------
+   本质是复制一份基础兵种的配置，再给它一份独立的枪械参数对象，
+   所以改它不会牵连步枪兵，也不会牵连别的自定义兵种 */
+var CUSTOM = { order: [], next: 1 };
+function makeCustomUnit(baseKind, forcedId) {
+  baseKind = baseKind || "rifle";
+  var src = CFG.unit[baseKind];
+  if (!src) return null;
+  var id = forcedId || ("c" + (CUSTOM.next++));
+  if (forcedId) {
+    var n = parseInt(forcedId.replace(/[^0-9]/g, ""), 10) || 0;
+    if (n >= CUSTOM.next) CUSTOM.next = n + 1;
+  }
+  if (CFG.unit[id]) return id;
+  var gk = gunCfgKeyOf(baseKind);
+  var gun = null;
+  if (gk) {
+    gun = {
+      dmg: cfgPathGet(gk + ".dmg"), r: cfgPathGet(gk + ".r"),
+      interval: cfgPathGet(gk + ".interval") || 1,
+      spreadDeg: cfgPathGet(gk + ".spreadDeg"),
+      mag: gk === "pistol" ? (CFG.shield.mag || 12) : cfgPathGet(gk + ".mag"),
+      reload: gk === "pistol" ? 2 : (cfgPathGet(gk + ".reload") || 2),
+      widthMul: cfgPathGet(gk + ".widthMul") || 1
+    };
+  }
+  CFG.unit[id] = {
+    r: src.r, vmax: src.vmax, acc: src.acc, hp: src.hp,
+    name: (src.name || "兵种") + "·改", color: src.color,
+    base: baseKind, line: true, gun: gun,
+    cost: unitCostOf(baseKind) || CFG.econ.cost.rifle || 25
+  };
+  CFG.fearRBy[id] = fearBaseOf(baseKind);
+  if (!CFG.recoilBy) CFG.recoilBy = {};
+  CFG.recoilBy[id] = (CFG.recoilBy[baseKind] !== undefined) ? CFG.recoilBy[baseKind]
+    : (CFG.recoil[baseKind] || 1);
+  TUNE_KIND_NAMES[id] = CFG.unit[id].name;
+  if (TUNE_ORDER.indexOf(id) < 0) TUNE_ORDER.push(id);
+  if (CUSTOM.order.indexOf(id) < 0) CUSTOM.order.push(id);
+  refreshPlaceLists();
+  return id;
+}
+function removeCustomUnit(id) {
+  if (CUSTOM.order.indexOf(id) < 0) return;
+  delete CFG.unit[id];
+  delete CFG.fearRBy[id];
+  delete TUNE_KIND_NAMES[id];
+  var i = TUNE_ORDER.indexOf(id);
+  if (i >= 0) TUNE_ORDER.splice(i, 1);
+  i = CUSTOM.order.indexOf(id);
+  if (i >= 0) CUSTOM.order.splice(i, 1);
+  if (UNIT_TUNE.kind === id) UNIT_TUNE.kind = "rifle";
+  refreshPlaceLists();
+}
+function sweepCustomUnits() {
+  var i;
+  for (i = CUSTOM.order.length - 1; i >= 0; i--) removeCustomUnit(CUSTOM.order[i]);
+}
+/* 投放 / 编辑器两个下拉框都要认识自定义兵种 */
+/* 兵种库变了就整表重建：自定义兵种也走同一条路，不再单独往下拉里追加 */
+function refreshPlaceLists() {
+  rebuildFactionKinds();
+  refreshUnitSelects();
+}
+
+/* ---------------- 角色种子 ----------------
+   一行文本就能把"我改过的所有数值 + 自定义兵种"完整描述出来。
+   把它发给我，我照着改代码里的预设即可；也可以粘回来一键还原。 */
+function shortKeyOf(kind, path) {
+  var pre = "unit." + kind + ".";
+  if (path.indexOf(pre) === 0) return path.slice(pre.length);
+  if (path === "fearRBy." + kind) return "fear";
+  return path;
+}
+function pathOfShort(kind, key) {
+  if (key === "fear") return "fearRBy." + kind;
+  var a = "unit." + kind + "." + key;
+  if (cfgPathHas(a)) return a;
+  return key;
+}
+function roundTune(v) {
+  return String(Math.round(v * 1000) / 1000);
+}
+function tuneSeed() {
+  var b = unitTuneBase(), out = [], i, j, fs, path, v, parts, kind, extra;
+  var gseen = {};   /* 子弹速度 / 后坐力基准是全局项，每个兵种下面都会出现，导出只留一次 */
+  for (i = 0; i < TUNE_ORDER.length; i++) {
+    kind = TUNE_ORDER[i];
+    fs = tuneFieldList(kind);
+    parts = [];
+    if (CUSTOM.order.indexOf(kind) >= 0) {
+      extra = CFG.unit[kind];
+      if (extra.base) parts.push("base=" + extra.base);
+      if (extra.name) parts.push("name=" + encodeURIComponent(extra.name));
+    }
+    for (j = 0; j < fs.length; j++) {
+      path = fs[j][0];
+      v = cfgPathGet(path);
+      var baseV = (b[path] === undefined) ? null : b[path];
+      /* 自定义兵种的全部字段都要带上（它们没有"预设"可言） */
+      var isCustom = CUSTOM.order.indexOf(kind) >= 0;
+      var isGlobalItem = TUNE_GLOBAL_PATHS.indexOf(path) >= 0;
+      if (isGlobalItem && gseen[path]) continue;
+      if (isCustom || baseV === null || Math.abs(v - baseV) > 1e-6) {
+        parts.push(shortKeyOf(kind, path) + "=" + roundTune(v));
+        if (isGlobalItem) gseen[path] = 1;
+      }
+    }
+    if (parts.length) out.push(kind + "@" + parts.join(","));
+  }
+  return "SB1;" + out.join(";");
+}
+function applyTuneSeed(text) {
+  if (!text) return 0;
+  text = String(text).trim();
+  if (text.indexOf("SB1;") === 0) text = text.slice(4);
+  var segs = text.split(";"), applied = 0, i, j, at, kind, pairs, kv, key, val;
+  for (i = 0; i < segs.length; i++) {
+    if (!segs[i]) continue;
+    at = segs[i].indexOf("@");
+    if (at < 0) continue;
+    kind = segs[i].slice(0, at).trim();
+    pairs = segs[i].slice(at + 1).split(",");
+    var base = null, nm = null, store = [];
+    for (j = 0; j < pairs.length; j++) {
+      kv = pairs[j].split("=");
+      if (kv.length < 2) continue;
+      key = kv[0].trim();
+      val = kv.slice(1).join("=").trim();
+      if (key === "base") base = val;
+      else if (key === "name") nm = decodeURIComponent(val);
+      else store.push([key, val]);
+    }
+    if (base && !CFG.unit[kind]) makeCustomUnit(base, kind);
+    if (!CFG.unit[kind]) continue;
+    if (nm) {
+      CFG.unit[kind].name = nm;
+      TUNE_KIND_NAMES[kind] = nm;
+    }
+    for (j = 0; j < store.length; j++) {
+      var p = pathOfShort(kind, store[j][0]);
+      var f = parseFloat(store[j][1]);
+      if (isFinite(f)) { cfgPathSet(p, f); applied++; }
+    }
+    applyUnitTune(kind);
+  }
+  refreshPlaceLists();
+  return applied;
+}
+
+/* 一键把内存里的 CFG 拉回代码预设（预设本身从未被改写，这里只是把值拷回去） */
+function unitTuneResetAll() {
+  var b = unitTuneBase(), p, i;
+  for (p in b) if (Object.prototype.hasOwnProperty.call(b, p)) cfgPathSet(p, b[p]);
+  applySpeedScale();
+  for (i = 0; i < TUNE_ORDER.length; i++) applyUnitTune(TUNE_ORDER[i]);
+  toast("已恢复全部预设数值（自定义兵种不受影响）");
+}
+
+/* 新手引导：开局后一次讲一件事，讲完或跳过就记进 localStorage，不再打扰 */
+var TUTOR = { i: 0, on: false };
+/* 教程里的键名一律现查，玩家改过键位后打开教程看到的就是他自己那套 */
+function tutorKeyOf(action) {
+  try {
+    return "<b>" + keyDisplay(KEYMAP[action]) + "</b>";
+  } catch (e) { return "<b>—</b>"; }
+}
+/* 手机没有键盘，教程里写键位等于什么都没说。
+   这里按"主要输入方式"分流：触屏为主就讲按钮在哪，键鼠为主才讲快捷键 */
+function isTouchPrimary() {
+  try {
+    if (typeof window === "undefined") return false;
+    var hasTouch = ("ontouchstart" in window) || (navigator && navigator.maxTouchPoints > 0);
+    /* 同时有触屏和键盘的设备（比如带触屏的笔记本）按键盘算，键位那套更好用 */
+    var hasFineMouse = window.matchMedia && window.matchMedia("(pointer: fine)").matches;
+    var touchUI = !!hasTouch && !hasFineMouse;
+    try {
+      if (touchUI) document.body.classList.add("touch-ui");
+      else document.body.classList.remove("touch-ui");
+    } catch (e) {}
+    return touchUI;
+  } catch (e) { return false; }
+}
+function tutorMoveKeys() {
+  try {
+    var ks = ["up", "left", "down", "right"].map(function (a) {
+      return "<b>" + keyDisplay(KEYMAP[a]) + "</b>";
+    });
+    return ks.join(" ");
+  } catch (e) { return "<b>WASD</b>"; }
+}
+function tutorModeOf() {
+  var m = (typeof GAME_MODE !== "undefined") ? GAME_MODE : START.gameMode;
+  return m === "escort" ? "escort" : "defense";
+}
+function tutorSteps() {
+  var args = [tutorKeyOf("cancel"), tutorKeyOf("market"), tutorKeyOf("fireMode"), tutorMoveKeys()];
+  return tutorModeOf() === "escort" ? TUTOR_ESCORT_STEPS_SRC.apply(null, args) : TUTOR_DEFENSE_STEPS_SRC.apply(null, args);
+}
+function TUTOR_DEFENSE_STEPS_SRC(kCancel, kMarket, kFire, kMove) {
+  var IS_TOUCH = isTouchPrimary();
+  return [
+  { t: "第 1 步 / 共 6 步",
+    b: "防线作战从部署开始。投放栏里每个单位的价格、射程和定位不同；先放一个能站住的单位，" +
+       "观察它如何自己找位置、何时开火。你不需要操作任何一个人，也能看懂这条防线是怎么运转的。" },
+  { t: "第 2 步 / 共 6 步",
+    b: "资源会持续增长。补人之前先看阵容缺什么：是火力、前排、续航，还是能拖住尸群的单位。" +
+       "低价单位能更快填线，但不等于能替代所有位置。" },
+  { t: "第 3 步 / 共 6 步",
+    b: "大多数时候，你只需要决定把资源放在哪里。想亲自介入时，再接管一个单位；" +
+       (IS_TOUCH ? "屏幕上会出现移动和瞄准摇杆。" : "接管后用 " + kMove + " 移动、鼠标瞄准、左键开火。") +
+       "接管是可选手段，不是唯一玩法。" },
+  { t: "第 4 步 / 共 6 步",
+    b: "装备市场可以改枪，也可以补防护、机动和续航。先看这个单位在队伍里承担什么，再决定投入什么；" +
+       (IS_TOUCH ? "在菜单里打开装备市场。" : "按 " + kMarket + " 或从菜单进入装备市场。") +
+       "不用先接管，点选一个人也能配置。" },
+  { t: "第 5 步 / 共 6 步",
+    b: "如果防线被冲散，先看是哪一段先崩：火力不足、没人挡，还是资源花错了地方。" +
+       "菜单里有完整说明和更新公告；先观察，再调整。" },
+  { t: "第 6 步 / 共 6 步",
+    b: "战场节奏很快，局势随时可能翻转。看不清的时候先暂停：" +
+       (IS_TOUCH ? "点顶栏「暂停」。" : "按 " + tutorKeyOf("pause") + " 或点顶栏「暂停」。") +
+       "把镜头拉远，看清哪一段在崩、资源该补哪里，再继续。暂停不会让局势变慢，但能让你看清它。" }
+  ];
+}
+function TUTOR_ESCORT_STEPS_SRC(kCancel, kMarket, kFire, kMove) {
+  var IS_TOUCH = isTouchPrimary();
+  return [
+  { t: "第 1 步 / 共 6 步",
+    b: "护送作战先从路线开始。队伍在右侧，平民关在左侧，最后还要把人带回撤离点。" +
+       "先看地形和小地图，判断哪条路值得走，再决定把队伍往哪里推。" },
+  { t: "第 2 步 / 共 6 步",
+    b: "资源会持续增长，但队伍的问题不会只有一种：有人站不住，有人掉队，有人一交火就打空弹匣。" +
+       "装备市场提供防护、机动和供弹三个方向；先看清这一局最明显的短板。" },
+  { t: "第 3 步 / 共 6 步",
+    b: "市场不要求先接管。点选一个人就能配置；防护让前排多撑一会，机动让掉队的人跟上来，供弹让火力不断档。" +
+       "不必每样都买，先补最影响队伍完整性的那一项。" },
+  { t: "第 4 步 / 共 6 步",
+    b: "大多数时候，队伍能自己处理交火。真正需要你介入时，通常是有人快被拖走、队伍被地形卡住，或者撤离时机需要判断。" +
+       "接管一个单位可以改变局部，但目标始终是把平民带回撤离点，而不是追杀每一只丧尸。" },
+  { t: "第 5 步 / 共 6 步",
+    b: "如果队伍被拖住，先看地形、队形和掉队的人，再考虑补什么装备。" +
+       "护送失败通常不是单纯火力不够，而是路线、队形或撤离时机出了问题。" },
+  { t: "第 6 步 / 共 6 步",
+    b: "护送途中局势变化更快，一次掉队就可能引发连锁崩盘。拿不准时先暂停：" +
+       (IS_TOUCH ? "点顶栏「暂停」。" : "按 " + tutorKeyOf("pause") + " 或点顶栏「暂停」。") +
+       "先看路线、队尾和撤离点，再决定是补装备、换路线，还是继续推进。" }
+  ];
+}
+function tutorStorageKey() {
+  return "zombieSandbox.tutor.v3." + tutorModeOf();
+}
+function tutorSeen() {
+  try { return localStorage.getItem(tutorStorageKey()) === "1"; } catch (e) { return false; }
+}
+function tutorMark() {
+  try { localStorage.setItem(tutorStorageKey(), "1"); } catch (e) {}
+}
+function tutorReset() {
+  try { localStorage.removeItem(tutorStorageKey()); } catch (e) {}
+}
+function showTutor(i) {
+  var box = $("tips");
+  if (!box) return;
+  var steps = tutorSteps();
+  var st = steps[i];
+  if (!st) { hideTutor(); return; }
+  TUTOR.i = i; TUTOR.on = true;
+  var tt = $("tipsT"), tb = $("tipsB"), nb = $("tipsNext");
+  if (tt) tt.textContent = st.t;
+  var dots = $("tipsDots");
+  if (dots) {
+    var dh = "";
+    for (var di = 0; di < steps.length; di++) dh += "<i class='" + (di <= i ? "on" : "") + "'></i>";
+    dots.innerHTML = dh;
+  }
+  if (tb) tb.innerHTML = st.b;
+  if (nb) nb.textContent = (i >= steps.length - 1) ? "开始吧" : "下一步";
+  /* 引导改到顶栏下方：底栏上方是场内占比条，两个版本都会互相遮挡 */
+  var topBar = $("top");
+  box.style.bottom = "auto";
+  box.style.top = ((topBar && topBar.offsetHeight ? topBar.offsetHeight : 56) + 10) + "px";
+  box.className = "show";
+}
+function hideTutor() {
+  TUTOR.on = false;
+  var box = $("tips");
+  if (box) box.className = "";
+  tutorMark();
+}
+function tutorNext() {
+  var n = tutorSteps().length;
+  if (TUTOR.i + 1 >= n) hideTutor();
+  else showTutor(TUTOR.i + 1);
+}
+
+/* 一键把所有可改设置拉回预设：开战设置、键位、兵种数值、音量。
+   存档和地形布置一概不动，那是玩家的作品，不属于"设置" */
+function resetAllDefaults() {
+  resetBinds();
+  unitTuneResetAll();
+  CFG.shake.enabled = true; CFG.shake.scale = 1; CFG.shake.distance = true; saveShake();
+  try { localStorage.removeItem("zombieSandbox.vol"); } catch (e) {}
+  var vr = $("volRange");
+  if (vr) {
+    vr.value = 95;
+    var vl = $("volVal");
+    if (vl) vl.textContent = "95%";
+    try { SFX.setVolume(0.95); } catch (e2) {}
+  }
+  setReduceMotion(false);
+  EDIT.genDifficulty = "normal";
+  resetStartSettings(false);
+  toast("已恢复全部默认设置（存档与地形未动）");
+}
+/* 开战设置一键回默认：当前停在哪个模式就只重置那个模式的参数，不把人踢回别的玩法 */
+function resetStartSettings(showPanel) {
+  var gm = START.gameMode || "defense";
+  START.mode = ""; START.add = 0; START.mult = 1;
+  START.postDuty = false;
+  START.civCount = 8;
+  START.squad = { rifle: 5, mg: 1, sniper: 0, shield: 0, medic: 0,
+                    cryo: 0, flame: 0, tesla: 0, laser: 0 };
+  START.heroMode = false;
+  START.chaosCiv = CFG.chaos.defCiv;
+  START.reinforce = false;
+  START.emperor = false;
+  START.waveMode = false;
+  START.waveCount = 10; START.waveFirst = 50; START.waveGap = 180; START.waveSize = 100; START.waveScale = true; START.bossWave = true; START.bossEvery = 9; START.doubleBoss = false; START.difficulty = "normal"; START.heroMode = true; START.reinforce = true; START.waveMode = true;
+  START.gameMode = gm;
+  trimSquad();
+  /* 从开战页点「恢复默认」：连同地图一起回到初始状态 */
+  if (showPanel !== false) {
+    EDIT.touched = false;
+    EDIT.unitsEdited = false;
+    EDIT.undo.length = 0;
+    resetForSetup();
+  }
+  toast(showPanel !== false ? "地图与开战设置已恢复默认" : "开战设置已恢复默认");
+  if (showPanel !== false) showStartPanel();
+}
+
+/* 首屏/开战设置期间收起顶栏底栏，别让"时间/资源/投放"这些战斗中才用的东西抢视线 */
+function setHomeBoard(on) {
+  var b = document.getElementById("homeBg");
+  if (b) b.className = on ? "show" : "";
+}
+function setGameChrome(on) {
+  var top = document.getElementById("top"), bot = document.getElementById("bottom");
+  if (top) top.style.visibility = on ? "" : "hidden";
+  if (bot) bot.style.visibility = on ? "" : "hidden";
+  var eh = document.getElementById("econHud");
+  if (eh) eh.style.display = on ? "" : "none";
+}
+/* 首屏：先让人看懂这是什么游戏，再让人选模式。
+   所有细节（数量、波次、支援）都收进下一层，这里只留"这是什么"和"从哪开始" */
+function showQuickStart() {
+  panelEl.innerHTML =
+    "<h2>快速开始</h2>" +
+    "<div class='qsSteps'>" +
+      "<div><b>01</b><strong>选模式</strong><p>防线：守住东侧阵地；护送：开门救人；混沌：开场倒计时。</p></div>" +
+      "<div><b>02</b><strong>投放</strong><p>底栏选单位，点地图放下。资源每秒自动增长，击杀再给一笔。</p></div>" +
+      "<div><b>03</b><strong>观察</strong><p>他们会自己找掩体、开火、换弹、撤退。你只决定往场上补什么。</p></div>" +
+    "</div>" +
+    "<p class='netTip'>丧尸全灭为胜，平民全灭为败。想亲自作战，点底栏「操控」再选择一名单位。</p>" +
+    "<p style='text-align:right'><button id='qsPlay' class='primary'>立即部署</button> " +
+      "<button id='qsClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var qp = $("qsPlay");
+  if (qp) qp.addEventListener("click", startWithFade);
+  var qc = $("qsClose");
+  if (qc) qc.addEventListener("click", function () { closeOverlaySmart(); });
+}
+function showHome() {
+  setGameChrome(false);
+  setHomeBoard(true);
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  HOME_PANEL = true;
+  panelEl.className = "home";
+  panelEl.innerHTML =
+    "<div class='termShell'>" +
+      "<div class='termTop'><span>" + GAME_TITLE_EN + " / 战术模拟</span><i>v" + GAME_VERSION + "</i></div>" +
+      "<div class='homeTitle'>" + GAME_TITLE.slice(0, 2) + "<span>" + GAME_TITLE.slice(2) + "</span></div>" +
+      "<div class='homeSub'>一局自己会打的攻防沙盘：人类结阵守阵地，丧尸成群扑上来。" +
+      "你不用操作任何一个人，他们自己会走位、开火、撤退、换弹。<br>" +
+      "<b>你只决定一件事：往这片战场上补什么。</b></div>" +
+      "<div class='termSection'>选择作战模式</div>" +
+      "<div class='modeList'>" +
+        "<button class='modeRow' data-gmode='defense'><span class='mi'>01</span><span class='mb'>" +
+          "<b>防线作战</b><em>人类死守东侧阵地，西边的尸潮一波波压过来。推荐作为首次作战。</em></span><span class='ma'>›</span></button>" +
+        "<button class='modeRow' data-gmode='escort'><span class='mi'>02</span><span class='mb'>" +
+          "<b>突破护送</b><em>小队从最右侧出发穿过尸群，打开牢房，再把平民护回撤离点。</em></span><span class='ma'>›</span></button>" +
+        "<button class='modeRow' data-gmode='chaos'><span class='mi'>03</span><span class='mb'>" +
+          "<b>混沌开局</b><em>十秒后全场身份重排：身边的平民随时可能站起来变成丧尸。</em></span><span class='ma'>›</span></button>" +
+      "</div>" +
+      "<p class='homeWarn'>⚠ 大量单位可能会引起设备卡顿，请量力而行</p>" +
+      "<div class='homeRow'><button id='homeStart' class='primary'>▶ 进入战场</button>" +
+        "<button id='homeLoad'>读取存档</button></div>" +
+      "<div class='homeQuick'><span>第一次玩？</span><button id='homeQuickBtn'>快速开始</button></div>" +
+      "<div class='termSection'>工具</div>" +
+      "<div class='homeRow2'><button id='homeEdit'>地形编辑器</button>" +
+        "<button id='homeUnit'>角色编辑</button>" +
+        "<button id='homeSettings'>设置与画面</button>" +
+        "<button id='homeHelp'>玩法说明</button></div>" +
+      "<div class='termFoot'>进入战斗后，右上角「☰ 菜单」可随时存档/读档、打开装备市场或剧情导演；" +
+      "开战前还可以在「开战设置」里点「编辑地形」改造地图。</div>" +
+    "</div>";
+  var cards = panelEl.querySelectorAll("[data-gmode]");
+  for (var i = 0; i < cards.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        START.gameMode = b.getAttribute("data-gmode");
+        showStartPanel();
+      });
+    })(cards[i]);
+  }
+  var st = document.getElementById("homeStart");
+  if (st) st.addEventListener("click", startWithFade);
+  var ld = document.getElementById("homeLoad");
+  if (ld) ld.addEventListener("click", function () { loadGame(); });
+  var hq = document.getElementById("homeQuickBtn");
+  if (hq) hq.addEventListener("click", function () { OVERLAY_BACK = showHome; showQuickStart(); });
+  var hu = document.getElementById("homeUnit");
+  if (hu) hu.addEventListener("click", function () { OVERLAY_BACK = showHome; showUnitTune(); });
+  var he = document.getElementById("homeEdit");
+  if (he) he.addEventListener("click", function () { startEditor(); });
+  var se = document.getElementById("homeSettings");
+  if (se) se.addEventListener("click", function () { OVERLAY_BACK = showHome; showSettingsPanel(); });
+  var hp = document.getElementById("homeHelp");
+  if (hp) hp.addEventListener("click", function () { OVERLAY_BACK = showHome; showHelp(); });
+}
+function wrapSetupCards() {
+  var body = panelEl.querySelector ? panelEl.querySelector(".startBody") : null;
+  if (!body) return;
+  var kids = [], i;
+  for (i = 0; i < body.children.length; i++) kids.push(body.children[i]);
+  for (i = 0; i < kids.length; i++) {
+    var h = kids[i];
+    if (!h || h.tagName !== "H3") continue;
+    var card = document.createElement("div");
+    card.className = "setupCard";
+    var n = h.nextSibling;
+    body.insertBefore(card, h);
+    card.appendChild(h);
+    while (n) {
+      var nx = n.nextSibling;
+      if (n.nodeType === 1 && n.tagName === "H3") break;
+      card.appendChild(n);
+      n = nx;
+    }
+  }
+}
+function showStartPanel() {
+  setGameChrome(false);
+  setHomeBoard(true);
+  START_PANEL = true;
+  var gm = START.gameMode || "defense";
+  panelEl.className = "";
+  var html = "<h2>开战设置</h2>" +
+    "<div class='startSteps'><b class='on'>01 模式</b><i></i><b>02 参数</b><i></i><b>03 开战</b></div>" +
+    "<p style='margin:-6px 0 8px'>" +
+    "<button id='goHome' style='font-size:12.5px;min-height:30px;padding:4px 12px'>← 返回主页</button> " +
+    "<button id='startReset' style='font-size:12.5px;min-height:30px;padding:4px 12px' " +
+    "title='地图、丧尸规模、英雄模式、支援部队、波次、值守岗位全部拉回预设'>恢复默认地图与设置</button></p>" +
+    "<h3>作战模式</h3><div class='setupModes' id='optMode'>" +
+    "<button data-gmode='defense'" + (gm === "defense" ? " class='on'" : "") + "><b>防线作战</b><em>守住东侧，清空尸潮</em></button>" +
+    "<button data-gmode='escort'" + (gm === "escort" ? " class='on'" : "") + "><b>突破护送</b><em>开门救人，带回撤离点</em></button>" +
+    "<button data-gmode='chaos'" + (gm === "chaos" ? " class='on'" : "") + "><b>混沌开局</b><em>十秒后身份重排</em></button></div>";
+  html += "<div class='startBody'>" +
+    ((gm === "escort") ? escortPanelHtml() : (gm === "chaos" ? chaosPanelHtml() : defensePanelHtml())) +
+    "</div>";
+  panelEl.innerHTML = html;
+  wrapSetupCards();
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  START_PANEL = true;
+  panelEl.className = "";
+  var mbs = panelEl.querySelectorAll("[data-gmode]");
+  for (var mi = 0; mi < mbs.length; mi++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        START.gameMode = b.getAttribute("data-gmode");
+        showStartPanel();
+      });
+    })(mbs[mi]);
+  }
+  var dbs = panelEl.querySelectorAll("[data-diff]");
+  for (var dbi = 0; dbi < dbs.length; dbi++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        applyDifficultyPreset(b.getAttribute("data-diff"));
+        showStartPanel();
+      });
+    })(dbs[dbi]);
+  }
+  var go = document.getElementById("goStart");
+  if (go) go.addEventListener("click", startWithFade);
+  var gh = document.getElementById("goHome");
+  if (gh) gh.addEventListener("click", showHome);
+  var sr = document.getElementById("startReset");
+  if (sr) sr.addEventListener("click", resetStartSettings);
+  if (gm === "escort") {
+    var cr = document.getElementById("civRange");
+    if (cr) cr.addEventListener("input", function () {
+      START.civCount = parseInt(this.value, 10) || 8;
+      trimSquad();
+      refreshEscortPanel();
+    });
+    var buys = panelEl.querySelectorAll("[data-buy]");
+    for (var bi = 0; bi < buys.length; bi++) {
+      (function (b) {
+        b.addEventListener("click", function () {
+          var k = b.getAttribute("data-buy");
+          var dir = parseInt(b.getAttribute("data-dir"), 10);
+          if (!START.squad) START.squad = {};
+          var cur = START.squad[k] | 0;
+          if (dir < 0) { START.squad[k] = Math.max(0, cur - 1); }
+          else {
+            var n2 = START.civCount || 8;
+            var econ2 = n2 * CFG.escort.econPerCivilian;
+            var test = {}, kk;
+            for (kk in START.squad) test[kk] = START.squad[kk];
+            test[k] = cur + 1;
+            if (squadCostOf(test) > econ2) { toast("经济不够了"); return; }
+            START.squad[k] = cur + 1;
+          }
+          refreshEscortPanel();
+        });
+      })(buys[bi]);
+    }
+    var gee = document.getElementById("goEdit");
+    if (gee) gee.addEventListener("click", startEditor);
+    var orfE = document.getElementById("optReinforce");
+    if (orfE) orfE.addEventListener("change", function () { START.reinforce = this.checked; });
+    var oeE = document.getElementById("optEmperor");
+    if (oeE) oeE.addEventListener("change", function () { START.emperor = this.checked; refreshPlacePrices(); });
+    var ofgE = document.getElementById("optFog");
+    if (ofgE) ofgE.addEventListener("change", function () {
+      START.fogMode = this.checked;
+      CFG.fog.on = this.checked;
+    });
+    refreshEscortPanel();
+  } else {
+    bindDefenseGroups();
+    var ge = document.getElementById("goEdit");
+    if (ge) ge.addEventListener("click", startEditor);
+    var op = document.getElementById("optPost");
+    if (op) op.addEventListener("change", function () { START.postDuty = this.checked; });
+    var oh = document.getElementById("optHero");
+    if (oh) oh.addEventListener("change", function () { START.heroMode = this.checked; });
+    var orf = document.getElementById("optReinforce");
+    if (orf) orf.addEventListener("change", function () { START.reinforce = this.checked; });
+    var oe = document.getElementById("optEmperor");
+    if (oe) oe.addEventListener("change", function () { START.emperor = this.checked; refreshPlacePrices(); });
+    var ofg = document.getElementById("optFog");
+    if (ofg) ofg.addEventListener("change", function () {
+      START.fogMode = this.checked;
+      CFG.fog.on = this.checked;
+    });
+    /* 波次模式：四个滑块各自记账，改一个就刷新一次预览 */
+    var bindWave = function (id, key, fallback) {
+      var el = document.getElementById(id);
+      if (!el) return;
+      el.addEventListener("input", function () {
+        START[key] = parseInt(this.value, 10) || fallback;
+        refreshWaveOpts();
+      });
+    };
+    bindWave("wCount", "waveCount", 5);
+    bindWave("wFirst", "waveFirst", 30);
+    bindWave("wGap", "waveGap", 45);
+    bindWave("wSize", "waveSize", 40);
+    bindWave("wBossEvery", "bossEvery", 10);
+    var ows = document.getElementById("optWaveScale");
+    if (ows) ows.addEventListener("change", function () { START.waveScale = this.checked; });
+    var ow = document.getElementById("optWave");
+    if (ow) ow.addEventListener("change", function () { START.waveMode = this.checked; refreshWaveOpts(); });
+    var odb = document.getElementById("optDoubleBoss");
+    if (odb) odb.addEventListener("change", function () { START.doubleBoss = this.checked; });
+    var obw = document.getElementById("optBossWave");
+    if (obw) obw.addEventListener("change", function () {
+      START.bossWave = this.checked;
+      if (this.checked) {
+        START.waveMode = true;
+        var ow2 = document.getElementById("optWave"); if (ow2) ow2.checked = true;
+      }
+      refreshWaveOpts();
+    });
+    refreshWaveOpts();
+    refreshStartPanel();
+  }
+  if (START.gameMode === "chaos") {
+    var cr = $("chaosCivRange");
+    if (cr) cr.addEventListener("input", function () {
+      START.chaosCiv = parseInt(this.value, 10) || CFG.chaos.defCiv;
+      var v = $("chaosCivVal");
+      if (v) v.textContent = START.chaosCiv;
+    });
+    var oh2 = document.getElementById("optHero");
+    if (oh2) oh2.addEventListener("change", function () { START.heroMode = this.checked; });
+    var ge2 = document.getElementById("goEdit");
+    if (ge2) ge2.addEventListener("click", startEditor);
+  }
+}
+/* 按阵营库展开：人类阵营里有的兵种都参与，新兵种不用回来改这里 */
+function expandSquad(map) {
+  var out = [], i, j, k, n;
+  for (i = 0; i < HUMAN_KINDS.length; i++) {
+    k = HUMAN_KINDS[i];
+    n = (map && map[k]) | 0;
+    for (j = 0; j < n; j++) out.push(k);
+  }
+  return out;
+}
+function squadCostOf(map) {
+  /* 直接按编成表累加：兵种库加人之后这里不用跟着改名单 */
+  var total = 0, k;
+  for (k in (map || {})) {
+    if (!map[k]) continue;
+    total += (map[k] | 0) * (CFG.econ.cost[k] || 0);
+  }
+  return total;
+}
+/* 把玩家在编辑器里改过的地形/单位套用到新开的一局上 */
+/* 把当前单位布置存成蓝图 */
+function snapshotEditUnits() {
+  EDIT.units = [];
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    if (u.dead) continue;
+    EDIT.units.push({ kind: u.kind, x: u.x, y: u.y });
+  }
+}
+/* 按蓝图重建单位（放在 buildScenario 之后，覆盖默认生成的单位） */
+function applyEditUnits() {
+  if (!EDIT.unitsEdited) return;
+  W.units = [];
+  W.humanList.length = 0;
+  if (!EDIT.units) return;      /* 玩家把单位清空了：那就真的是空场景 */
+  for (var i = 0; i < EDIT.units.length; i++) {
+    var b = EDIT.units[i];
+    addUnit(b.kind, b.x, b.y);
+  }
+}
+/* 把编辑器里画的行进路线绑定到场上单位。
+   框选范围里的单位继承这条路线；玩家没框范围时，默认取路线起点附近的人。
+   每次重建场景之后调用一次 */
+function assignRoutes() {
+  var L = activeLevel();
+  W.routes = [];
+  if (!L || !L.routes || !L.routes.length) return;
+  var i, r, u, rts = L.routes;
+  for (r = 0; r < rts.length; r++) {
+    var rt = rts[r];
+    if (!rt.pts || rt.pts.length < 2) continue;
+    W.routes.push({ pts: rt.pts, color: rt.color });
+    var idx = W.routes.length - 1;
+    var head = rt.pts[0];
+    var box = rt.rect || { x: head.x - 300, y: head.y - 300, w: 600, h: 600 };
+    for (i = 0; i < W.units.length; i++) {
+      u = W.units[i];
+      if (u.dead || !isHuman(u) || isZombieSide(u)) continue;
+      if (u.x >= box.x && u.x <= box.x + box.w && u.y >= box.y && u.y <= box.y + box.h) {
+        u.routeIdx = idx; u.routePt = 0;
+      }
+    }
+  }
+}
+/* 回到"还没开打"的干净场景：丢掉这一局的全部对局状态（残局单位、子弹、击杀、胜负标记），
+   只保留玩家手动编辑过的地形、门与单位蓝图。
+   重开、以及进入地形编辑之前都必须走这一步，
+   否则编辑器里看到的、以及下一局开的，都会是上一局的残局 */
+function resetForSetup() {
+  var keepObs = EDIT.touched ? W.obstacles : null;
+  var keepDoors = EDIT.touched ? W.doors : null;
+  var keepArt = EDIT.touched ? (W.wallArt || []).slice() : null;
+  GAME_MODE = START.gameMode || "defense";
+  CFG.hero.enabled = !!START.heroMode;
+  LAST_ZOMBIE_COUNT = CFG.start.baseZombies;
+  if (GAME_MODE === "escort") {
+    LAST_CIV_COUNT = START.civCount || 8;
+    LAST_SQUAD = expandSquad(START.squad);
+    if (!LAST_SQUAD.length) LAST_SQUAD = ["rifle"];
+    buildScenario(undefined, 0);
+  } else {
+    buildScenario(undefined, LAST_ZOMBIE_COUNT);
+  }
+  restoreEdits(keepObs, keepDoors, null, keepArt);
+  applyEditUnits();
+  assignRoutes();
+  W.over = false; W.result = "";
+  W.paused = true;
+  UI.shownResult = false;
+  UI.peek = null;
+  centerCamera();
+}
+function restoreEdits(keepObs, keepDoors, keepUnits, keepArt) {
+  var i2, u2;
+  if (keepArt) W.wallArt = keepArt;
+  if (keepObs) {
+    W.obstacles = keepObs;
+    if (keepDoors) W.doors = keepDoors;
+  }
+  if (keepUnits) {
+    var maxId = 0;
+    for (i2 = 0; i2 < keepUnits.length; i2++) {
+      u2 = keepUnits[i2];
+      u2.dead = false;
+      u2.target = null; u2.nzCache = null; u2.path = []; u2.guardOf = null;
+      if (u2.guards) u2.guards.length = 0;
+      u2.post = null; u2.vx = 0; u2.vy = 0; u2.ax = 0; u2.ay = 0;
+      u2.infectLocked = false; u2.infectT = 0; u2.incubT = 0; u2.fadeT = 0;
+      u2.reloading = false; u2.reloadT = 0; u2.mag = u2.magSize;
+      u2.penned = false;
+      if (u2.id > maxId) maxId = u2.id;
+    }
+    W.units = keepUnits;
+    W.nextId = maxId + 1;
+  }
+  /* 封锁大门可能被换掉了，重新认一遍 */
+  if (W.mode === "escort") {
+    var found = null;
+    for (i2 = 0; i2 < W.doors.length; i2++) if (W.doors[i2].prison) { found = W.doors[i2]; break; }
+    if (!found) {
+      /* 兜底：门记录丢了就从实体障碍里重建，保证护送流程永远有个可解锁的大门 */
+      for (i2 = 0; i2 < W.obstacles.length; i2++) {
+        var po = W.obstacles[i2];
+        if (!po.prison) continue;
+        found = { x: po.x, y: po.y, w: po.w, h: po.h, vertical: po.h > po.w, prison: true };
+        W.doors.push(found);
+        break;
+      }
+    }
+    W.prisonDoor = found;
+  }
+  if (keepObs || keepUnits) editRebuild();
+}
+var FADE_BUSY = false;
+function startWithFade() {
+  if (START.bossWave) START.waveMode = true;
+  if (FADE_BUSY) return;
+  if (REDUCE_MOTION) { hideOverlay(); beginGame(); return; }
+  var f = document.getElementById("sceneFade");
+  FADE_BUSY = true;
+  if (f) f.className = "on";
+  setTimeout(function () {
+    try {
+      hideOverlay();
+      beginGame();
+    } catch (err) {
+      try { console.error(err); } catch (e2) {}
+      if (typeof toast === "function") toast("进入战场失败：" + (err && err.message ? err.message : "未知错误"));
+    } finally {
+      setTimeout(function () {
+        if (f) f.className = "";
+        FADE_BUSY = false;
+      }, 40);
+    }
+  }, 160);
+}
+function beginGame() {
+  HOME_PANEL = false; START_PANEL = false;
+  setGameChrome(true);
+  setHomeBoard(false);
+  SFX.resume();
+  /* 第一次玩：开局后浮出三步引导（看过或点跳过就记下来，以后不再出现） */
+  if (!tutorSeen()) {
+    setTimeout(function () { showTutor(0); }, 700);
+  }
+  LAST_ZOMBIE_COUNT = startZombieCount();
+  /* 波次模式下开局一只都不铺，全交给 stepWaves 分批送来 */
+  if (START.waveMode && START.gameMode !== "escort") LAST_ZOMBIE_COUNT = 0;
+  CFG.postDuty = !!START.postDuty;
+  CFG.hero.enabled = !!START.heroMode;
+  GAME_MODE = START.gameMode || "defense";
+  /* 战争迷雾是实验性功能：防线模式默认关，护送模式默认开（护送更依赖视野） */
+  if (START.fogMode === undefined) CFG.fog.on = (GAME_MODE === "escort");
+  W.waves = null;   /* 上一局的波次进度不能残留到这一局，否则会挡住/go 掉胜负判定 */
+  hideOverlay();
+  if (GAME_MODE === "escort") {
+    trimSquad();
+    LAST_CIV_COUNT = START.civCount || 8;
+    LAST_SQUAD = expandSquad(START.squad);
+    if (!LAST_SQUAD.length) LAST_SQUAD = ["rifle"];
+    W.squadSize = LAST_SQUAD.length;   /* 兵力系数按这个缩放护送模式的刷怪量 */
+    var eObs = EDIT.touched ? W.obstacles : null;
+    var eDoors = EDIT.touched ? W.doors : null;
+    buildScenario(undefined, 0);
+    restoreEdits(eObs, eDoors, null);
+    applyEditUnits();
+    assignRoutes();
+    if (!W.prisonDoor) { toast("地图里没有封锁大门，无法进行护送！请恢复默认地形"); }
+    centerCamera();
+    UI.shownResult = false; UI.selected = null;
+    var pb2 = $("bPause"), sb3 = $("bSpeed");
+    if (pb2) { pb2.textContent = "暂停"; pb2.className = ""; }
+    if (sb3) { sb3.textContent = "1×"; sb3.className = ""; }
+    toast("护送模式：营救 " + LAST_CIV_COUNT + " 名平民，小队 " + LAST_SQUAD.length + " 人");
+    if (START.reinforce) startReinforce();
+    /* 联机中重开：把新种子推给对面，让他跟着重开，而不是各跑各的 */
+    if (NET.on) { LOCK.reset(); netSendSync(); }
+    return;
+  }
+  /* 玩家在开局前编辑过的地形与单位都要保留下来 */
+  var keepObs = EDIT.touched ? W.obstacles : null;
+  var keepDoors = EDIT.touched ? W.doors : null;
+  buildScenario(undefined, LAST_ZOMBIE_COUNT);
+  restoreEdits(keepObs, keepDoors, null);
+  applyEditUnits();
+  /* 清空地图后直接开局会让场上零丧尸，开局即判胜；这里补回基础尸潮 */
+  if (!START.waveMode && !W.units.some(function (u) { return !u.dead && isZombieSide(u); })) {
+    var _sz = W.spawn || mapSpawnZone(CFG.mapPreset);
+    for (var _zi = 0; _zi < 12; _zi++) {
+      addUnit("zombie", _sz.x + 40 + (_zi % 4) * 34, _sz.y + 40 + Math.floor(_zi / 4) * 34);
+    }
+    toast("地图没有丧尸，已补回 12 只基础尸潮");
+  }
+  assignRoutes();
+  centerCamera();
+  UI.shownResult = false; UI.selected = null;
+  var pb = $("bPause"), sb = $("bSpeed");
+  if (pb) { pb.textContent = "暂停"; pb.className = ""; }
+  if (sb) { sb.textContent = "1×"; sb.className = ""; }
+  toast(START.waveMode ? ("开局：共 " + (START.waveCount | 0) + " 波尸潮，首波 " + (START.waveFirst | 0) + " 秒后来袭")
+    : ("开局：丧尸 " + LAST_ZOMBIE_COUNT + " 只"));
+  if (START.bossWave) START.waveMode = true;
+  if (START.reinforce) startReinforce();
+  if (START.waveMode) startWaves();
+  /* 联机中重开：把新种子推给对面，让他跟着重开 */
+  if (NET.on) { LOCK.reset(); netSendSync(); }
+}
+function syncSpeedBtn() {
+  var b = $("bSpeed");
+  if (!b) return;
+  b.textContent = W.speed + "×";
+  /* 慢放用另一套配色，一眼和加速区分开 */
+  b.className = W.speed > 1 ? "on" : (W.speed < 1 ? "slow" : "");
+}
+/* ---------- 指针 / 触摸 ---------- */
+var ptrs = {}, dragRef = null, pinchRef = null, multiTouch = false;
+function localPos(e) {
+  var r = CANVAS.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+function onDown(e) {
+  if (overlayEl.className === "show" && !EDIT.active) return;
+  var p = localPos(e);
+  /* 指挥模式优先接管左键：还没选人就是拉框，已经选好就是下达目标点 */
+  if (CMD.on) {
+    if (CMD.units.length) { cmdIssue(s2wx(p.x), s2wy(p.y)); return; }
+    CMD.busy = true;
+    CMD.rx = p.x; CMD.ry = p.y; CMD.tx = p.x; CMD.ty = p.y;
+    return;
+  }
+  ptrs[e.pointerId] = p;
+  var n = 0, k;
+  for (k in ptrs) n++;
+  /* 地形编辑：左键/单指用于绘制，右键或双指才用于平移 */
+  /* 平移工具下把单指让给地图拖动，否则手机上永远拖不动画面 */
+  if (EDIT.active && n === 1 && e.button !== 2 && EDIT.tool !== "pan") {
+    UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true;
+    editPointerDown(s2wx(p.x), s2wy(p.y));
+    return;
+  }
+  /* 玩家操控：鼠标左键留给射击与选人（右键仍可拖动地图）；触摸的单指变成左右两个摇杆 */
+  if (PLAYER.on && !EDIT.active) {
+    /* 还没接管任何人时，这一下点击是"选人"而不是摇杆/开火，
+       否则手机上一按就冒出摇杆，永远选不中角色 */
+    if (!playerUnitValid()) {
+      if (n === 1 && (e.pointerType === "touch" || e.button === 0)) {
+        var hk = pickPeekUnit(p.x, p.y);
+        UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true;
+        if (hk) {
+          UI.peek = hk;
+          toast("已选中：" + CFG.unit[hk.kind].name + "，再点「操控」即可接管他");
+        } else UI.peek = null;
+        return;
+      }
+    }
+    if (e.pointerType === "touch") {
+      /* 左半屏是走位摇杆、右半屏是瞄准开火摇杆，各自认领一根手指。
+         不能再用 n === 1 判断，那样第二根手指按下去时永远建不出第二根摇杆，
+         手机上就变成"要么能走、要么能打"，二选一 */
+      UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true;
+      if (p.x < VW / 2) {
+        if (!PLAYER.stickL) {
+          PLAYER.stickL = { id: e.pointerId, ox: p.x, oy: p.y, x: p.x, y: p.y,
+            nx: 0, ny: 0, mag: 0, kx: p.x, ky: p.y };
+        }
+      } else if (!PLAYER.stickR) {
+        PLAYER.stickR = { id: e.pointerId, ox: p.x, oy: p.y, x: p.x, y: p.y,
+          nx: 0, ny: 0, mag: 0, kx: p.x, ky: p.y };
+      }
+      return;
+    }
+    if (e.pointerType !== "touch" && e.button === 0) {
+      PLAYER.pressing = true; PLAYER.pressT = 0;
+      /* 半自动：这一下点击立刻排一发，不等射速冷却 */
+      if (PLAYER.fireMode === 1) PLAYER.semiShot = 1;
+      UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true;
+      return;
+    }
+  }
+  if (n === 1) {
+    dragRef = { x: p.x, y: p.y, camX: CAM.x, camY: CAM.y, moved: false, id: e.pointerId };
+    pointerMoved = false;
+  } else if (n === 2) {
+    var ks = [], kk;
+    for (kk in ptrs) ks.push(ptrs[kk]);
+    multiTouch = true;
+    pinchRef = { d: Math.max(1, dist(ks[0].x, ks[0].y, ks[1].x, ks[1].y)), zoom: CAM.zoom,
+      mx: (ks[0].x + ks[1].x) / 2, my: (ks[0].y + ks[1].y) / 2, camX: CAM.x, camY: CAM.y };
+  }
+  UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true;
+}
+var pointerMoved = false;
+function onMove(e) {
+  var p = localPos(e);
+  UI.pointer.x = p.x; UI.pointer.y = p.y; UI.pointer.in = true; UI.pointer.mouse = (e.pointerType !== "touch");
+  if (ptrs[e.pointerId]) ptrs[e.pointerId] = p;
+  if (CMD.on && CMD.busy) { CMD.tx = p.x; CMD.ty = p.y; return; }
+  var n = 0, k;
+  for (k in ptrs) n++;
+  if (EDIT.active) editPointerMove(s2wx(p.x), s2wy(p.y));
+  if (PLAYER.on && !EDIT.active) {
+    if (PLAYER.stickL && PLAYER.stickL.id === e.pointerId) { stickUpdate(PLAYER.stickL, p.x, p.y); return; }
+    if (PLAYER.stickR && PLAYER.stickR.id === e.pointerId) { stickUpdate(PLAYER.stickR, p.x, p.y); return; }
+  }
+  if (n >= 2 && pinchRef) {
+    var ks = [], kk;
+    for (kk in ptrs) ks.push(ptrs[kk]);
+    var d = Math.max(1, dist(ks[0].x, ks[0].y, ks[1].x, ks[1].y));
+    ZOOM_TO = null;   /* 捏合是直接跟手，插值会和手指抢控制权 */
+    var nz = clamp(pinchRef.zoom * (d / pinchRef.d), CAM.minZ, CAM.maxZ);
+    var wx = pinchRef.camX + (pinchRef.mx - VW / 2) / CAM.zoom;
+    var wy = pinchRef.camY + (pinchRef.my - VH / 2) / CAM.zoom;
+    CAM.zoom = nz;
+    CAM.x = wx - (pinchRef.mx - VW / 2) / nz;
+    CAM.y = wy - (pinchRef.my - VH / 2) / nz;
+    pointerMoved = true;
+  } else if (dragRef && n === 1 && !CAM_FOCUS) {
+    var dx = p.x - dragRef.x, dy = p.y - dragRef.y;
+    if (Math.abs(dx) > 6 || Math.abs(dy) > 6) { dragRef.moved = true; pointerMoved = true; PLAYER.camHoldT = CFG.playerCam.hold; }
+    CAM.x = dragRef.camX - dx / CAM.zoom;
+    CAM.y = dragRef.camY - dy / CAM.zoom;
+  }
+}
+function onUp(e) {
+  var p = localPos(e);
+  if (CMD.on && CMD.busy) {
+    CMD.busy = false;
+    cmdSelect(CMD.rx, CMD.ry, CMD.tx, CMD.ty);
+    delete ptrs[e.pointerId];
+    return;
+  }
+  var n = 0, k;
+  for (k in ptrs) n++;
+  if (PLAYER.on && !EDIT.active) {
+    if (PLAYER.stickL && PLAYER.stickL.id === e.pointerId) { PLAYER.stickL = null; delete ptrs[e.pointerId]; return; }
+    if (PLAYER.stickR && PLAYER.stickR.id === e.pointerId) { PLAYER.stickR = null; PLAYER.firing = false; delete ptrs[e.pointerId]; return; }
+    if (PLAYER.pressing && e.button === 0) {
+      PLAYER.pressing = false;
+      var wasFiring = PLAYER.firing;
+      PLAYER.firing = false;
+      /* 没开过火、也没拖动过地图的短按，才算"点选角色" */
+      if (!wasFiring && PLAYER.pressT < 0.35 && !pointerMoved) pickPlayerUnit(p.x, p.y);
+      PLAYER.pressT = 0;
+      delete ptrs[e.pointerId];
+      dragRef = null;
+      return;
+    }
+  }
+  if (EDIT.active) {
+    if (n === 1 && e.button !== 2 && !multiTouch) editPointerUp(s2wx(p.x), s2wy(p.y));
+    delete ptrs[e.pointerId];
+    var leftE = 0;
+    for (k in ptrs) leftE++;
+    if (leftE < 2) pinchRef = null;
+    if (leftE === 0) { dragRef = null; pointerMoved = false; multiTouch = false; }
+    return;
+  }
+  if (n === 1 && dragRef && !dragRef.moved && !pointerMoved && !multiTouch && e.button !== 2) {
+    var wx = s2wx(p.x), wy = s2wy(p.y);
+    /* 剧情模式优先接管这一下点击：选人 / 或给选中的人指定目标 */
+    if (DIRECTOR.on) { directorClickAt(wx, wy); delete ptrs[e.pointerId]; dragRef = null; return; }
+    /* 指名升格优先：这一下点击是去挑人，不是去投放 */
+    if (UI.promotePick) { tryPromoteAt(wx, wy); delete ptrs[e.pointerId]; dragRef = null; return; }
+    if (UI.selected === "militia") { tryMilitiaConvertAt(wx, wy); delete ptrs[e.pointerId]; dragRef = null; return; }
+    if (UI.selected) doPlace(UI.selected, wx, wy, batchCount());
+    else {
+      UI.selected = null;
+      /* 点角色就看他的状态，不需要先开操控；点空地就取消查看 */
+      var pkHit = pickPeekUnit(p.x, p.y);
+      var hadPeek = !!UI.peek;
+      UI.peek = pkHit;      /* 点到空地就是 null，空白处一点即退出查看 */
+      if (pkHit) toast("已选中：" + CFG.unit[pkHit.kind].name + "，点「操控」即可接管他");
+      else if (hadPeek) toast("已取消查看");
+    }
+  }
+  delete ptrs[e.pointerId];
+  var left = 0;
+  for (k in ptrs) left++;
+  if (left < 2) pinchRef = null;
+  if (left === 0) { dragRef = null; pointerMoved = false; multiTouch = false; }
+}
+function onWheel(e) {
+  e.preventDefault();
+  var p = localPos(e);
+  /* 锚点记在鼠标上：缩放过程中这一点下面的世界坐标始终保持不动 */
+  ZOOM_ANCHOR.x = p.x;
+  ZOOM_ANCHOR.y = p.y;
+  var f = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+  var base = ZOOM_TO === null ? CAM.zoom : ZOOM_TO;
+  ZOOM_TO = clamp(base * f, CAM.minZ, CAM.maxZ);
+}
+/* 把 CAM.zoom 平滑地推向 ZOOM_TO，同时修正镜头位置以守住锚点 */
+function stepZoom(dt) {
+  if (ZOOM_TO === null) return;
+  var before = CAM.zoom;
+  if (Math.abs(ZOOM_TO - before) < 1e-4) { CAM.zoom = ZOOM_TO; ZOOM_TO = null; return; }
+  var k = 1 - Math.pow(1e-6, dt);      /* 每帧收掉约两成，约 0.15 秒到位八成 */
+  var z = before + (ZOOM_TO - before) * k;
+  if (Math.abs(z - ZOOM_TO) < 0.0008) z = ZOOM_TO;
+  var ax = ZOOM_ANCHOR.x - VW / 2, ay = ZOOM_ANCHOR.y - VH / 2;
+  CAM.zoom = z;
+  CAM.x += ax * (1 / before - 1 / z);
+  CAM.y += ay * (1 / before - 1 / z);
+  CAM.x = clamp(CAM.x, 0, CFG.world.w);
+  CAM.y = clamp(CAM.y, 0, CFG.world.h);
+  if (z === ZOOM_TO) ZOOM_TO = null;
+}
+function handlePanKey(dt) {
+  /* 接管角色期间 WASD 属于角色，镜头交给 followPlayerCamera */
+  if (playerUnitValid()) return;
+  var sp = 900 / CAM.zoom * dt;
+  if (keyHeld("up")) CAM.y -= sp;
+  if (keyHeld("down")) CAM.y += sp;
+  if (keyHeld("left")) CAM.x -= sp;
+  if (keyHeld("right")) CAM.x += sp;
+  CAM.x = clamp(CAM.x, 0, CFG.world.w);
+  CAM.y = clamp(CAM.y, 0, CFG.world.h);
+}
+/* 出错就把话说在屏幕上，别让玩家对着一片没反应的界面猜 */
+var _fatalTimer = null, _fatalCount = 0, _fatalLastAt = 0;
+function showFatal(msg) {
+  try {
+    var d = document.getElementById("fatalBox");
+    if (!d) {
+      d = document.createElement("div");
+      d.id = "fatalBox";
+      /* pointer-events:none 保证它永远不会挡住底栏按钮；
+         只显示最新一条、限高两行、6 秒后自动收起 */
+      d.style.cssText = "position:fixed;left:8px;right:8px;bottom:8px;z-index:9999;" +
+        "pointer-events:none;background:rgba(120,20,20,.95);color:#fff;padding:8px 10px;" +
+        "border-radius:8px;font:12px/1.5 monospace;max-height:84px;overflow:hidden;" +
+        "white-space:pre-wrap";
+      document.body.appendChild(d);
+    }
+    var now = Date.now();
+    if (now - _fatalLastAt < 1500) _fatalCount++;
+    else { _fatalCount = 1; _fatalLastAt = now; }
+    var s = String(msg || "脚本错误").slice(0, 300);
+    d.textContent = (_fatalCount > 1 ? "错误 ×" + _fatalCount + "  " : "") + s;
+    d.style.display = "block";
+    if (_fatalTimer) clearTimeout(_fatalTimer);
+    _fatalTimer = setTimeout(function () { try { d.style.display = "none"; } catch (e) {} }, 6000);
+  } catch (e) {}
+}
+if (typeof window !== "undefined" && window.addEventListener) {
+  window.addEventListener("error", function (e) {
+    showFatal((e && e.message ? e.message : "脚本错误") + "  @" + (e && e.lineno ? e.lineno : "?"));
+  });
+}
+function bindUI() {
+  /* 菜单绑定放在最前面：后面任何一步初始化出错，这个按钮也得能用 */
+  /* 顶部菜单：点 ☰ 展开，点里面任一按钮或点别处自动收起 */
+(function () {
+  var mv = $("menuVer");
+  if (mv) mv.textContent = "v" + GAME_VERSION;
+  var mb = $("bMenu"), mp = $("menuPop");
+  if (!mb || !mp) return;
+  /* 菜单从顶栏移出：手机顶栏横向滚动 + 磨砂会把绝对定位的子菜单裁掉 */
+  if (mp.parentNode !== document.body) document.body.appendChild(mp);
+  function insideMenu(el) {
+    var n = 0;
+    while (el && n++ < 12) { if (el === mp) return true; el = el.parentNode; }
+    return false;
+  }
+  mb.addEventListener("click", function (e) {
+    if (e && e.stopPropagation) e.stopPropagation();
+    mp.className = (mp.className === "show") ? "" : "show";
+    if (mp.className === "show") fitMenuHeight();
+  });
+  /* 按菜单实际的顶边到屏幕底边来限制高度，比写死减 76px 靠谱 */
+  function fitMenuHeight() {
+    var r = mp.getBoundingClientRect();
+    var vv = window.visualViewport;
+    var vis = (vv && vv.height) || window.innerHeight || 0;
+    var avail = vis - r.top - 12;
+    mp.style.maxHeight = Math.max(140, avail) + "px";
+  }
+  window.addEventListener("resize", function () {
+    if (mp.className === "show") fitMenuHeight();
+  });
+  mp.addEventListener("click", function (e) {
+    var t = e && e.target;
+    if (!t) return;
+    if ((t.tagName || "").toLowerCase() === "button") mp.className = "";
+  });
+  if (document.addEventListener) {
+    document.addEventListener("click", function (e) {
+      if (mp.className !== "show") return;
+      if (insideMenu(e && e.target) || (e && e.target === mb)) return;
+      mp.className = "";
+    });
+  }
+})();
+  statEl = $("stat"); overlayEl = $("overlay"); panelEl = $("panel");
+  /* 下拉树先填，但它绝不能连累后面的事件绑定，一旦这里抛错，
+     菜单、暂停这些按钮就全都点不动了，而且表面上什么异常都看不到 */
+  try {
+    refreshUnitSelects();
+  } catch (e) {
+    showFatal("下拉框初始化失败: " + (e && e.message ? e.message : e));
+  }
+  toastEl = document.createElement("div");
+  toastEl.style.cssText = "position:absolute;left:50%;bottom:" + ((BOTBAR_H || 0) + 22) + "px;transform:translateX(-50%);z-index:30;" +
+    "background:rgba(20,26,42,.94);border:1px solid #33415f;border-radius:8px;padding:7px 14px;" +
+    "font-size:13px;opacity:0;transition:opacity .25s;pointer-events:none";
+  document.body.appendChild(toastEl);
+  CANVAS.addEventListener("pointerdown", onDown);
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+  bindDirectorBar();
+  window.addEventListener("blur", function () { UI.pointer.in = false; });
+  CANVAS.addEventListener("wheel", onWheel, { passive: false });
+  CANVAS.addEventListener("contextmenu", function (e) { e.preventDefault(); });
+  refreshPlacePrices();
+  var i, psel = $("placeSel");
+  if (psel) psel.addEventListener("change", function () { selectPlace(this.value); });
+  $("bPause").addEventListener("click", function () { setPausedState(!W.paused, false); });
+
+  /* 速度档位：0.25 → 0.75 → 1 → 2 → 4 → 循环 */
+  var SPEEDS = [0.25, 0.75, 1, 2, 4];
+  $("bSpeed").addEventListener("click", function () {
+    var idx = SPEEDS.indexOf(W.speed);
+    W.speed = SPEEDS[(idx + 1) % SPEEDS.length];
+    syncSpeedBtn();
+  });
+
+$("bSave").addEventListener("click", function () { saveGame(false); });
+  $("bLoad").addEventListener("click", function () { loadGame(); });
+  $("bExport").addEventListener("click", exportSave);
+  var bCodeEl = $("bCode");
+  if (bCodeEl) bCodeEl.addEventListener("click", showSaveCodePanel);
+  $("bImport").addEventListener("click", function () { $("fileIn").click(); });
+  $("fileIn").addEventListener("change", function (ev) {
+    var f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    var fr = new FileReader();
+    fr.onload = function () {
+      try { deserialize(JSON.parse(String(fr.result))); hideOverlay(); syncSpeedBtn(); toast("已导入存档"); }
+      catch (err) { toast("导入失败：" + err.message); }
+    };
+    fr.readAsText(f);
+    ev.target.value = "";
+  });
+  $("bHelp").addEventListener("click", showHelp);
+  $("bKeysHelp").addEventListener("click", function () { showKeyHelp("kbm"); });
+  var dsel = $("debugSel");
+  if (dsel) dsel.addEventListener("change", function () {
+    UI.debugOnly = this.value;
+    if (this.value && !UI.debug) { UI.debug = true; var b = $("bDebug"); if (b) b.className = "on"; }
+    if (!this.value && UI.debug) { var b2 = $("bDebug"); if (b2) b2.className = "on"; }
+  });
+  $("bDebug").addEventListener("click", function () {
+    UI.debug = !UI.debug;
+    this.className = UI.debug ? "on" : "";
+  });
+  /* 地形编辑器 */
+  var ets = document.querySelectorAll(".etool");
+  for (i = 0; i < ets.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        EDIT.tool = b.getAttribute("data-tool");
+        EDIT.hasCorner = false; EDIT.dragging = false;
+        syncEditButtons();
+      });
+    })(ets[i]);
+  }
+  /* 编辑栏的分组标签 */
+  var gtabs = document.querySelectorAll("[data-gtab]");
+  for (i = 0; i < gtabs.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () { setEditGroup(b.getAttribute("data-gtab")); });
+    })(gtabs[i]);
+  }
+  var ems = document.querySelectorAll(".emode");
+  for (i = 0; i < ems.length; i++) {
+    (function (b) {
+      b.addEventListener("click", function () {
+        EDIT.mode = b.getAttribute("data-mode");
+        EDIT.hasCorner = false; EDIT.dragging = false;
+        syncEditButtons();
+      });
+    })(ems[i]);
+  }
+  $("eNewRoute").addEventListener("click", function () {
+    EDIT.routeCur = -1;
+    toast("下一笔会开始一条新的路线");
+  });
+  $("eClearRoute").addEventListener("click", function () {
+    if (EDIT.level) EDIT.level.routes = [];
+    EDIT.routeCur = -1;
+    EDIT.levelTouched = true;
+    toast("已清空全部行进路线");
+  });
+  $("eUndo").addEventListener("click", editUndo);
+  $("eRedo").addEventListener("click", editRedo);
+  var gd = $("genDifficulty");
+  if (gd) gd.addEventListener("change", function () { EDIT.genDifficulty = this.value; });
+  var fixBtn = $("eGenFix");
+  if (fixBtn) fixBtn.addEventListener("click", function () {
+    editPushUndo();
+    var info = generateAndRepair(EDIT.lastGenMode || "rooms");
+    EDIT.touched = true;
+    editRebuild();
+    toast("生成+修复：连通 " + Math.round(info.mainPct * 100) + "% · 密封 " + info.sealed +
+      " · 修复 " + info.repaired + " · 评分 " + info.score);
+  });
+  var prefabBtn = $("eGenPrefab");
+  if (prefabBtn) prefabBtn.addEventListener("click", function () {
+    editPushUndo();
+    EDIT.lastGenMode = "prefab";
+    var info = generatePrefabTerrain();
+    EDIT.touched = true;
+    editRebuild();
+    toast("预制件：已生成 " + info.rooms + " 座建筑 · 连通 " + Math.round(info.mainPct * 100) +
+      "% · 评分 " + info.score + " · 种子 " + info.seed);
+  });
+  var bspBtn = $("eGenBsp");
+  if (bspBtn) bspBtn.addEventListener("click", function () {
+    editPushUndo();
+    EDIT.lastGenMode = "bsp";
+    var info = generateBspTerrain();
+    EDIT.touched = true;
+    editRebuild();
+    toast("BSP：已生成 " + info.rooms + " 座建筑 · 连通 " + Math.round(info.mainPct * 100) +
+      "% · 评分 " + info.score + " · 种子 " + info.seed);
+  });
+  var genBtn = $("eGen");
+  if (genBtn) genBtn.addEventListener("click", function () {
+    editPushUndo();
+    EDIT.lastGenMode = "rooms";
+    var info = generateTerrain();
+    EDIT.touched = true;
+    editRebuild();
+    toast("已生成 " + info.rooms + " 座建筑 · 连通 " + Math.round(info.mainPct * 100) +
+      "% · 密封 " + info.sealed + " · 评分 " + info.score + " · 种子 " + info.seed);
+  });
+  var tc = $("tileColor");
+  if (tc) tc.addEventListener("input", function () { EDIT.tileColor = this.value; EDIT.colorSet = true; });
+  var te = $("tileEffect");
+  if (te) te.addEventListener("change", function () { EDIT.tileEffect = this.value; });
+  var ts = $("tileSolid");
+  if (ts) ts.addEventListener("change", function () { EDIT.tileSolid = this.value === "1"; });
+  var tp = $("tilePierce");
+  if (tp) tp.addEventListener("change", function () { EDIT.tilePierce = this.value === "1"; });
+  var th = $("tileHp");
+  if (th) th.addEventListener("change", function () { EDIT.tileHp = parseInt(this.value, 10) || 0; });
+  var tpat = $("tilePattern");
+  if (tpat) tpat.addEventListener("change", function () { EDIT.tilePattern = this.value; });
+  var anBtn = $("eAnalyze");
+  if (anBtn) anBtn.addEventListener("click", showMapAnalysis);
+
+  var secHeads = document.querySelectorAll(".esecHead");
+  for (var sh = 0; sh < secHeads.length; sh++) {
+    secHeads[sh].addEventListener("click", function () {
+      var body = this.nextElementSibling;
+      if (!body) return;
+      var closed = body.className.indexOf("collapsed") >= 0;
+      body.className = closed ? "esecBody" : "esecBody collapsed";
+      var names = { mode: "绘制方式", edit: "编辑块", unit: "单位块", level: "关卡要素块", other: "其他块", gen: "地形分析与生成" };
+      var base = names[this.getAttribute("data-sec")] || "功能区";
+      this.textContent = base + (closed ? " ▴" : " ▾");
+    });
+  }
+
+  var snapBtn = $("eSnapMode");
+  if (snapBtn) snapBtn.addEventListener("click", function () {
+    var order = ["4", "8", "16", "32", "64", "96", "128", "free"];
+    var i = order.indexOf(EDIT.snapMode);
+    EDIT.snapMode = order[(i + 1) % order.length];
+    syncSnapBtn();
+    toast(EDIT.snapMode === "free" ? "吸附已关闭：完全自由放置" : "吸附：" + EDIT.snapMode + " 像素");
+  });
+  $("eClear").addEventListener("click", function () {
+    editPushUndo();
+    W.obstacles = []; W.doors = []; W.units = [];
+    EDIT.touched = true;
+    EDIT.unitsEdited = true;
+    editRebuild();
+    toast("已清空地形与单位");
+  });
+  $("eReset").addEventListener("click", function () {
+    EDIT.touched = false;
+    EDIT.unitsEdited = false;
+    EDIT.undo.length = 0;
+    resetForSetup();
+    editRebuild();
+    toast("已恢复默认地图与单位");
+  });
+  $("eDone").addEventListener("click", finishEditor);
+  var ewa = $("eWallArt");
+  if (ewa) ewa.addEventListener("click", waOpen);
+  var et = $("eDoneTop");
+  if (et) et.addEventListener("click", finishEditor);
+  var dm = $("eDoneMobile");
+  if (dm) dm.addEventListener("click", finishEditor);
+  var dr = $("eDrawer");
+  if (dr) dr.addEventListener("click", function () {
+    var bar = $("editbar");
+    if (!bar) return;
+    var open = bar.className.indexOf("open") >= 0;
+    bar.className = "bar compact" + (open ? "" : " open");
+    dr.textContent = open ? "工具 ▾" : "工具 ▴";
+  });
+  $("eBatchMinus").addEventListener("click", function () { setBatch(BATCH_IDX - 1); });
+  $("eBatchPlus").addEventListener("click", function () { setBatch(BATCH_IDX + 1); });
+  $("editUnitSel").addEventListener("change", function () {
+    /* 选回占位项就切回地形工具，免得"取消选择"变成没反应 */
+    EDIT.tool = this.value || "house";
+    EDIT.hasCorner = false; EDIT.dragging = false;
+    syncEditButtons();
+  });
+  $("bControl").addEventListener("click", togglePlayerControl);
+  $("bFull").addEventListener("click", toggleFullscreen);
+  $("mReload").addEventListener("click", manualReload);
+  $("mCtrl").addEventListener("click", function () { $("bControl").click(); });
+  $("mFull").addEventListener("click", toggleFullscreen);
+  $("mMenu").addEventListener("click", function () { $("bMenu").click(); });
+  var mpo = $("mPounce");
+  if (mpo) mpo.addEventListener("pointerdown", function (e) {
+    e.preventDefault(); e.stopPropagation(); playerPounce();
+  });
+  var ma = $("mAttack");
+  if (ma) {
+    ma.addEventListener("pointerdown", function (e) { e.preventDefault(); PLAYER.attackHeld = true; PLAYER.firing = true; });
+    ma.addEventListener("pointerup", function () { PLAYER.attackHeld = false; PLAYER.firing = false; });
+    ma.addEventListener("pointercancel", function () { PLAYER.attackHeld = false; PLAYER.firing = false; });
+    ma.addEventListener("pointerleave", function () { PLAYER.attackHeld = false; PLAYER.firing = false; });
+  }
+  try { var am = localStorage.getItem("zombieSandbox.attackMode"); if (am === "three" || am === "two") PLAYER.attackMode = am; } catch (e) {}
+  loadMobilePos(); applyMobilePos();
+  $("bPromote").addEventListener("click", togglePromotePick);
+  $("batchMinus").addEventListener("click", function () { setBatch(BATCH_IDX - 1); });
+  $("batchPlus").addEventListener("click", function () { setBatch(BATCH_IDX + 1); });
+  $("waveRange").addEventListener("input", function () {
+    $("waveVal").textContent = this.value;
+  });
+  $("bWave").addEventListener("click", function () {
+    if (W.over) { toast("本局已结束，请重开或读档"); return; }
+    var want = parseInt($("waveRange").value, 10) || 40;
+    var room = CFG.caps.zombies - countUnits().z;
+    var n = Math.min(want, room);
+    if (n <= 0) { toast("丧尸数量已达上限 " + CFG.caps.zombies); return; }
+    var zs = (EDIT && EDIT.spawn) ? EDIT.spawn : mapSpawnZone(CFG.mapPreset);
+    /* 混编：普通丧尸与奔跑者 20:1、舔舐者 120:1，另外每 80 只额外掺一只母体 */
+    var momN = Math.floor(n / 81);
+    var runners = 0, lickers = 0;
+    for (var i = 0; i < n; i++) {
+      var zk2 = pickZombieKind();
+      if (zk2 === "runner") runners++;
+      else if (zk2 === "licker") lickers++;
+      addUnit(zk2, RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+    }
+    /* 120:1 在几十只的批量里经常刷不出来，大波次补一只保底，免得玩家以为没加 */
+    if (lickers === 0 && n >= 80) {
+      addUnit("licker", RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+      lickers = 1;
+    }
+    for (i = 0; i < momN; i++) {
+      addUnit("mother", RNG.range(zs.x, zs.x + zs.w), RNG.range(zs.y, zs.y + zs.h));
+    }
+    toast("尸潮涌入 +" + n + " 只（奔跑者 " + runners + "，舔舐者 " + lickers + "，母体 " + momN + "）");
+  });
+  /* 重开：立即重置全局再弹开战设置。只弹面板不重置的话，
+     接着进地形编辑器编辑到的会是刚打完的残局，下一局也从残局开始 */
+  $("bRestart").addEventListener("click", function () {
+  /* 「另开一局」先给上一局摘要：继续/重开由玩家决定 */
+  if (W.over) { showResult(); return; }
+  if (!W.paused) setPausedState(true, false);
+  showPausePanel();
+});
+  var bTune = $("bTune");
+  if (bTune) bTune.addEventListener("click", function () {
+    OVERLAY_BACK = document.getElementById("moreHost") ? showMorePanel : showSettingsPanel;
+    showUnitTune();
+  });
+  var bResetAll = $("bResetAll");
+  if (bResetAll) bResetAll.addEventListener("click", resetAllDefaults);
+  var bKeys = $("bKeys");
+  if (bKeys) bKeys.addEventListener("click", showBindPanel);
+  var bMarket = $("bMarket");
+  if (bMarket) bMarket.addEventListener("click", showMarket);
+  loadFB();
+  syncFB();
+  /* 战争迷雾开关：同样只存本地 */
+  (function () {
+    try {
+      var v = localStorage.getItem("zombieSandbox.fog");
+      if (v !== null) CFG.fog.on = (v === "1");
+    } catch (e) {}
+    var b = document.getElementById("fogBtn");
+    if (b) {
+      var lab = b.getAttribute("data-label") || "战争迷雾（实验性功能）";
+      b.textContent = (CFG.fog.on ? "✓ " : "✗ ") + lab;
+      b.className = CFG.fog.on ? "on" : "";
+      b.addEventListener("click", function (ev) {
+        if (ev && ev.stopPropagation) ev.stopPropagation();
+        CFG.fog.on = !CFG.fog.on;
+        b.textContent = (CFG.fog.on ? "✓ " : "✗ ") + lab;
+        b.className = CFG.fog.on ? "on" : "";
+        try { localStorage.setItem("zombieSandbox.fog", CFG.fog.on ? "1" : "0"); } catch (e2) {}
+      });
+    }
+  })();
+  (function () {
+    var pairs = [["fbFeed", "feed"], ["fbHit", "hitmark"], ["fbSfx", "killSfx"]];
+    for (var i = 0; i < pairs.length; i++) {
+      (function (btn, key) {
+        if (!btn) return;
+        btn.addEventListener("click", function (ev) {
+          if (ev && ev.stopPropagation) ev.stopPropagation();
+          toggleFB(key);
+        });
+      })(document.getElementById(pairs[i][0]), pairs[i][1]);
+    }
+  })();
+  var tNext = $("tipsNext"), tSkip = $("tipsSkip");
+  if (tNext) tNext.addEventListener("click", tutorNext);
+  if (tSkip) tSkip.addEventListener("click", hideTutor);
+  /* 音量：读存档里的设置，拖动即时生效并记住 */
+  try {
+    var vs = localStorage.getItem("zombieSandbox.vol");
+    if (vs !== null) { $("volRange").value = vs; SFX.volume = parseInt(vs, 10) / 100; }
+    else { $("volRange").value = Math.round(SFX.volume * 100); }   /* 没存档就用引擎默认音量 */
+  } catch (e) {}
+  var volLabel = function (v) {
+    var e = $("volVal");
+    if (e) e.textContent = v + "%";
+  };
+  if ($("volRange")) volLabel(parseInt($("volRange").value, 10) || 0);
+  $("volRange").addEventListener("input", function () {
+    SFX.setVolume(parseInt(this.value, 10) / 100);
+    volLabel(parseInt(this.value, 10) || 0);
+    try { localStorage.setItem("zombieSandbox.vol", this.value); } catch (e) {}
+  });
+  /* 任何按钮点击都给一声音效反馈 */
+  window.addEventListener("click", function (e) {
+    var el = e.target;
+    if (el && el.tagName === "BUTTON") SFX.ui();
+  });
+  /* 浏览器要求音频必须由用户手势解锁，第一次点屏幕时开闸 */
+  window.addEventListener("pointerdown", function () { SFX.resume(); }, { once: true });
+  overlayEl.addEventListener("click", function (e) {
+  if (e.target !== overlayEl) return;
+  if (HOME_PANEL || START_PANEL) return;
+  closeOverlaySmart();
+});
+  function runKeyAction(act, e) {
+    switch (act) {
+      case "pause":
+        e.preventDefault();
+        /* 手里有人命的时候，空格不是暂停，是"扑一下" */
+        if (PLAYER.on && PLAYER.unit && !PLAYER.unit.dead) { playerPounce(); return true; }
+        $("bPause").click(); return true;
+      case "cancel":
+        if (CMD.on) { cmdAbort(); toast("已退出指挥模式"); return true; }
+        if (HOME_PANEL) return true;
+        if (START_PANEL) { showHome(); return true; }
+        /* 正在操控就先交还 AI，这才是玩家按下 Esc 最想要的结果 */
+        if (PLAYER.on) { togglePlayerControl(); return true; }
+        /* 只是查看状态的话，Esc 直接取消查看 */
+        if (UI.peek) { UI.peek = null; return true; }
+        UI.selected = null; selectPlace(null); closeOverlaySmart(); return true;
+      case "director":   setDirector(!DIRECTOR.on); return true;
+      case "toggleUI":   setHideUI(!HIDE_UI); return true;
+    case "command":    toggleCmd(); return true;
+      case "cinema":     CINEMA = !CINEMA; toast(CINEMA ? "电影遮幅：开" : "电影遮幅：关"); return true;
+      case "debug":      e.preventDefault(); $("bDebug").click(); return true;
+      case "batchMinus": setBatch(BATCH_IDX - 1); return true;
+      case "batchPlus":  setBatch(BATCH_IDX + 1); return true;
+      case "place1":     selectPlace("rifle"); return true;
+      case "place2":     selectPlace("mg"); return true;
+      case "place3":     selectPlace("sniper"); return true;
+      case "place4":     selectPlace("shield"); return true;
+      case "place5":     selectPlace("civilian"); return true;
+      case "place6":     selectPlace("sandbag"); return true;
+      /* 方向与换弹是"按住"型，交给每帧逻辑处理 */
+      case "up": case "down": case "left": case "right": case "reload": return false;
+      case "market":
+        if (MARKET_OPEN) { MARKET_OPEN = false; hideOverlay(); return true; }
+        showMarket(); return true;
+      case "fireMode":
+        /* 手里有人：切换全自动 / 半自动。
+           空手时这个键退回剧情模式的"朝向"指令，一键盘两用，不用记两个键 */
+        if (PLAYER.on && PLAYER.unit && !PLAYER.unit.dead) {
+          PLAYER.fireMode = PLAYER.fireMode === 0 ? 1 : 0;
+          PLAYER.semiShot = 0;
+          toast("开火模式：" + CFG.playerFire.modeName[PLAYER.fireMode]);
+          return true;
+        }
+        if (DIRECTOR.on) { directorDoAction("face"); return true; }
+        return false;
+      default:
+        if (DIRECTOR.on) { directorDoAction(act); return true; }
+        return false;
+    }
+  }
+  window.addEventListener("keydown", function (e) {
+    var k = e.key.toLowerCase();
+    /* 键位设置面板正在等按键：这一下只用来绑定，不触发任何游戏行为 */
+    if (BIND_WAIT) { e.preventDefault(); applyBind(k); return; }
+    keys[k] = true;
+    /* 编辑器里按住 Alt 临时关闭吸附，松开恢复，和 AutoCAD 的临时捕捉一致 */
+    if (EDIT.active && (e.key === "Alt" || e.altKey)) EDIT.altFree = true;
+    /* 统一按键分派：所有键位都来自 KEYMAP，玩家可自由改绑 */
+    var act = actionOfKey(k);
+    if (act && runKeyAction(act, e)) return;
+  });
+  window.addEventListener("keyup", function (e) {
+    keys[e.key.toLowerCase()] = false;
+    if (e.key === "Alt" || !e.altKey) EDIT.altFree = false;
+  });
+  window.addEventListener("resize", resize);
+  window.addEventListener("blur", function () { keys = {}; EDIT.altFree = false; });
+}
+/* =================== 17. 音效：Web Audio 程序化合成 ===================
+   设计取向：短促有力。要点是
+   · 噪声脉冲 + 低通（砍掉刺耳的高频），配一条低频正弦"推力"做胸腔感
+   · 混响只给几十毫秒的实感，绝不留尾音，连发时每一发都要能听出个数
+   · 每种武器准备 5 组极相似的参数，每次开火随机选一组，避免听感机械重复
+   · 音量按单位与镜头的距离平方衰减，并按横向位置做左右声像 */
+function makeIR(ctx, seconds, decay) {
+  var rate = ctx.sampleRate;
+  var len = Math.max(1, Math.floor(rate * seconds));
+  var buf = ctx.createBuffer(2, len, rate);
+  /* 只留两个极近的反射点：给枪声一点"在空场上响"的实感。
+     不留长尾巴，尾巴一长，连发的每一发都会糊在一起，听不出个数 */
+  var taps = [0.006, 0.012];
+  for (var ch = 0; ch < 2; ch++) {
+    var d = buf.getChannelData(ch);
+    var lp = 0;
+    for (var i = 0; i < len; i++) {
+      var t = i / len;
+      /* 强低通 + 陡衰减：能量在几十毫秒内就散干净，之后只剩干声 */
+      lp = lp * 0.72 + (Math.random() * 2 - 1) * 0.28;
+      d[i] = lp * Math.pow(1 - t, decay) * 2.0;
+    }
+    for (var k = 0; k < taps.length; k++) {
+      var idx = Math.floor((taps[k] + (ch ? 0.0021 : 0)) * rate);
+      if (idx < len) d[idx] += (0.42 - k * 0.12) * (Math.random() > 0.5 ? 1 : -1);
+    }
+  }
+  return buf;
+}
+/* 单位位置 -> 音量与声像 */
+function sfxAtten(x, y) {
+  if (typeof x !== "number" || typeof y !== "number") return { vol: 1, pan: 0 };
+  var d = dist(x, y, CAM.x, CAM.y);
+  /* 衰减范围放宽到 2800，指数从平方降到 1.6 次方：
+     镜头一拉远，战场外侧的枪声不该直接消失，那才是"听起来声音很小"的主因之一 */
+  var v = clamp(1 - d / 2800, 0, 1);
+  v = Math.pow(v, 1.6);
+  var pan = clamp((x - CAM.x) / (Math.max(200, VW / (2 * CAM.zoom))), -1, 1);
+  return { vol: v, pan: pan };
+}
+/* 主输出增益倍数：音量滑块 100% 对应的实际线性增益。
+   之前是 1.0（也就是没有任何放大余量），枪声叠上距离衰减与动态降幅后听起来就很小 */
+var SFX_BOOST = 2.6;
+var SFX = {
+  ctx: null, master: null, wetIn: null, noiseBuf: null, comp: null,
+  volume: 0.95, enabled: true, ok: false, tried: false,
+  last: {}, voices: 0, maxVoices: 240, softCap: 60,
+
+  init: function () {
+    if (this.ok) return true;
+    var AC = (typeof window !== "undefined") ? (window.AudioContext || window.webkitAudioContext) : null;
+    if (!AC) return false;
+    try {
+      var c = new AC();
+      this.ctx = c;
+      this.master = c.createGain();
+      this.master.gain.value = 0;
+      /* 总输出挂一个压缩器：几十把枪同时响也不会削波爆音，靠它兜底而不是掐掉声源 */
+      try {
+        var comp = c.createDynamicsCompressor();
+        /* 阈值从 -10dB 抬到 -4dB、比率从 9:1 放到 5:1：
+           原来的设置几乎把每一枪都压进去了，整体听感因此被死死摁在低电平上 */
+        comp.threshold.value = -4;
+        comp.knee.value = 18;
+        comp.ratio.value = 5;
+        comp.attack.value = 0.002;
+        comp.release.value = 0.25;
+        this.comp = comp;
+        /* 压缩器之后再滚一道高频，把残留的"尖"削掉 */
+        var soft = c.createBiquadFilter();
+        soft.type = "lowpass";
+        soft.frequency.value = 6800;
+        soft.Q.value = 0.5;
+        this.master.connect(comp);
+        comp.connect(soft);
+        soft.connect(c.destination);
+      } catch (e) {
+        this.master.connect(c.destination);
+      }
+      var conv = c.createConvolver();
+      conv.buffer = makeIR(c, 0.30, 5.0);   /* 0.30 秒 + 陡衰减：只加实感，不留尾音 */
+      var wet = c.createGain();
+      wet.gain.value = 0.20;
+      wet.connect(conv);
+      conv.connect(this.master);
+      this.wetIn = wet;
+      var n = Math.floor(c.sampleRate * 2);
+      var b = c.createBuffer(1, n, c.sampleRate);
+      var d = b.getChannelData(0);
+      for (var i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+      this.noiseBuf = b;
+      this.ok = true;
+      this.applyVolume();
+      return true;
+    } catch (e) { this.ok = false; return false; }
+  },
+  resume: function () {
+    if (!this.init()) return;
+    if (this.ctx.state === "suspended") { try { this.ctx.resume(); } catch (e) {} }
+    this.applyVolume();
+  },
+  applyVolume: function () {
+    if (!this.ok) return;
+    /* 滑块 0~100 映射到 0~MASTER_BOOST 的线性增益：
+       满格不再是 1.0，而是足够响的电平。峰值由后面那级压缩器兜住，不会爆音 */
+    var g = (this.enabled ? this.volume : 0) * SFX_BOOST;
+    try { this.master.gain.setTargetAtTime(g, this.ctx.currentTime, 0.03); } catch (e) {}
+  },
+  setVolume: function (v) {
+    this.volume = clamp(v, 0, 1.5);   /* 允许推到 150%，配合 SFX_BOOST 给足余量 */
+    if (this.volume > 0.001) this.enabled = true;
+    this.applyVolume();
+  },
+  toggleMute: function () { this.enabled = !this.enabled; this.applyVolume(); return this.enabled; },
+  /* 密集交火时的动态降幅：同时发声越多，单个音压得越轻，但绝不掐断。
+     触发门槛从 40 抬到 60、下限从 30% 提到 45%，原来一场大混战
+     会把每一枪都压到三成，听上去就是"人一多枪声就没了" */
+  duck: function () {
+    var n = this.voices;
+    if (n <= this.softCap) return 1;
+    return clamp(1 - (n - this.softCap) * 0.0035, 0.45, 1);
+  },
+  /* 只留给调度类音效（比如嘶吼）去重。枪声不走闸门，同一帧几十把枪一起响正是要的密集感 */
+  gate: function (name, ms) {
+    var now = (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+    if (this.last[name] && now - this.last[name] < ms) return false;
+    this.last[name] = now;
+    return true;
+  },
+  /* 噪声脉冲：枪声的主体 */
+  burst: function (o) {
+    var c = this.ctx, t = c.currentTime + (o.delay || 0);
+    var src = c.createBufferSource();
+    src.buffer = this.noiseBuf; src.loop = true;
+    var f = c.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.setValueAtTime(o.cut, t);
+    if (o.cutEnd) f.frequency.exponentialRampToValueAtTime(Math.max(60, o.cutEnd), t + o.decay);
+    f.Q.value = o.q || 0.8;
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(Math.max(0.0002, o.peak), t + (o.attack || 0.004));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + o.decay);
+    var out = g;
+    if (c.createStereoPanner && o.pan !== undefined) {
+      var p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1);
+      g.connect(p); out = p;
+    }
+    out.connect(this.master);
+    if (o.wet) { var w = c.createGain(); w.gain.value = o.wet; out.connect(w); w.connect(this.wetIn); }
+    src.connect(f); f.connect(g);
+    src.start(t, Math.random() * 1.5);
+    src.stop(t + o.decay + 0.08);
+    this.voices++;
+    var self = this;
+    setTimeout(function () { self.voices = Math.max(0, self.voices - 1); }, (o.decay + 0.1) * 1000);
+  },
+  /* 带通层：给枪声加"啪/哒"的脆头 */
+  band: function (o) {
+    var c = this.ctx, t = c.currentTime + (o.delay || 0);
+    var src = c.createBufferSource();
+    src.buffer = this.noiseBuf; src.loop = true;
+    var f = c.createBiquadFilter();
+    f.type = "bandpass";
+    f.frequency.value = o.freq;
+    f.Q.value = o.q || 1.6;
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(Math.max(0.0002, o.peak), t + 0.002);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + o.decay);
+    var out = g;
+    if (c.createStereoPanner && o.pan !== undefined) {
+      var p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1);
+      g.connect(p); out = p;
+    }
+    out.connect(this.master);
+    if (o.wet) { var w = c.createGain(); w.gain.value = o.wet; out.connect(w); w.connect(this.wetIn); }
+    src.connect(f); f.connect(g);
+    src.start(t, Math.random() * 1.5);
+    src.stop(t + o.decay + 0.06);
+    this.voices++;
+    var self2 = this;
+    setTimeout(function () { self2.voices = Math.max(0, self2.voices - 1); }, (o.decay + 0.08) * 1000);
+  },
+  /* 低频推力：胸腔里那一下"砰" */
+  /* 极轻的一声"滴"：医疗兵手动锁定，每锁上一个目标给一次提示 */
+  blip: function (o) {
+    if (!this.ok) return;
+    var c = this.ctx, t = c.currentTime;
+    var f0 = (o && o.freq) || 2100;
+    var osc = c.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(f0, t);
+    osc.frequency.exponentialRampToValueAtTime(f0 * 0.86, t + 0.055);
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime((o && o.peak) || 0.07, t + 0.006);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
+    osc.connect(g); g.connect(this.master);
+    if (o && o.wet) { var w = c.createGain(); w.gain.value = o.wet; g.connect(w); w.connect(this.wetIn); }
+    osc.start(t); osc.stop(t + 0.09);
+    this.voices++;
+    var self = this;
+    setTimeout(function () { self.voices = Math.max(0, self.voices - 1); }, 120);
+  },
+  /* 呕吐：舔舐者把舌头甩出去的那一下，喉音下滑 + 湿滑的带通噪声，
+     两路一起从高往低滑，听感就是一口"呕，"被硬挤出来 */
+  vomit: function (o) {
+    var c = this.ctx, t0 = c.currentTime + (o.delay || 0);
+    var pk = (o.peak || 0.30) * this.duck();
+    var osc = c.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(155, t0);
+    osc.frequency.exponentialRampToValueAtTime(52, t0 + 0.42);
+    var lp = c.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.setValueAtTime(950, t0);
+    lp.frequency.exponentialRampToValueAtTime(170, t0 + 0.40);
+    lp.Q.value = 6;
+    var g1 = c.createGain();
+    g1.gain.setValueAtTime(0.0001, t0);
+    g1.gain.linearRampToValueAtTime(Math.max(0.0002, pk), t0 + 0.030);
+    g1.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.46);
+    var src = c.createBufferSource();
+    src.buffer = this.noiseBuf; src.loop = true;
+    var bp = c.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.setValueAtTime(1150, t0);
+    bp.frequency.exponentialRampToValueAtTime(185, t0 + 0.38);
+    bp.Q.value = 3.2;
+    var g2 = c.createGain();
+    g2.gain.setValueAtTime(0.0001, t0);
+    g2.gain.linearRampToValueAtTime(Math.max(0.0002, pk * 0.85), t0 + 0.035);
+    g2.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.40);
+    var out = g1;
+    if (c.createStereoPanner && o.pan !== undefined) {
+      var p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1);
+      g1.connect(p); g2.connect(p); out = p;
+    } else {
+      g2.connect(g1);
+    }
+    out.connect(this.master);
+    if (o.wet) { var w = c.createGain(); w.gain.value = o.wet; out.connect(w); w.connect(this.wetIn); }
+    osc.connect(lp); lp.connect(g1);
+    src.connect(bp); bp.connect(g2);
+    osc.start(t0); osc.stop(t0 + 0.50);
+    src.start(t0, Math.random() * 1.5); src.stop(t0 + 0.44);
+    this.voices += 2;
+    var self = this;
+    setTimeout(function () { self.voices = Math.max(0, self.voices - 2); }, 520);
+  },
+  thump: function (o) {
+    var c = this.ctx, t = c.currentTime + (o.delay || 0);
+    var osc = c.createOscillator();
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(o.freq, t);
+    if (o.freqEnd) osc.frequency.exponentialRampToValueAtTime(Math.max(18, o.freqEnd), t + o.decay);
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(Math.max(0.0002, o.peak), t + (o.attack || 0.006));
+    g.gain.exponentialRampToValueAtTime(0.0001, t + o.decay);
+    var out = g;
+    if (c.createStereoPanner && o.pan !== undefined) {
+      var p = c.createStereoPanner(); p.pan.value = clamp(o.pan, -1, 1);
+      g.connect(p); out = p;
+    }
+    out.connect(this.master);
+    if (o.wet) { var w = c.createGain(); w.gain.value = o.wet; out.connect(w); w.connect(this.wetIn); }
+    osc.connect(g);
+    osc.start(t); osc.stop(t + o.decay + 0.05);
+    this.voices++;
+    var self3 = this;
+    setTimeout(function () { self3.voices = Math.max(0, self3.voices - 1); }, (o.decay + 0.06) * 1000);
+  },
+  /* 每种武器 5 组极相似的参数，每次随机取一组 */
+  /* mid = 共振音高（听感上的"音调"），两把枪靠它拉开：步枪 1300Hz 上下，机枪 600Hz 上下，
+     相差一个八度以上，所以即使都很闷也能一耳朵听出区别 */
+  V: {
+    /* 步枪："啪"，中频共振 1360~1560Hz，衰减 0.040~0.051s（短促），低通 1840~2130Hz */
+    rifle: [
+      { cut: 1950, decay: 0.046, freq: 128, wet: 0.14, peak: 0.94, mid: 1440, midQ: 1.05, midG: 0.95 },
+      { cut: 2060, decay: 0.043, freq: 134, wet: 0.13, peak: 0.90, mid: 1510, midQ: 1.10, midG: 0.90 },
+      { cut: 1840, decay: 0.051, freq: 124, wet: 0.15, peak: 0.98, mid: 1360, midQ: 1.00, midG: 1.00 },
+      { cut: 2130, decay: 0.040, freq: 138, wet: 0.12, peak: 0.88, mid: 1560, midQ: 1.12, midG: 0.88 },
+      { cut: 2000, decay: 0.048, freq: 131, wet: 0.14, peak: 0.92, mid: 1470, midQ: 1.06, midG: 0.93 }
+    ],
+    /* 机枪："哒"，木质共振压到 580~680Hz，衰减只有 0.024~0.030s，最干脆、敲得最密 */
+    mg: [
+      { cut: 1150, decay: 0.027, freq: 168, wet: 0.09, peak: 0.80, mid: 620, midQ: 1.75, midG: 1.05 },
+      { cut: 1220, decay: 0.024, freq: 174, wet: 0.08, peak: 0.76, mid: 660, midQ: 1.80, midG: 1.00 },
+      { cut: 1080, decay: 0.030, freq: 162, wet: 0.10, peak: 0.84, mid: 580, midQ: 1.70, midG: 1.10 },
+      { cut: 1280, decay: 0.022, freq: 178, wet: 0.08, peak: 0.74, mid: 680, midQ: 1.85, midG: 0.98 },
+      { cut: 1180, decay: 0.028, freq: 170, wet: 0.09, peak: 0.78, mid: 640, midQ: 1.78, midG: 1.02 }
+    ],
+    /* 狙击：一记重"砰"，低通 620~800、衰减 0.26~0.38s（全场最长的音，但仍然收得干净） */
+    sniper: [
+      { cut: 700, decay: 0.34, freq: 42, wet: 0.26, peak: 1.18, mid: 0 },
+      { cut: 760, decay: 0.28, freq: 46, wet: 0.24, peak: 1.10, mid: 0 },
+      { cut: 620, decay: 0.38, freq: 38, wet: 0.28, peak: 1.26, mid: 0 },
+      { cut: 800, decay: 0.26, freq: 48, wet: 0.22, peak: 1.06, mid: 0 },
+      { cut: 720, decay: 0.32, freq: 44, wet: 0.25, peak: 1.14, mid: 0 }
+    ],
+    /* 手枪：比步枪更脆更短，衰减 0.034~0.044s */
+    pistol: [
+      { cut: 1450, decay: 0.042, freq: 148, wet: 0.13, peak: 0.70, mid: 1010, midQ: 1.15, midG: 0.85 },
+      { cut: 1560, decay: 0.038, freq: 154, wet: 0.12, peak: 0.66, mid: 1070, midQ: 1.20, midG: 0.82 },
+      { cut: 1370, decay: 0.044, freq: 143, wet: 0.14, peak: 0.72, mid: 950, midQ: 1.10, midG: 0.88 },
+      { cut: 1620, decay: 0.034, freq: 158, wet: 0.11, peak: 0.64, mid: 1110, midQ: 1.22, midG: 0.80 },
+      { cut: 1500, decay: 0.040, freq: 150, wet: 0.13, peak: 0.68, mid: 1040, midQ: 1.16, midG: 0.84 }
+    ],
+    /* 1.3.3 四个新兵种：
+       液氮 = 短促的"嘶——"（高频气阀），喷火 = 低频的"呼"（持续的闷响），
+       磁爆 = 尖而碎的"啪啦"（超高频共振），激光 = 明亮的"咻"（高频窄带） */
+    cryo: [
+      { cut: 3200, decay: 0.16, freq: 88, wet: 0.10, peak: 0.58, mid: 2380, midQ: 2.40, midG: 0.52 },
+      { cut: 2900, decay: 0.19, freq: 82, wet: 0.11, peak: 0.54, mid: 2140, midQ: 2.20, midG: 0.48 },
+      { cut: 3500, decay: 0.14, freq: 94, wet: 0.09, peak: 0.60, mid: 2560, midQ: 2.60, midG: 0.55 }
+    ],
+    flame: [
+      { cut: 760, decay: 0.17, freq: 62, wet: 0.13, peak: 0.74, mid: 250, midQ: 0.85, midG: 0.80 },
+      { cut: 680, decay: 0.20, freq: 56, wet: 0.14, peak: 0.70, mid: 220, midQ: 0.80, midG: 0.76 },
+      { cut: 820, decay: 0.15, freq: 68, wet: 0.12, peak: 0.78, mid: 280, midQ: 0.90, midG: 0.84 }
+    ],
+    tesla: [
+      { cut: 4300, decay: 0.075, freq: 126, wet: 0.10, peak: 0.86, mid: 3120, midQ: 3.20, midG: 0.90 },
+      { cut: 4700, decay: 0.065, freq: 132, wet: 0.09, peak: 0.82, mid: 3380, midQ: 3.50, midG: 0.86 },
+      { cut: 3900, decay: 0.085, freq: 118, wet: 0.11, peak: 0.90, mid: 2900, midQ: 3.00, midG: 0.94 }
+    ],
+    laser: [
+      { cut: 5400, decay: 0.10, freq: 58, wet: 0.15, peak: 0.62, mid: 1820, midQ: 2.10, midG: 0.78 },
+      { cut: 6000, decay: 0.09, freq: 54, wet: 0.16, peak: 0.58, mid: 1960, midQ: 2.30, midG: 0.74 },
+      { cut: 5000, decay: 0.11, freq: 62, wet: 0.14, peak: 0.66, mid: 1720, midQ: 1.95, midG: 0.82 }
+    ]
+  },
+  shot: function (kind, x, y, pitch) {
+    if (!this.ok || !this.enabled) return;
+    if (this.voices > this.maxVoices) return;
+    var a = sfxAtten(x, y);
+    if (a.vol <= 0.025) return;
+    var key = kind || "rifle";
+    var list = this.V[key] || this.V.rifle;
+    var v = list[Math.floor(Math.random() * list.length)];
+    var pt = pitch || 1;
+    var dk = this.duck() * a.vol;              /* 越拥挤单个越轻，但不会被掐掉 */
+    this.burst({ cut: v.cut * pt, cutEnd: v.cut * 0.38, peak: v.peak * dk * 1.75,
+      decay: v.decay, attack: 0.0022, q: 0.7, wet: v.wet, pan: a.pan });
+    if (v.mid) {
+      this.band({ freq: v.mid * pt, peak: v.peak * dk * 1.20 * (v.midG || 1),
+        decay: v.decay * 0.85, q: v.midQ || 1.2, wet: v.wet * 0.45, pan: a.pan });
+    }
+    this.thump({ freq: v.freq * pt, freqEnd: v.freq * 0.45, peak: v.peak * dk * 2.1,
+      attack: 0.003, decay: v.decay * 2.2, pan: a.pan, wet: v.wet * 0.5 });
+  }
+};
+/* 礼花：一记升空哨音，随后炸开 + 一串噼啪 */
+/* 击杀确认音：一记低沉的闷响 + 一点点金属脆音收尾。
+   战地那种击杀音是"啪/咚"的一声、短促干脆、有分量，不是两声音高往上爬的奖励音
+ ，上行双音听着像捡金币，完全没有确认击杀的力度 */
+SFX.kill = function () {
+  if (!this.ok || !this.enabled) return;
+  if (this.voices > this.maxVoices) return;
+  /* 低频闷响：190 → 62 Hz 急坠，压得干脆但要有分量 */
+  this.thump({ freq: 190, freqEnd: 62, peak: 1.15, attack: 0.002, decay: 0.16, pan: 0, wet: 0.22 });
+  /* 中频撞击层：让它在密集枪声里也能"顶"出来，不然会被枪声盖掉 */
+  this.band({ freq: 820, peak: 0.62, decay: 0.085, q: 1.1, wet: 0.16 });
+  /* 极短的金属脆音，给一点"确认"的锐度 */
+  this.band({ freq: 2680, peak: 0.42, decay: 0.055, q: 2.6, wet: 0.14 });
+};
+SFX.firework = function (x, y) {
+  if (!this.ok || !this.enabled) return;
+  if (this.voices > this.maxVoices) return;
+  var a = sfxAtten(x, y);
+  var vol = 0.45 + 0.55 * a.vol;              /* 烟花是"天上的"，不做距离骤减 */
+  var c = this.ctx, t = c.currentTime;
+  /* 升空：尖锐的哨音，音调一路上滑 */
+  var osc = c.createOscillator();
+  osc.type = "triangle";
+  osc.frequency.setValueAtTime(380, t);
+  osc.frequency.exponentialRampToValueAtTime(1500, t + 0.44);
+  var og = c.createGain();
+  og.gain.setValueAtTime(0.0001, t);
+  og.gain.linearRampToValueAtTime(0.11 * vol, t + 0.1);
+  og.gain.exponentialRampToValueAtTime(0.0001, t + 0.46);
+  osc.connect(og); og.connect(this.master);
+  var w0 = c.createGain(); w0.gain.value = 0.3; og.connect(w0); w0.connect(this.wetIn);
+  osc.start(t); osc.stop(t + 0.5);
+  /* 炸开 */
+  this.burst({ cut: 3200, cutEnd: 280, peak: 0.62 * vol, decay: 0.55, attack: 0.002, q: 0.5, wet: 0.30, delay: 0.44 });
+  this.thump({ freq: 150, freqEnd: 38, peak: 0.85 * vol, attack: 0.003, decay: 0.44, wet: 0.25, delay: 0.44 });
+  /* 灰烬里的噼啪 */
+  for (var i = 0; i < 7; i++) {
+    this.band({ freq: 2100 + i * 430, peak: 0.15 * vol, decay: 0.085, q: 2.2, wet: 0.16, delay: 0.48 + i * 0.055 });
+  }
+};
+/* 警报：只响两声，两声之间留出空档 */
+SFX.alarm = function () {
+  if (!this.ok || !this.enabled) return;
+  if (this.voices > this.maxVoices) return;
+  var c = this.ctx, t0 = c.currentTime;
+  for (var i = 0; i < 2; i++) {
+    var t = t0 + i * 0.78;
+    var osc = c.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(640, t);
+    osc.frequency.exponentialRampToValueAtTime(198, t + 0.52);
+    var f = c.createBiquadFilter();
+    f.type = "lowpass";
+    f.frequency.value = 1250;
+    f.Q.value = 0.7;
+    var g = c.createGain();
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.linearRampToValueAtTime(0.30, t + 0.05);
+    g.gain.setValueAtTime(0.30, t + 0.40);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.62);
+    osc.connect(f); f.connect(g); g.connect(this.master);
+    var w = c.createGain(); w.gain.value = 0.22; g.connect(w); w.connect(this.wetIn);
+    osc.start(t); osc.stop(t + 0.68);
+  }
+};
+/* 丧尸嘶吼：低频锯齿 + 抖动，数量越多越低沉浑厚 */
+SFX.groan = function (x, y, pitch, dur) {
+  if (!this.ok || !this.enabled) return;
+  if (this.voices > this.maxVoices) return;
+  var a = sfxAtten(x, y);
+  if (a.vol <= 0.03) return;
+  if (!this.gate("groan", 90)) return;
+  var c = this.ctx, t = c.currentTime;
+  dur = dur || (0.5 + Math.random() * 0.5);
+  var f0 = 72 * (pitch || 1) * (0.92 + Math.random() * 0.16);
+  var osc = c.createOscillator();
+  osc.type = "sawtooth";
+  osc.frequency.setValueAtTime(f0, t);
+  osc.frequency.linearRampToValueAtTime(f0 * (0.7 + Math.random() * 0.55), t + dur);
+  var lfo = c.createOscillator();
+  lfo.frequency.value = 15 + Math.random() * 16;
+  var lg = c.createGain();
+  lg.gain.value = f0 * 0.2;
+  lfo.connect(lg); lg.connect(osc.frequency);
+  var bp = c.createBiquadFilter();
+  bp.type = "bandpass";
+  bp.frequency.value = 300 * (pitch || 1);
+  bp.Q.value = 1.5;
+  var g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.26 * a.vol, t + dur * 0.3);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+  var out = g;
+  if (c.createStereoPanner) { var p = c.createStereoPanner(); p.pan.value = a.pan; g.connect(p); out = p; }
+  out.connect(this.master);
+  var w = c.createGain(); w.gain.value = 0.22; out.connect(w); w.connect(this.wetIn);
+  osc.connect(bp); bp.connect(g);
+  osc.start(t); osc.stop(t + dur + 0.05);
+  lfo.start(t); lfo.stop(t + dur + 0.05);
+};
+/* 护盾碎裂：高频炸裂 + 低频冲击 */
+SFX.blast = function (x, y) {
+  if (!this.ok || !this.enabled) return;
+  var a = sfxAtten(x, y);
+  if (a.vol <= 0.03) return;
+  if (!this.gate("blast", 110)) return;
+  this.burst({ cut: 2400, cutEnd: 260, peak: 0.98 * a.vol, decay: 0.17, attack: 0.002, q: 0.6, wet: 0.18, pan: a.pan });
+  this.thump({ freq: 150, freqEnd: 34, peak: 1.55 * a.vol, attack: 0.003, decay: 0.30, pan: a.pan, wet: 0.14 });
+};
+/* 盾兵自爆：更闷更长的一记重响 */
+SFX.detonate = function (x, y) {
+  if (!this.ok || !this.enabled) return;
+  var a = sfxAtten(x, y);
+  if (a.vol <= 0.03) return;
+  this.burst({ cut: 820, cutEnd: 70, peak: 1.30 * a.vol, decay: 0.38, attack: 0.002, q: 0.5, wet: 0.20, pan: a.pan });
+  this.thump({ freq: 96, freqEnd: 22, peak: 1.95 * a.vol, attack: 0.003, decay: 0.58, pan: a.pan, wet: 0.16 });
+};
+/* 感染尸变：不祥的上升滑音 + 一点噪声 */
+SFX.infect = function (x, y) {
+  if (!this.ok || !this.enabled) return;
+  var a = sfxAtten(x, y);
+  if (a.vol <= 0.04) return;
+  if (!this.gate("infect", 200)) return;
+  var c = this.ctx, t = c.currentTime;
+  var osc = c.createOscillator();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(170, t);
+  osc.frequency.exponentialRampToValueAtTime(640, t + 0.38);
+  var g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.26 * a.vol, t + 0.07);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.42);
+  var out = g;
+  if (c.createStereoPanner) { var p = c.createStereoPanner(); p.pan.value = a.pan; g.connect(p); out = p; }
+  out.connect(this.master);
+  var w = c.createGain(); w.gain.value = 0.16; out.connect(w); w.connect(this.wetIn);
+  osc.connect(g);
+  osc.start(t); osc.stop(t + 0.45);
+  this.burst({ cut: 900, cutEnd: 250, peak: 0.16 * a.vol, decay: 0.20, attack: 0.002, pan: a.pan, wet: 0.10 });
+};
+/* 命中丧尸：很闷的一声，密集时限流 */
+SFX.hit = function (x, y) {
+  if (!this.ok || !this.enabled) return;
+  var a = sfxAtten(x, y);
+  if (a.vol <= 0.05) return;
+  this.burst({ cut: 720, cutEnd: 180, peak: 0.56 * this.duck() * a.vol, decay: 0.045, attack: 0.002, q: 1.1, wet: 0.10, pan: a.pan });
+};
+/* UI 音 */
+SFX.ui = function () {
+  if (!this.ok || !this.enabled) return;
+  var c = this.ctx, t = c.currentTime;
+  var osc = c.createOscillator();
+  osc.type = "square";
+  osc.frequency.value = 610;
+  var g = c.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.linearRampToValueAtTime(0.09, t + 0.004);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 0.075);
+  osc.connect(g); g.connect(this.master);
+  osc.start(t); osc.stop(t + 0.1);
+};
+var PERF = { fps: 0, sim: 0, render: 0, frame: 0 };
+function perfNow() {
+  try { return (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now(); }
+  catch (e) { return Date.now(); }
+}
+function perfText() {
+  return "FPS " + Math.round(PERF.fps) + " · 模拟 " + PERF.sim.toFixed(1) + "ms · 渲染 " + PERF.render.toFixed(1) + "ms · 比例 " + Math.round(QUALITY.scale * 100) + "%";
+}
+function updatePerfLine() {
+  var el = document.getElementById("perfLine");
+  if (el) el.textContent = "性能：" + perfText();
+}
+function qualityTick() {
+  if (!CFG.quality.enabled || !QUALITY) return;
+  var doc = typeof document !== "undefined" ? document : null;
+  if (doc && doc.visibilityState === "hidden") return;
+  if (!PERF.fps) return;
+  var load = PERF.sim + PERF.render;
+  var low = PERF.fps < (CFG.quality.lowFps || 50) || load > (CFG.quality.lowLoad || 14);
+  var high = PERF.fps >= (CFG.quality.highFps || 57) && load < (CFG.quality.highLoad || 9);
+  if (low) { QUALITY.lowT += 0.5; QUALITY.highT = 0; }
+  else if (high) { QUALITY.highT += 0.5; QUALITY.lowT = 0; }
+  else { QUALITY.lowT = 0; QUALITY.highT = 0; }
+  var step = CFG.quality.step || 0.08;
+  var hold = CFG.quality.hold || 2;
+  if (QUALITY.lowT >= hold && QUALITY.scale > (CFG.quality.min || 0.7)) {
+    QUALITY.scale = Math.max(CFG.quality.min || 0.7, QUALITY.scale - step);
+    QUALITY.lowT = 0;
+    resize();
+    updateQualityLabel();
+    updatePerfLine();
+  } else if (QUALITY.highT >= hold && QUALITY.scale < 1) {
+    QUALITY.scale = Math.min(1, QUALITY.scale + step);
+    QUALITY.highT = 0;
+    resize();
+    updateQualityLabel();
+    updatePerfLine();
+  }
+}
+function ensureGlowCanvas() {
+  if (!CFG.glowLayer.enabled) return null;
+  if (typeof document === "undefined" || !document.createElement) return null;
+  var scale = QUALITY.scale < 0.8 ? 0.4 : 0.5;
+  var w = Math.max(1, Math.floor(VW * scale));
+  var h = Math.max(1, Math.floor(VH * scale));
+  if (!GLOW.canvas) {
+    try {
+      GLOW.canvas = document.createElement("canvas");
+      GLOW.ctx = GLOW.canvas.getContext("2d");
+    } catch (e) { GLOW.canvas = null; GLOW.ctx = null; return null; }
+  }
+  if (!GLOW.ctx) return null;
+  if (GLOW.canvas.width !== w || GLOW.canvas.height !== h || GLOW.w !== w || GLOW.h !== h) {
+    GLOW.canvas.width = w; GLOW.canvas.height = h;
+    GLOW.w = w; GLOW.h = h;
+  }
+  return GLOW.canvas;
+}
+function glowColorAlpha(color, a) {
+  var m = String(color).match(/rgba?\(([^)]+)\)/);
+  if (!m) return "rgba(255,180,100," + a + ")";
+  var p = m[1].split(",");
+  return "rgba(" + p[0] + "," + p[1] + "," + p[2] + "," + a + ")";
+}
+function addGlowLight(x, y, r, color, alpha) {
+  if (!GLOW.ctx || r <= 0 || alpha <= 0) return;
+  var g = GLOW.ctx;
+  var grd = g.createRadialGradient(x, y, 0, x, y, r);
+  grd.addColorStop(0, color);
+  grd.addColorStop(0.18, color);
+  grd.addColorStop(0.46, glowColorAlpha(color, 0.30));
+  grd.addColorStop(0.76, glowColorAlpha(color, 0.07));
+  grd.addColorStop(1, glowColorAlpha(color, 0));
+  g.globalAlpha = alpha;
+  g.fillStyle = grd;
+  g.beginPath(); g.arc(x, y, r, 0, TAU); g.fill();
+}
+function addGlowLine(x0, y0, x1, y1, w, color, alpha) {
+  if (!GLOW.ctx || alpha <= 0 || w <= 0) return;
+  var dx = x1 - x0, dy = y1 - y0, len = Math.sqrt(dx * dx + dy * dy);
+  if (len < 2) return;
+  var nx = -dy / len, ny = dx / len, g = GLOW.ctx;
+  var grd = g.createLinearGradient(x0 - nx * w / 2, y0 - ny * w / 2, x0 + nx * w / 2, y0 + ny * w / 2);
+  grd.addColorStop(0, glowColorAlpha(color, 0));
+  grd.addColorStop(0.22, glowColorAlpha(color, 0.22));
+  grd.addColorStop(0.5, color);
+  grd.addColorStop(0.78, glowColorAlpha(color, 0.22));
+  grd.addColorStop(1, glowColorAlpha(color, 0));
+  g.globalAlpha = alpha;
+  g.fillStyle = grd;
+  g.beginPath();
+  g.moveTo(x0 + nx * w / 2, y0 + ny * w / 2);
+  g.lineTo(x1 + nx * w / 2, y1 + ny * w / 2);
+  g.lineTo(x1 - nx * w / 2, y1 - ny * w / 2);
+  g.lineTo(x0 - nx * w / 2, y0 - ny * w / 2);
+  g.closePath(); g.fill();
+}
+function addGlowBeam(x0, y0, x1, y1, w, color, alpha) {
+  if (!GLOW.ctx || alpha <= 0) return;
+  var g = GLOW.ctx;
+  g.save();
+  g.globalCompositeOperation = "lighter";
+  g.globalAlpha = alpha;
+  g.strokeStyle = color;
+  g.shadowColor = color;
+  g.shadowBlur = Math.max(7, 13 * Math.max(0.7, CAM.zoom || 1));
+  g.lineWidth = w;
+  g.lineCap = "butt";
+  g.beginPath(); g.moveTo(x0, y0); g.lineTo(x1, y1); g.stroke();
+  g.restore();
+}
+function drawGlowLayer(z) {
+  if (!CFG.glowLayer.enabled) return;
+  var can = ensureGlowCanvas();
+  if (!can) return;
+  var g = GLOW.ctx;
+  var sc = can.width / VW;
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.globalCompositeOperation = "source-over";
+  g.clearRect(0, 0, can.width, can.height);
+  g.setTransform(sc, 0, 0, sc, 0, 0);
+  g.globalCompositeOperation = "lighter";
+  var max = CFG.glowLayer.max || 48;
+  var n = 0, i;
+  var flashes = W.flashes || [];
+  for (i = 0; i < flashes.length && n < max; i++) {
+    var f = flashes[i];
+    if (!(f.life > 0)) continue;
+    var fa = clamp(f.life / f.max, 0, 1);
+    var fx = w2sx(f.x), fy = w2sy(f.y);
+    if (!vis(fx, fy, 180)) continue;
+    addGlowLight(fx, fy, (f.snipe ? 120 : 86) * Math.max(0.5, z), f.snipe ? "rgba(110,210,255,1)" : "rgba(255,175,80,1)", 0.52 * fa);
+    n++;
+  }
+  if (CFG.visualFx.enabled && CFG.visualFx.bulletBloom) {
+    var bbl = W.bullets || [];
+    for (i = 0; i < bbl.length && n < max; i++) {
+      var bb = bbl[i];
+      var bbx = w2sx(bb.x), bby = w2sy(bb.y);
+      if (!vis(bbx, bby, 120)) continue;
+      var bcol = visualFxBulletPalette(bb).glow;
+      if (CFG.visualFx.projectileLight) {
+        var bseg = bb.snipe ? CFG.sniper.len : CFG.bullet.len;
+        var bfly = (bb.ox === undefined) ? bseg : Math.sqrt((bb.x - bb.ox) * (bb.x - bb.ox) + (bb.y - bb.oy) * (bb.y - bb.oy));
+        bseg = Math.min(bseg, bfly);
+        var btx = w2sx(bb.x - Math.cos(bb.ang) * bseg), bty = w2sy(bb.y - Math.sin(bb.ang) * bseg);
+        addGlowBeam(btx, bty, bbx, bby, (bb.snipe ? 4.5 : 2.8), bcol, 0.62);
+        n++;
+      } else {
+        addGlowLight(bbx, bby, (bb.snipe ? 30 : 18) * Math.max(0.6, z), bcol, 0.22); n++;
+      }
+    }
+  }
+  var shocks = W.shocks || [];
+  for (i = 0; i < shocks.length && n < max; i++) {
+    var sk = shocks[i];
+    var sp = clamp(sk.life / sk.max, 0, 1);
+    var sx = w2sx(sk.x), sy = w2sy(sk.y);
+    if (!vis(sx, sy, sk.r * z + 30)) continue;
+    addGlowLight(sx, sy, Math.max(20, sk.r * (1 - sp) * z), sk.col, 0.22 * sp);
+    n++;
+  }
+  for (i = 0; i < W.units.length && n < max; i++) {
+    var u = W.units[i];
+    if (u.dead || !isBossUnit(u)) continue;
+    var bx = w2sx(u.x), by = w2sy(u.y);
+    if (!vis(bx, by, u.r * z + 80)) continue;
+    var col = u.kind === "tyrant" ? "rgba(255,90,50,1)" : "rgba(160,90,210,1)";
+    var br = Math.max(45, u.r * 1.25 * z);
+    var ba = u.kind === "tyrant" ? 0.28 : 0.20;
+    if (u.tyState === "charge") ba += 0.2;
+    addGlowLight(bx, by, br, col, ba);
+    n++;
+  }
+  CTX.save();
+  CTX.globalCompositeOperation = "lighter";
+  CTX.globalAlpha = CFG.glowLayer.strength || 0.48;
+  CTX.drawImage(can, 0, 0, VW, VH);
+  CTX.restore();
+}
+function recordSupported() {
+  return !!(CANVAS && CANVAS.captureStream && typeof MediaRecorder !== "undefined");
+}
+function updateRecordUI() {
+  var b = document.getElementById("recBtn");
+  var i = document.getElementById("recInfo");
+  if (b) b.textContent = REC.active ? "停止录像" : "开始录像";
+  if (i) i.textContent = REC.active ? "录制中…" : "未录制";
+}
+function stopBattleRecord() {
+  if (!REC.active || !REC.rec) return;
+  try { REC.rec.stop(); } catch (e) {
+    REC.active = false;
+    updateRecordUI();
+    toast("录像停止失败");
+  }
+}
+function startBattleRecord() {
+  if (REC.active) { stopBattleRecord(); return; }
+  if (!recordSupported()) { toast("当前浏览器不支持战局录像"); return; }
+  var mime = "";
+  if (MediaRecorder.isTypeSupported) {
+    var list = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+    for (var i = 0; i < list.length; i++) {
+      if (MediaRecorder.isTypeSupported(list[i])) { mime = list[i]; break; }
+    }
+  }
+  try {
+    REC.stream = CANVAS.captureStream(CFG.record.fps || 30);
+    REC.chunks = [];
+    REC.mime = mime;
+    REC.rec = mime ? new MediaRecorder(REC.stream, { mimeType: mime }) : new MediaRecorder(REC.stream);
+    REC.rec.ondataavailable = function (e) {
+      if (e.data && e.data.size) REC.chunks.push(e.data);
+    };
+    REC.rec.onstop = function () {
+      var blob = null;
+      if (REC.chunks.length) blob = new Blob(REC.chunks, { type: REC.mime || "video/webm" });
+      REC.active = false;
+      try { if (REC.stream) REC.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+      REC.rec = null; REC.stream = null;
+      updateRecordUI();
+      if (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = "归墟防线-战局-" + new Date().toISOString().replace(/[:.]/g, "-") + ".webm";
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} try { a.remove(); } catch (e) {} }, 1500);
+        toast("战局录像已生成");
+      } else {
+        toast("没有录到画面");
+      }
+    };
+    REC.active = true;
+    REC.startedAt = Date.now();
+    REC.rec.start(1000);
+    updateRecordUI();
+    toast("开始录制战局");
+  } catch (e) {
+    REC.active = false;
+    REC.rec = null; REC.stream = null; REC.chunks = [];
+    updateRecordUI();
+    toast("战局录像启动失败");
+  }
+}
+function recordReplayFrame() {
+  if (!CFG.replay.enabled || !W || !W.units) return;
+  var interval = CFG.replay.interval || 0.5;
+  if (REPLAY.lastT >= 0 && W.t - REPLAY.lastT < interval) return;
+  REPLAY.lastT = W.t;
+  var arr = [];
+  for (var i = 0; i < W.units.length; i++) {
+    var u = W.units[i];
+    arr.push({
+      id: u.id, kind: u.kind, x: Math.round(u.x * 10) / 10, y: Math.round(u.y * 10) / 10,
+      a: Math.round((u.faceAng || 0) * 100) / 100, dead: u.dead ? 1 : 0,
+      hp: Math.round(u.hp || 0), hero: u.hero || ""
+    });
+  }
+  var bs = [];
+  if (W.bullets) {
+    for (var bi = 0; bi < W.bullets.length && bs.length < 80; bi++) {
+      var b = W.bullets[bi];
+      bs.push({ x: Math.round(b.x * 10) / 10, y: Math.round(b.y * 10) / 10, a: Math.round((b.ang || 0) * 100) / 100, s: b.snipe ? 1 : 0 });
+    }
+  }
+  REPLAY.frames.push({ t: Math.round(W.t * 10) / 10, u: arr, b: bs });
+  if (REPLAY.frames.length > (CFG.replay.max || 300)) REPLAY.frames.shift();
+}
+function updateBossStatsUI() {
+  var el = document.getElementById("bossStatsInfo");
+  if (!el) return;
+  var b = (W && W.bossStats) || {};
+  el.textContent = "暴君精英 " + (b.tyrantSpawns || 0) + " · 冲击 " + (b.tyrantShockHits || 0) +
+    " · 冲撞 " + (b.tyrantDashHits || 0) + " · 巢卵 " + (b.plagueEggs || 0);
+}
+function updateReplayUI() {
+  var el = document.getElementById("replayInfo");
+  if (!el) return;
+  var n = REPLAY.frames.length;
+  var dur = n ? REPLAY.frames[n - 1].t - REPLAY.frames[0].t : 0;
+  el.textContent = n ? ("最近 " + dur.toFixed(1) + " 秒 / " + n + " 帧") : "暂无快照";
+}
+function exportReplay() {
+  if (!REPLAY.frames.length) { toast("还没有战局快照"); return; }
+  var data = {
+    game: GAME_TITLE, version: GAME_VERSION, exportedAt: new Date().toISOString(),
+    interval: CFG.replay.interval || 0.5, frames: REPLAY.frames
+  };
+  var blob = new Blob([JSON.stringify(data)], { type: "application/json" });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement("a");
+  a.href = url;
+  a.download = "归墟防线-战局快照-" + new Date().toISOString().replace(/[:.]/g, "-") + ".json";
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} try { a.remove(); } catch (e) {} }, 1500);
+  toast("战局快照已导出");
+}
+function replayDuration() {
+  if (!REPLAY.frames.length) return 0;
+  return Math.max(0, REPLAY.frames[REPLAY.frames.length - 1].t - REPLAY.frames[0].t);
+}
+function replayFrameIndex(time) {
+  var fs = REPLAY.frames;
+  if (!fs.length) return -1;
+  var t0 = fs[0].t, i;
+  for (i = 0; i < fs.length - 1; i++) if (fs[i + 1].t > t0 + time) break;
+  return i;
+}
+function drawReplayOverlay(z) {
+  if (!REPLAY.open || !REPLAY.frames.length) return;
+  var fs = REPLAY.frames, t0 = fs[0].t;
+  var time = Math.max(0, Math.min(replayDuration(), REPLAY.time));
+  var i = replayFrameIndex(time);
+  if (i < 0) return;
+  var a = fs[i], b = fs[Math.min(fs.length - 1, i + 1)];
+  var span = Math.max(0.001, b.t - a.t);
+  var k = Math.max(0, Math.min(1, (t0 + time - a.t) / span));
+  var bmap = {};
+  for (var j = 0; j < b.u.length; j++) bmap[b.u[j].id] = b.u[j];
+  CTX.save();
+  CTX.setTransform(DPR, 0, 0, DPR, 0, 0);
+  CTX.fillStyle = "rgba(3,7,12,.64)";
+  CTX.fillRect(0, 0, VW, VH);
+  for (var n = 0; n < a.u.length; n++) {
+    var u = a.u[n], v = bmap[u.id] || u;
+    var x = w2sx(u.x + (v.x - u.x) * k);
+    var y = w2sy(u.y + (v.y - u.y) * k);
+    if (x < -20 || y < -20 || x > VW + 20 || y > VH + 20) continue;
+    var c = CFG.unit[u.kind];
+    var col = (c && c.color) || "#9fb4dd";
+    CTX.globalAlpha = u.dead ? 0.18 : 0.86;
+    CTX.fillStyle = col;
+    CTX.beginPath();
+    CTX.arc(x, y, Math.max(3, (u.r || 10) * Math.max(0.35, z)), 0, Math.PI * 2);
+    CTX.fill();
+    CTX.globalAlpha = u.dead ? 0.08 : 0.28;
+    CTX.strokeStyle = "#ffffff";
+    CTX.lineWidth = 1;
+    CTX.stroke();
+    if (!u.dead) {
+      var rad = Math.max(3, (u.r || 10) * Math.max(0.35, z));
+      var ang = u.a || 0;
+      CTX.globalAlpha = 0.8;
+      CTX.strokeStyle = "rgba(255,255,255,.82)";
+      CTX.lineWidth = 1.2;
+      CTX.beginPath();
+      CTX.moveTo(x, y);
+      CTX.lineTo(x + Math.cos(ang) * rad * 4, y + Math.sin(ang) * rad * 4);
+      CTX.stroke();
+    }
+  }
+  var ba = a.b || [];
+  for (var bj = 0; bj < ba.length; bj++) {
+    var bb = ba[bj], bx = w2sx(bb.x), by = w2sy(bb.y);
+    if (bx < -10 || by < -10 || bx > VW + 10 || by > VH + 10) continue;
+    CTX.globalAlpha = 0.8;
+    CTX.fillStyle = bb.s ? "#7fd4ff" : "#ffd27a";
+    CTX.fillRect(bx - 1.2, by - 1.2, 2.4, 2.4);
+  }
+  CTX.globalAlpha = 1;
+  CTX.fillStyle = "rgba(6,10,16,.88)";
+  CTX.fillRect(14, 52, 190, 28);
+  CTX.strokeStyle = "rgba(217,164,65,.55)";
+  CTX.lineWidth = 1;
+  CTX.strokeRect(14.5, 52.5, 189, 27);
+  CTX.fillStyle = "rgba(230,236,245,.95)";
+  CTX.font = "bold 14px system-ui, sans-serif";
+  CTX.textAlign = "left";
+  CTX.fillText("回放 " + time.toFixed(1) + "s / " + replayDuration().toFixed(1) + "s", 24, 71);
+  CTX.restore();
+}
+function updateReplayBar() {
+  if (!REPLAY.open) return;
+  var r = document.getElementById("rpRange");
+  var t = document.getElementById("rpTime");
+  var p = document.getElementById("rpPlay");
+  var c = document.getElementById("rpCam");
+  if (c) c.textContent = "自动镜头：" + (REPLAY.autoCam ? "开" : "关");
+  var dur = replayDuration();
+  if (r) { r.max = String(dur); r.value = String(Math.min(dur, REPLAY.time)); }
+  if (t) t.textContent = REPLAY.time.toFixed(1) + " / " + dur.toFixed(1) + "s";
+  if (p) p.textContent = REPLAY.playing ? "暂停" : "播放";
+}
+function updateReplayCamera() {
+  if (!REPLAY.open || !REPLAY.autoCam || !REPLAY.frames.length) return;
+  var fs = REPLAY.frames, t0 = fs[0].t;
+  var i = replayFrameIndex(Math.max(0, Math.min(replayDuration(), REPLAY.time)));
+  if (i < 0) return;
+  var au = fs[i].u, mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity, n = 0;
+  for (var j = 0; j < au.length; j++) {
+    if (au[j].dead) continue;
+    mnx = Math.min(mnx, au[j].x); mxx = Math.max(mxx, au[j].x);
+    mny = Math.min(mny, au[j].y); mxy = Math.max(mxy, au[j].y); n++;
+  }
+  if (!n) return;
+  CAM.x = clamp((mnx + mxx) / 2, 0, CFG.world.w);
+  CAM.y = clamp((mny + mxy) / 2, 0, CFG.world.h);
+  CAM.zoom = clamp(Math.min(VW / Math.max(320, mxx - mnx + 420), VH / Math.max(240, mxy - mny + 300)), 0.4, 1.15);
+}
+function stepReplay(dt) {
+  if (!REPLAY.open || !REPLAY.playing) return;
+  REPLAY.time += dt;
+  if (REPLAY.time >= replayDuration()) {
+    REPLAY.time = replayDuration();
+    REPLAY.playing = false;
+  }
+  updateReplayCamera();
+  updateReplayBar();
+}
+function openReplay() {
+  if (REPLAY.frames.length < 2) { toast("还没有足够的战局快照"); return; }
+  REPLAY.open = true;
+  REPLAY.playing = false;
+  REPLAY.time = 0;
+  REPLAY.autoCam = true;
+  REPLAY.cam = { x: CAM.x, y: CAM.y, zoom: CAM.zoom };
+  REPLAY.wasPaused = W.paused;
+  W.paused = true;
+  var bar = document.getElementById("replayBar");
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.id = "replayBar";
+    bar.style.cssText = "position:fixed;left:50%;bottom:84px;transform:translateX(-50%);z-index:80;display:flex;align-items:center;gap:10px;max-width:calc(100vw - 32px);padding:10px 12px;background:rgba(12,18,28,.96);border:1px solid #35507f;border-radius:10px;box-shadow:0 12px 36px rgba(0,0,0,.6);color:#dfe6f5;font:13px system-ui,sans-serif";
+    bar.innerHTML = "<button id='rpPlay' style='min-width:64px'>播放</button><button id='rpCam'>自动镜头：开</button><input id='rpRange' type='range' min='0' max='1' step='0.05' style='width:min(30vw,300px)'><b id='rpTime'>0 / 0s</b><button id='rpClose'>关闭</button>";
+    document.body.appendChild(bar);
+    document.getElementById("rpPlay").addEventListener("click", function () {
+      if (REPLAY.time >= replayDuration()) REPLAY.time = 0;
+      REPLAY.playing = !REPLAY.playing;
+      updateReplayBar();
+    });
+    document.getElementById("rpClose").addEventListener("click", closeReplay);
+    document.getElementById("rpCam").addEventListener("click", function () {
+      REPLAY.autoCam = !REPLAY.autoCam;
+      updateReplayCamera();
+      updateReplayBar();
+    });
+    document.getElementById("rpRange").addEventListener("input", function () {
+      REPLAY.time = parseFloat(this.value) || 0;
+      REPLAY.playing = false;
+      updateReplayCamera();
+      updateReplayBar();
+    });
+  }
+  bar.style.display = "flex";
+  updateReplayCamera();
+  updateReplayBar();
+  toast("战局快照回放");
+}
+function closeReplay() {
+  REPLAY.open = false;
+  REPLAY.playing = false;
+  if (REPLAY.cam) { CAM.x = REPLAY.cam.x; CAM.y = REPLAY.cam.y; CAM.zoom = REPLAY.cam.zoom; }
+  W.paused = !!REPLAY.wasPaused;
+  var bar = document.getElementById("replayBar");
+  if (bar) bar.style.display = "none";
+}
+function frame(now) {
+  requestAnimationFrame(frame);
+  updateMobileFloat();
+  var dt = (now - lastFrameT) / 1000;
+  lastFrameT = now;
+  if (!isFinite(dt) || dt <= 0) dt = 0;
+  if (dt > 0.25) dt = 0.25;
+  if (REPLAY.open) stepReplay(dt);
+  /* 震动计时放在渲染帧而不是模拟步里：暂停、打开面板时也会自然衰减，不会永久抖动 */
+  if (W.shakeT > 0) {
+    W.shakeT -= dt;
+    if (W.shakeT <= 0) { W.shakeT = 0; W.shakeMag = 0; }
+  }
+  if (W.shakeDur > (CFG.shake.maxDur || 0.7)) W.shakeDur = CFG.shake.maxDur || 0.7;
+  if (W.shakeT > W.shakeDur) W.shakeT = W.shakeDur;
+  if (!REPLAY.open) {
+    handlePanKey(dt);
+    stepZoom(dt);
+    stepPlayerInput(dt);
+    /* 镜头优先级：手动推镜 > 跟拍某单位 > 跟随玩家 */
+    if (!stepCameraFocus(dt)) {
+      var cf = DIRECTOR.camFollow;
+      if (cf && !cf.dead) {
+        var ck = Math.min(1, dt * 6);
+        CAM.x += (cf.x - CAM.x) * ck;
+        CAM.y += (cf.y - CAM.y) * ck;
+        CAM.x = clamp(CAM.x, 0, CFG.world.w);
+        CAM.y = clamp(CAM.y, 0, CFG.world.h);
+      } else {
+        if (cf) DIRECTOR.camFollow = null;
+        followPlayerCamera(dt);
+      }
+    }
+  }
+  updateEndFx(dt);
+  /* 网络消息和"游戏是否暂停"无关：对面在玩的时候，
+     这边就算暂停着也该把收到的指令落地，不能攒到解除暂停才一次性冒出来 */
+  if (NET && NET.on) NET.step();
+  /* 成员：把房主最新的快照揉进本地世界（房主权威，这边只是跟随） */
+  if (NET.on && NET.role === "guest" && SNET.last) {
+    applySnapshot(SNET.last);
+  }
+  /* 帧号心跳：不管这一帧推不推进模拟，都要让对方知道我还活着、跑到哪了。
+     停止上报会导致「互相等待 → 双双冻住」的死锁 */
+  if (LOCK.on && NET.on) {
+    var nowMs0 = Date.now();
+    if (LOCK.frame - LOCK.lastTick >= 30 || nowMs0 - (LOCK.lastTickMs || 0) > 1000) {
+      LOCK.lastTick = LOCK.frame;
+      LOCK.lastTickMs = nowMs0;
+      NET.send({ t: "tick", f: LOCK.frame });
+    }
+  }
+  /* 编辑地形、看帮助、结算时都暂停演算 */
+  if (!W.paused && !W.over && overlayEl.className !== "show" && !EDIT.active) {
+    /* 重同步之后的追帧：按房主的进度空跑到同一帧。
+       每帧最多跑 40 步，跑完就交还一帧渲染时间，画面不会定住 */
+    if (RESYNC.active) {
+      var rn = 0;
+      while (RESYNC.active && LOCK.frame < RESYNC.target && rn < 15) {
+        var _pt0 = perfNow();
+    stepSim(CFG.step);
+    PERF.sim = perfNow() - _pt0;
+        rn++;
+      }
+      if (LOCK.frame >= RESYNC.target) {
+        RESYNC.active = false;
+        LOCK.mismatch = 0;
+        toast("已追上房主的进度");
+      }
+      accum = 0;
+    } else {
+      /* 联机时帧号不能跑飞：设备快的这边如果领先对面太多，就先停下来等。
+         不做这一步的话，60fps 对 55fps 跑三分钟就差出上百帧，两边的世界再也对不上 */
+      var waitPeer = LOCK.on && LOCK.peerFrame >= 0 && LOCK.frame > LOCK.peerFrame + LOCK.leadLimit;
+      if (waitPeer) {
+        /* 保险一：对面半秒没消息，多半是掉线或切后台了，不能死等 */
+        if (Date.now() - (LOCK.peerFrameT || 0) > 800) waitPeer = false;
+        /* 保险二：自己已经等了超过 1.5 秒，放弃等待硬着头皮走，宁可短暂不同步也别冻住 */
+        if (waitPeer) {
+          LOCK.waitSince = LOCK.waitSince || Date.now();
+          if (Date.now() - LOCK.waitSince > 1500) waitPeer = false;
+        }
+      }
+      if (!waitPeer) LOCK.waitSince = 0;
+      if (waitPeer) {
+        accum = 0;
+      } else {
+        accum += dt * W.speed;
+        var steps = 0;
+        var _sim0 = perfNow();
+        while (accum >= CFG.step && steps < CFG.maxSteps) {
+          stepSim(CFG.step);
+          accum -= CFG.step;
+          steps++;
+          if (W.over) break;
+        }
+        if (steps > 0) PERF.sim = perfNow() - _sim0;
+        if (accum > CFG.step * CFG.maxSteps) accum = 0;
+      }
+    }
+    stepWaves(dt);
+    stepKillFeed(dt);
+    stepPops(dt);
+  }
+  autoSaveT += dt;
+  if (autoSaveT >= CFG.autoSaveSec && !W.over) { autoSaveT = 0; saveGame(true); }
+  if (toastT > 0) { toastT -= dt; if (toastT <= 0 && toastEl) toastEl.style.opacity = "0"; }
+  stepStory(dt);
+  fpsAcc += dt; fpsN++;
+  if (fpsAcc >= 0.5) { fpsShown = Math.round(fpsN / fpsAcc); PERF.fps = fpsShown; fpsAcc = 0; fpsN = 0; updatePerfLine(); qualityTick(); }
+  var _pr0 = perfNow();
+  render();
+  PERF.render = perfNow() - _pr0;
+  updateHUD();
+  updateEconHud(dt);
+  updateCtxHint();
+}
+/* ---------------- 版本更新公告 ---------------- */
+/* 公告每次刷新页面都会弹一次；菜单里的「更新公告」也能随时再打开。
+   GAME_VERSION 只用来显示版本号，不参与"弹不弹"的判断 */
+var GAME_VERSION = "3.0.1";
+/* 品牌名：只改这里，标题/首页/帮助/存档码都会跟着变 */
+var GAME_TITLE = "归墟防线";
+var GAME_TITLE_EN = "THE LAST LINE";
+/* 按版本倒序排列，最新的在最上面。
+   公告只展示前三项，再多就变成流水账了，玩家根本不会往下翻 */
+var PATCH_VERSIONS = [
+  {
+    v: "3.0.1", d: "2026-11-15",
+    title: "UI 紧凑化与战果榜可读性",
+    items: [
+      "界面紧凑化：面板内边距、标题间距、列表与按钮排布统一收紧。",
+      "战果榜重做：数值移出比例条，字号提高至 12px，前三名改为左侧金银铜色条与名次标记。",
+      "难度预设改为五等分卡片，选中态使用顶部琥珀条；难度说明改为左侧强调条。",
+      "桌面顶栏与底栏按钮收敛至 34px，移动端保持 44px 触控高度；移动底栏支持换行。",
+      "手机悬浮键默认透明度由 25% 提高至 55%，猛扑键扩大至 64px。",
+      "更新公告与设置面板同步收紧留白，减少首屏滚动。"
+    ]
+  },
+  {
+    v: "3.0.0", d: "2026-11-15",
+    title: "3.0 正式版：实验分支全量合并",
+    items: [
+      "3.0 正式版发布，实验分支完成合并，后续迭代从 3.0 起算。",
+      "新增简单、普通、困难、极限与自定义五档防线预设，默认普通；胜负条件与地图选择独立显示，简单与自定义可调丧尸规模。",
+      "普通、困难、极限每波数量分别调整为 150、300、400；困难补齐英雄模式，极限启用双首领。",
+      "首领池加入连续抽取保底：连续两次同一首领后，第三次强制更换。",
+      "毁灭暴君蓄力与冲刺冷却减半；冲撞未命中时后撤并立即再次蓄力，冲撞期间减伤 70%。",
+      "暴君召唤量随本局出场次数递增；双首领波次一次生成两名不同首领。",
+      "首领宽体寻路、绕行选点与卡住重选机制调整，降低大型首领卡入窄缝的概率。",
+      "特殊事件波改为全地图每 2 波轮换；奔跑者、爆裂体、舔舐者按比例重编，递增强度可独立开关。",
+      "民兵重做：武装单位尸变时 1% 概率武装一名平民；民兵按平民判定，可被治疗，感染后自爆；英雄形态获得平民与武装双赐福。",
+      "盾兵与民兵的自爆倒计时可被医疗兵清除。",
+      "新投放人类单位落地弹匣补满，并获得 0.55 秒整备期。",
+      "结算与暂停摘要新增兵种击杀、伤害 Top 5 柱状图，支持金/银/铜边框与 K/W/E/C/B/A 数值格式，统计随重置换局清零。",
+      "画面设置新增极简统计，默认仅显示人类与丧尸总占比；关闭后显示详细兵种占比。",
+      "手机悬浮按钮改为战斗接管后显示；修复手机猛扑按钮触发。",
+      "护送模式新增五步新手教程；攻防教程改为弱引导，不再逐项手把手。",
+      "画面增强 2.0 合并进正式版：弹道配色、激光与雷电多层光效、墙面反射、湿地倒影、暗角与冷色校正。",
+      "人类行为、支援手雷、盾兵火力与首领免疫控制等既有实验修正一并合并。",
+      "港口与回放功能继续冻结；其现有入口与行为不在本版本扩展。"
+    ]
+  },
+  {
+    v: "2.9.88.1a", d: "2026-11-14",
+    title: "巢主递减阶段血量",
+    items: [
+      "瘟疫巢主总血量提升到 2000。",
+      "五段阶段血量改为递减：560 / 480 / 400 / 320 / 240。",
+      "阶段血条按实际递减宽度显示，不再五等分。",
+      "产卵数量继续随阶段递增：2 / 4 / 6 / 8 / 10 枚。"
+    ]
+  },
+  {
+    v: "2.9.87.1a", d: "2026-11-14",
+    title: "暴君冲撞结算与护盾显示",
+    items: [
+      "精英奔跑者改为冲撞结束后生成，不再在蓄力或冲撞开始时生成。",
+      "血珠溢出护盾转化率提高到 100:1，每 1 点溢出恢复量转化 100 点护盾。",
+      "首领血条在总血量数字左侧以括号显示临时护盾值，颜色与对应护盾条一致。"
+    ]
+  },
+  {
+    v: "2.9.86.1a", d: "2026-11-14",
+    title: "地形编辑器功能重整",
+    items: [
+      "地形编辑器默认吸附网格从 4px 改为 32px。",
+      "编辑器按编辑块、单位块、关卡要素块、其他块重新分组，每组独立标题和展开块。",
+      "绘制方式独立成标题与展开块；地形分析与生成合并为可折叠块。",
+      "自定义地块移到其他块最下方，橡皮擦归入编辑块。"
+    ]
+  },
+  {
+    v: "2.9.85.1a", d: "2026-11-14",
+    title: "首领池",
+    items: [
+      "新增首领池，瘟疫巢主与毁灭暴君等概率出现。",
+      "首领波次改为从首领池随机抽取一名首领。",
+      "设置页首领波次说明同步改为随机首领池。"
+    ]
+  },
+  {
+    v: "2.9.84.1a", d: "2026-11-14",
+    title: "首领提速与窄巷禁冲",
+    items: [
+      "瘟疫巢主基础移速从 9.6 提高到 28.8，毁灭暴君从 28.8 提高到 86.4，均提升 3 倍。",
+      "暴君冲撞前检查整条冲撞路径的体型净空，窄巷内不会触发冲撞。",
+      "暴君后退重新寻路期间禁止再次锁敌冲撞，避免被拉回窄巷形成循环。"
+    ]
+  },
+  {
+    v: "2.9.83.1a", d: "2026-11-14",
+    title: "首领寻路重试",
+    items: [
+      "首领寻路失败时不再进入普通放弃冷却，而是先退开再重新寻找宽路。",
+      "首领没有可走路径时会朝远离目标方向退让，避免在窄口封路。",
+      "路径恢复后按宽路绕行，不再沿普通丧尸的直线视线硬穿窄缝。"
+    ]
+  },
+  {
+    v: "2.9.82.1a", d: "2026-11-13",
+    title: "首领净空绕路",
+    items: [
+      "首领不再套用普通丧尸的直线视线判定，改为按体型净空判断。",
+      "首领寻路使用半体型净空半径，优先绕行可以通过的宽路。",
+      "首领找不到宽路时不再硬顶窄口，会后退让路。"
+    ]
+  },
+  {
+    v: "2.9.81.1a", d: "2026-11-13",
+    title: "巢主窄口让路",
+    items: [
+      "巢主在窄口停滞超过 1.15 秒时，会退到附近更开阔的位置，而不是继续硬挤。",
+      "后退持续 3 秒，期间其他丧尸可以从缺口通过，避免巢主把整条路封死。",
+      "后退方向优先远离最近人类，并选择视线通透、离墙更远的位置。"
+    ]
+  },
+  {
+    v: "2.9.80.1a", d: "2026-11-13",
+    title: "毁灭暴君逃跑与阶段冲击",
+    items: [
+      "无敌阶段改为以 6 倍速度远离人类逃跑，不再原地定身。",
+      "狭窄地形卡住时朝远离人类方向反向冲刺，结束后立即恢复巡逻与锁敌。",
+      "阶段技能额外释放一次冲击波并生成 30 名精英奔跑者。",
+      "血珠溢出护盾转化率由 10:1 上调至 30:1，5 点溢出换 150 点护盾。"
+    ]
+  },
+  {
+    v: "2.9.79.1a", d: "2026-11-13",
+    title: "毁灭暴君冲撞精英与护盾",
+    items: [
+      "精英奔跑者改为每次冲撞时生成，不再由阶段技能生成。",
+      "冲撞冲击波的判定范围和视觉范围翻倍，半径提升到平民恐惧范围的 3 倍。",
+      "血珠溢出恢复量改为 10:1 转化护盾，每 5 点溢出增加 50 点护盾。"
+    ]
+  },
+  {
+    v: "2.9.78.1a", d: "2026-11-13",
+    title: "毁灭暴君冲撞与阶段加强",
+    items: [
+      "冲撞撞到地图边界或护盾边沿也会触发冲击波。",
+      "冲撞命中的护盾直接扣除 20 秒感染抵御时间，护盾接触伤害与瘟疫巢主一致。",
+      "阶段技能期间暴君无敌且定身，直到所有血珠吸收完毕。",
+      "阶段技能额外生成 10 名精英奔跑者，体型略大、血量为奔跑者 5 倍，不参与本次血珠结算。"
+    ]
+  },
+  {
+    v: "2.9.77.1a", d: "2026-11-13",
+    title: "毁灭暴君范围与生成调整",
+    items: [
+      "暴君视线锁敌距离和最大冲撞距离各增加 6 倍。",
+      "每 0.1 秒生成的奔跑者数量从 1 只提高到 3 只。",
+      "奔跑者优先从护送模式生存区或攻防模式波次刷新区生成。",
+      "杀戮血珠溢出恢复量改为 1:1 转化为橘红临时护盾。"
+    ]
+  },
+  {
+    v: "2.9.76.1a", d: "2026-11-13",
+    title: "毁灭暴君",
+    items: [
+      "新增丧尸首领毁灭暴君：奔跑者浅红配色、半巢主体型、三倍巢主移速，5 段阶段血条。",
+      "暴君每 0.1 秒在刷新点生成奔跑者，遵守单位上限。",
+      "暴君掉一格血吞噬当前场上三分之二可移动丧尸，生成红色血珠回血；回血不超过当前阶段上限，溢出按 10:1 转橘红临时护盾。",
+      "暴君周期性搜索人类，3 秒蓄力后沿锁定路径冲撞；冲撞命中引发橘红冲击波，击飞并施加双倍自爆减速，无伤害。",
+      "暴君阵亡引发全屏橘红冲击波，仅击飞和减速；阶段血条、预览条和血珠均使用世界坐标。"
+    ]
+  },
+  {
+    v: "2.9.75.1a", d: "2026-11-13",
+    title: "首领自盾恢复与友方护盾减半",
+    items: [
+      "首领治愈冲击波给自己的护盾恢复为最大血量 10%。",
+      "冲击波对其他单位的护盾增量公式减半：每 10 点血量上限额外 5 点护盾。",
+      "首领绿色护盾容量条仍按当前容量实时缩短。"
+    ]
+  },
+  {
+    v: "2.9.74.1a", d: "2026-11-13",
+    title: "首领护盾减半与实时显示",
+    items: [
+      "首领治愈冲击波给自己提供的护盾，从最大血量 10% 减半为 5%。",
+      "绿色护盾容量条按当前护盾上限归一化，满盾铺满。",
+      "护盾受到伤害时绿色条实时缩短，护盾破裂后才完全消失。"
+    ]
+  },
+  {
+    v: "2.9.73.1a", d: "2026-11-13",
+    title: "首领掉血产母体",
+    items: [
+      "回滚母体掉血爆产 10 名母体的改动，母体恢复为产普通丧尸。",
+      "巢主每被打掉一格血，在身旁产下 10 名母体。",
+      "疫卵仍为每枚只孵化 1 名母体，每轮产卵数量翻倍。"
+    ]
+  },
+  {
+    v: "2.9.72.1a", d: "2026-11-13",
+    title: "巢主产卵与母体爆产",
+    items: [
+      "每枚疫卵现在只孵化 1 名母体。",
+      "巢主每轮产卵数量翻倍，满血 2 枚，掉血后逐级增加到最多 12 枚。",
+      "母体每被打掉一格血，释放一次无伤害冲击波。",
+      "母体每次触发掉血冲击波时，在身旁产下 10 名母体。"
+    ]
+  },
+  {
+    v: "2.9.71.1a", d: "2026-11-13",
+    title: "首领护盾条全宽覆盖",
+    items: [
+      "护盾存在时，浅绿色护盾条拉满整个血条长度。",
+      "护盾实际容量不变，内部亮色仍按剩余容量收缩。",
+      "血条被护盾完全覆盖，护盾耗尽后才露出红色血量。"
+    ]
+  },
+  {
+    v: "2.9.70.1a", d: "2026-11-13",
+    title: "多首领血条与护盾覆盖",
+    items: [
+      "Boss 血条高度压缩约一半，横向长度保持不变。",
+      "场上每名瘟疫巢主独立显示一条血条，依次向下排列。",
+      "巢主每次释放治愈冲击波给自己增加 10% 最大血量的护盾。",
+      "护盾容量以浅绿色柱状条覆盖在血条上，护盾减少时逐步露出下方血条。"
+    ]
+  },
+  {
+    v: "2.9.69.1a", d: "2026-11-13",
+    title: "多首领互疗修复",
+    items: [
+      "治愈冲击波不再影响任何首领级单位，包括另一名瘟疫巢主。",
+      "首领单位不会获得治愈护盾，避免双首领互相回血叠盾导致无法击杀。"
+    ]
+  },
+  {
+    v: "2.9.68.1a", d: "2026-11-13",
+    title: "后排前压与巢主护盾机制",
+    items: [
+      "前排接敌后，后排会主动前压到自身射程，并按阵型槽位向两侧分开，避免把前排推进尸堆。",
+      "巢主疫卵数量随掉血段数增加：满血 1 枚，掉 1 格 2 枚，依此类推。",
+      "治愈冲击波护盾永久叠加，不再随时间消失，巢主死亡也不清除。",
+      "母体获得 4 倍半径浅绿色能量盾，可拦截普通子弹，但狙击、激光、英雄喷火和磁暴链可穿透。",
+      "多个母体护盾只合并视觉边缘，每个护盾容量独立计算。"
+    ]
+  },
+  {
+    v: "2.9.67.1a", d: "2026-11-13",
+    title: "巨型单位索敌与范围判定",
+    items: [
+      "所有索敌范围按目标体表计算，后排士兵不再因为首领圆心太远而站着不开火。",
+      "磁暴连锁按双方体表距离计算，首领可以连到周围母体，母体也能连回首領。",
+      "液氮、喷火、激光、火焰地面、冲击波与爆炸范围均按单位半径扩展。",
+      "首领的血量阶段治愈波只作用于实际范围内的丧尸。"
+    ]
+  },
+  {
+    v: "2.9.66.1a", d: "2026-11-12",
+    title: "士兵墙角堆积修复",
+    items: [
+      "人类单位长时间贴墙不动且远离坚守点位时，会沿墙法线获得一次脱困速度。",
+      "脱困不会传送穿墙，只清空当前路径并施加短促推力。",
+      "坚守点位附近与正常待命单位不会被误判为卡墙。"
+    ]
+  },
+  {
+    v: "2.9.65.1a", d: "2026-11-12",
+    title: "震动滑块与首领波次修复",
+    items: [
+      "补上震动滑块、开关、距离衰减的即时事件绑定，拖动时百分比实时变化。",
+      "保存当前设置会强制写回界面值，关闭再打开可正确恢复。",
+      "开启首领波次时自动启用波次模式，并保证波次数量不少于首领间隔。"
+    ]
+  },
+  {
+    v: "2.9.64.1a", d: "2026-11-12",
+    title: "设置保存与首领波次修复",
+    items: [
+      "设置与画面新增「保存当前设置」按钮，强制把震动开关、系数、距离衰减写回全局配置与本地存储。",
+      "首领波次开启时自动保证波次数量不少于首领间隔，避免首领永远不到场。",
+      "震屏上限降为 3，单次最长 0.7 秒，暂停立即停止。"
+    ]
+  },
+  {
+    v: "2.9.63.1a", d: "2026-11-12",
+    title: "震屏设置修复与距离衰减",
+    items: [
+      "修复震屏开关和强度系数离开设置页后不保存的问题。",
+      "震屏增加强度上限和时长上限，不再无限持续。",
+      "暂停时立即清除当前震动，暂停期间计时照常衰减。",
+      "新增按镜头距离衰减普通震动的开关；特殊事件保留全局震动。",
+      "首领控制抗性、接触防护消耗、治愈冲击范围和死亡母体数量同步保留。"
+    ]
+  },
+  {
+    v: "2.9.62.1a", d: "2026-11-11",
+    title: "首领受击体积修正",
+    items: [
+      "激光束命中判定加入目标半径，首领不再只有圆心一个小受击点。",
+      "激光查询范围随目标体型扩展，巨型首领的身体边缘也能被光束扫到。"
+    ]
+  },
+  {
+    v: "2.9.61.1a", d: "2026-11-11",
+    title: "震屏设置与首领抗性",
+    items: [
+      "屏幕震动增加强度上限，任何冲击波与爆炸都不会超过阈值。",
+      "设置与画面新增屏幕震动开关与强度系数滑块，配置会保存。",
+      "首领级单位受到的所有控制效果降至一成：击退、减速、击飞、眩晕、闪电麻痹与液氮减速均按 90% 抗性处理。",
+      "丧尸接触防护道具按每秒扣除防护时长；首领接触每秒扣除 5 倍。",
+      "治愈冲击波范围扩大到 900，颜色加深并增加多层可见冲击环。",
+      "瘟疫巢主死亡爆裂增强，死亡母体从 10 只增加到 30 只。",
+      "首领波次默认间隔从 5 波改为 10 波。",
+      "疫卵固定不可被任何位移效果推动。"
+    ]
+  },
+  {
+    v: "2.9.60.1a", d: "2026-11-11",
+    title: "瘟疫巢主与首领波次",
+    items: [
+      "新增丧尸首领瘟疫巢主：30 倍体型、母体 1/10 速度、15 倍血量、深紫配色。",
+      "巢主每 5 秒分散产下 3 枚可攻击疫卵；卵孕育 3 秒后每秒释放 1 只母体，第 3 只时破裂并释放无伤害浅绿冲击波。",
+      "巢主血量跌破 1/5 界限时释放无伤害黄绿冲击波；未满血丧尸回满，满血丧尸获得 1 倍血量上限的临时额外生命。",
+      "巢主死亡爆裂无伤害，留下 10 只分散母体；击杀奖励 10000 资源。",
+      "顶部红色五段 Boss 血条，自动避开经济计数和键位提示。",
+      "波次模式新增首领波次开关与每 N 波间隔滑块，默认每 5 波一只。",
+      "巢主与疫卵加入所有可放置单位条目表，并接入世界坐标、存档与临时生命机制。"
+    ]
+  },
+  {
+    v: "2.9.59.1a", d: "2026-11-09",
+    title: "可破坏墙与极简墙体",
+    items: [
+      "丧尸会主动拆掉挡在目标前方的可破坏墙，每次攻击扣减耐久，耐久归零后移除并重建寻路。",
+      "普通墙体改为极简纯色，去掉砖缝、木纹和分段高光，相邻墙体合并填充，接缝不再可见。",
+      "可破坏墙改为两端浅灰、中段黄黑警戒带。",
+      "保留墙面矢量绘制、高矮墙明暗区分与墙体外轮廓。"
+    ]
+  },
+  {
+    v: "2.9.58.1a", d: "2026-11-09",
+    title: "配件市场演示报错修复",
+    items: [
+      "修复护送模式打开装备市场时，演示世界错误继承护送模式导致 prisonDoor 为空报错。",
+      "角色编辑与装备市场演示世界强制使用防线模式。",
+      "护送目标函数增加空门防御，旧存档或异常状态不再中断演示。"
+    ]
+  },
+  {
+    v: "2.9.57.1a", d: "2026-11-09",
+    title: "墙体接缝合并与墙面绘制",
+    items: [
+      "相邻同类型墙体自动合并外轮廓，去掉内部接缝线，看起来像一整块墙。",
+      "高墙改为竖向砖缝与砌层纹理，矮墙改为浅色横向木板纹理，高度区分更明显。",
+      "地形编辑器新增「墙面绘制」窗口。",
+      "墙面绘制支持钢笔、笔刷、直线、曲线、油漆桶、多行文字、调色盘与笔宽。",
+      "绘制图层只显示在墙体与建筑内部，并随地图保存、撤销、重做与重置。"
+    ]
+  },
+  {
+    v: "2.9.56.1a", d: "2026-11-09",
+    title: "帮助调试入口恢复与场景提示位置",
+    items: [
+      "修复从帮助页进入角色编辑后，排查与调试控件随旧面板一起被销毁的问题。",
+      "角色编辑关闭时按入口来源返回帮助与其他或设置页，调兵种入口保持存在。",
+      "场景提示条从底栏上方移到顶栏下方，不再遮挡场内兵种占比条。",
+      "角色编辑与装备市场演示继续隐藏场内占比条。"
+    ]
+  },
+  {
+    v: "2.9.55.1a", d: "2026-11-09",
+    title: "帮助入口、演示统计条与引导位置",
+    items: [
+      "帮助与术语页新增稳定的角色编辑入口，关闭角色编辑后回到帮助页，入口不会丢失。",
+      "帮助页的教程、快捷键、开战设置、关闭按钮补齐绑定。",
+      "角色编辑与装备市场演示中隐藏场内兵种占比统计条，不再挡住演示单位。",
+      "新手引导提示栏从底栏上方移到顶栏下方，电脑与手机都不再遮挡场内占比条。"
+    ]
+  },
+  {
+    v: "2.9.54.1a", d: "2026-11-09",
+    title: "磁暴树状闪电链",
+    items: [
+      "磁暴主干闪电连接数量等于最大连锁数。",
+      "每个主干命中点分叉两条分支闪电，每条分支再分叉两条末枝闪电。",
+      "末枝不再继续分裂。",
+      "主干、分支、末枝共用已连接目标表，绝不会重复命中同一单位。",
+      "全部分支按各自实际位置寻找最近且未连接的目标。"
+    ]
+  },
+  {
+    v: "2.9.53.1a", d: "2026-11-09",
+    title: "护盾展开期间屏障生效",
+    items: [
+      "护盾不再等完全展开才形成屏障。",
+      "护盾从原点长大，当前半径多大就阻挡多大范围。",
+      "展开期间丧尸阻挡、舌头阻断、耐久扣除和分段冲击波同步生效。",
+      "展开完成只是达到最大半径，不是屏障启用条件。"
+    ]
+  },
+  {
+    v: "2.9.52.1a", d: "2026-11-09",
+    title: "舌头护盾阻断",
+    items: [
+      "舔舐者舌头触及军团能量护盾或英雄盾兵护盾时，立即收回舌头。",
+      "舌头被护盾挡住只进入回收，不扣舌头血量，不判定断裂。",
+      "军团护盾展开完成前不阻断舌头，展开后才形成屏障。"
+    ]
+  },
+  {
+    v: "2.9.51.1a", d: "2026-11-09",
+    title: "军团护盾展开与信标",
+    items: [
+      "大型蓝色护盾改为落地 1 秒后从原点迅速展开，不再瞬间生成。",
+      "护盾展开期间半径与透明度渐变，展开完成后才接管阻挡与耐久。",
+      "军团信标改为精确落点，不再被自由落点偏移。",
+      "信标改为点状光效 + 冲天细光柱，绿色高频闪烁。",
+      "军团主力价格提升至 10000。"
+    ]
+  },
+  {
+    v: "2.9.50.1a", d: "2026-11-09",
+    title: "军团轨道舱重做",
+    items: [
+      "废弃旧军团空投，重做完整状态机：信标、钝击、呼啸、砸落、护盾、释放、护盾破裂、爆炸、结束。",
+      "空降舱砸落造成 1.5 倍平民恐惧范围真实击退与 0.1 伤害，强制伪 3D 击飞。",
+      "落地立即展开约两倍英雄盾兵半径的蓝色能量护盾，耐久沿用盾兵英雄护盾。",
+      "护盾每掉一段复用盾兵护盾冲击波；护盾破裂是空降舱爆炸的唯一条件。",
+      "军团士兵每 0.3 秒释放一名，出现即围绕空降舱防守，全部释放后恢复正常 AI。",
+      "最终爆炸复用航弹伤害准则，含冲击波、烟雾、火焰、碎石与短促震屏。",
+      "信标、舱体、护盾、军团队伍全部使用世界坐标。"
+    ]
+  },
+  {
+    v: "2.9.49.1a", d: "2026-11-09",
+    title: "航弹梯度伤害与强击退",
+    items: [
+      "航弹爆心伤害 6 点，每偏移一个机枪兵恐惧半径降低 1 点。",
+      "航弹中心击退距离改为平民恐惧半径 1.2 倍，向外递减，可把中心丧尸推出恐惧范围。",
+      "航弹显形瞬间追加一次 0.1 伤害的纯特效砸地冲击，不给击退，只播放伪 3D 击飞。",
+      "航弹爆炸保留短促震屏、永久弹坑与七秒渐隐。"
+    ]
+  },
+  {
+    v: "2.9.48.1a", d: "2026-11-09",
+    title: "空降速度与弹坑修正",
+    items: [
+      "战斗机掠过速度从约 2 倍子弹速度降到约 1.3 倍，剪影可见时间更长。",
+      "运输机阴影只在横穿期间绘制，掠过地图右侧后立即消失，不再长时间停留。",
+      "航弹弹坑改为 7 秒后开始渐变，约 8 秒完全消失。",
+      "伞兵全部改用世界坐标，拖动地图时轨迹、落点、开火目标不再漂移。",
+      "伞兵按自身武器配置开火，不再统一射速。"
+    ]
+  },
+  {
+    v: "2.9.47.1a", d: "2026-11-09",
+    title: "特化空降修正",
+    items: [
+      "战斗机剪影置顶绘制并增加残影/亮边，不再被航弹、爆炸或运输机阴影遮挡。",
+      "航弹默认不可见，战斗机掠过落点上方时才切换为斜插地面的可见状态。",
+      "运输机阴影改为宽大机体椭圆 + 两侧机翼阴影，约地图 2/3 大小。",
+      "伞兵入场点、轨迹、落点、开火目标全部使用世界坐标。",
+      "伞兵按各自武器配置开火：狙击慢速单发、机枪连射、喷火短间隔、盾兵手枪。",
+      "航弹伤害 4.9、永久弹坑与短促震屏保留。"
+    ]
+  },
+  {
+    v: "2.9.46.1a", d: "2026-11-09",
+    title: "特化部队空降系统",
+    items: [
+      "特化部队改为完整状态机：战斗机投弹、航弹嵌入、爆炸、运输机阴影、伞兵悬挂战斗、降落、结束。",
+      "航弹伤害 4.9，爆炸半径约为手榴弹 5 倍，留下永久弹坑。",
+      "战斗机剪影从右上到左下掠过，航弹瞬间半插地，短促震动与扬尘。",
+      "运输机只显示约地图 2/3 大小的阴影，固定从左侧向右侧高速穿过。",
+      "伞兵从屏幕左上角分散、错峰出现，各带淡绿伞盖与墨绿伞绳，朝点击落点钟摆飘落。",
+      "挂伞期间朝落点区域丧尸开火，高空无碰撞、不可感染；落地后恢复地面规则。",
+      "落地后降落伞上下压缩成线并消失。"
+    ]
+  },
+  {
+    v: "2.9.45.1a", d: "2026-11-08",
+    title: "绳索比例与攀附高度",
+    items: [
+      "绳索线宽收细，改为纯棕色绳身。",
+      "士兵攀附高度改为世界坐标，不再随镜头缩放上下漂移。",
+      "放大画面时士兵相对地面升高，缩小画面时降低，与绳索比例一致。",
+      "绳索顶端、阴影、士兵全部使用世界锚点，暂停拖镜头不再拉伸。"
+    ]
+  },
+  {
+    v: "2.9.44.1a", d: "2026-11-08",
+    title: "绳索视觉与挂绳速射",
+    items: [
+      "移除绳索上的浅色斜纹，改为纯棕色麻绳。",
+      "士兵悬挂高度下移，更靠近落点地面，绳索继续垂到地面。",
+      "绳索间距与锚点改为世界坐标，缩放时同步变化，不再固定屏幕间距。",
+      "暂停拖动镜头时绳索与阴影保持世界位置，不再被拉长。",
+      "挂绳士兵全部改为速射，机枪不再点射。"
+    ]
+  },
+  {
+    v: "2.9.43.1a", d: "2026-11-08",
+    title: "索降手榴弹与七秒判定",
+    items: [
+      "士兵改为攀在绳索中部，绳索底端垂到地面，不再挂在绳端。",
+      "阴影区域清空判定改为以阴影投影中心为准。",
+      "悬挂战斗最多 7 秒；7 秒时区域安全则下降，不安全则投弹后撤离。",
+      "四名士兵依次投掷手榴弹，每枚有独立延迟。",
+      "手榴弹使用伪 3D 抛物线，落地爆炸并产生冲击波与击退。",
+      "手榴弹外观为绿色椭圆弹体、深灰握把与保险。",
+      "下降途中会复核阴影区，有丧尸重新进入则取消降落继续压制。"
+    ]
+  },
+  {
+    v: "2.9.42.1a", d: "2026-11-08",
+    title: "直升机索降状态机",
+    items: [
+      "支援小队改为完整状态机：接近、绳索展开、挂绳战斗、区域清空、下降、落地、收绳、撤离。",
+      "新增可配置参数：阴影时长/减速/弧高、绳长、摆动弹簧、开火间隔、清空半径、下降速度、撤离加速度、最长悬停。",
+      "挂绳士兵使用真实单位，固定在绳长高度，朝降临区域内的丧尸开火。",
+      "降临区域未清空不下降；清空后下降，20 秒超时强制下降防止卡死。",
+      "挂绳期间无地面碰撞、不会被感染/抓取/索敌；落地后恢复地面状态。",
+      "绳索加入螺旋花纹与阻尼摆动，阴影按弧线减速进入、左侧加速撤离。"
+    ]
+  },
+  {
+    v: "2.9.41.1a", d: "2026-11-08",
+    title: "寻路权重仲裁",
+    items: [
+      "新增硬走位闸门：逃跑、后撤、回位、换弹、路线、剧本、玩家输入一旦成立，抱团/同步/坚守拉力不得再覆盖。",
+      "待命状态与坚守状态分离；无目标推进不再误判为坚守。",
+      "阵型锚点排除正在逃跑、后撤、夺回点位的单位，避免整条阵线被拖向危险方向。",
+      "坚守拉力不再作用于逃跑和后撤单位；视线侧移也不覆盖逃跑。",
+      "明确硬规则、软规则、物理规则三层优先级。"
+    ]
+  },
+  {
+    v: "2.9.40.1a", d: "2026-11-08",
+    title: "全角色撤退路线",
+    items: [
+      "撤退评估不再只适用于平民，所有人类单位的恐惧撤退共用同一套多点威胁评分。",
+      "候选点周围 320 像素与路线中段 360 像素的丧尸都计入危险值。",
+      "会避开“终点安全、半路穿过另一群丧尸”的撤退路线。",
+      "近身红线与同伴解救目标同样覆盖所有人类单位。"
+    ]
+  },
+  {
+    v: "2.9.39.1a", d: "2026-11-08",
+    title: "近战站位、全局逃逸与舌头",
+    items: [
+      "非盾兵武装单位增加近身红线，距离过近时先后撤，不再往丧尸身上贴。",
+      "平民逃逸改为评估候选点附近全部丧尸，不再只看最近一批，避免被一侧尸群推进另一侧尸群。",
+      "武装单位发现同伴被三只以上丧尸围住时，优先朝靠救援者一侧的包围圈开火，尝试撕开口子。",
+      "喷火、激光、磁暴现在都能伤害舔舐者的舌头。",
+      "磁暴命中舌头时，电流沿舌头导向舔舐者本体，以本体作为第一次命中点继续连锁。"
+    ]
+  },
+  {
+    v: "2.9.38.1a", d: "2026-11-08",
+    title: "索降兵真实单位",
+    items: [
+      "索降小队改为生成真实步枪兵/机枪兵单位，不再使用绘制假人。",
+      "四名士兵从一开始就挂在从屏幕顶端垂下的绳索上，随直升机飞入。",
+      "悬挂期间保持固定绳长并真实开火，优先清空落点附近丧尸。",
+      "悬停射击一段时间后才沿绳下降落地，落地后绳索回收。"
+    ]
+  },
+  {
+    v: "2.9.37.1a", d: "2026-11-08",
+    title: "索降动画重做",
+    items: [
+      "绳索改为从屏幕最上端垂下，不再只到阴影上方一点。",
+      "士兵从一开始就挂在绳上，随直升机阴影一起从右侧飞入，不再先到场再放绳。",
+      "取消绳索下放过程；到场后士兵落地、绳索回收、直升机阴影向左飞离。",
+      "悬挂假人改为按步枪/机枪实际兵种颜色绘制的头盔、身体与枪械轮廓。"
+    ]
+  },
+  {
+    v: "2.9.36.1a", d: "2026-11-08",
+    title: "支援演出修正",
+    items: [
+      "直升机阴影改为落到小队落点，绳索与悬挂士兵随阴影从右侧荡入，再一起下降。",
+      "修正士兵先于绳索落地、绳索最低时士兵消失的顺序。",
+      "运输机阴影扩大到半场，炸弹改为从右侧抛物线落点。",
+      "降落伞改为淡绿灯叶、墨绿伞绳，收束到落点附近，不再白色一字排开。",
+      "空降舱改为深灰圆柱体与浅蓝反光窗口，以极快速度落地。",
+      "军团主力改为每 0.3 秒释放一名，全部撤离后空降舱爆炸。",
+      "支援事件与帝皇特使震屏压缩到数毫秒，不再持续十余秒。"
+    ]
+  },
+  {
+    v: "2.9.35.1a", d: "2026-11-08",
+    title: "支援体系重做",
+    items: [
+      "支援体系重做为支援小队、特化部队增援、军团主力赶到三级编制。",
+      "支援小队 3 步枪 + 1 机枪；特化部队 1 盾 + 2 机枪 + 1 喷火 + 1 医疗 + 1 狙击；军团主力按新编制 21 人。",
+      "游戏内投放价格：支援小队 9 折、特化部队 8 折、军团主力 5 折。",
+      "帝皇之力选项可将第三轮军团主力替换为帝皇特使降临。",
+      "帝皇特使降临可在游戏内耗费 30000 经济定点投放。",
+      "投放栏名称后显示单位或兵团价格。",
+      "支援小队改为直升机索降，特化部队改为运输机炸弹 + 降落伞，军团主力改为轨道舱空投。",
+      "导演模式事件发生器同步新支援事件与名称。"
+    ]
+  },
+  {
+    v: "2.9.34.1a", d: "2026-11-08",
+    title: "激光命中拖尾包覆",
+    items: [
+      "激光命中拖尾直径改为略大于单位本体，并预留冰壳厚度。",
+      "拖尾与环形包边画在单位之前，由身体盖住中心，只露出包住单位的边缘。",
+      "命中粒子数量小幅增加，粒子寿命延长。",
+      "末端命中仍随光束透明度衰减，不会在远处过亮。"
+    ]
+  },
+  {
+    v: "2.9.33.1a", d: "2026-11-08",
+    title: "喷火图层与防线站位",
+    items: [
+      "喷火束与火焰粒子改到单位之前绘制，不再整颗盖住喷火兵。",
+      "守军改到大本营西侧外沿，三排交错；不再从墙内沿墙排成一列。",
+      "守军获得外沿坚守点，且坚守优先于掩护队形，不会被拉回屋内。",
+      "回位改为直线转向，避免 A* 绕路把西侧岗位带进建筑。",
+      "移除夹在西墙与守军之间的沙袋，避免把守军困成一条窄缝。"
+    ]
+  },
+  {
+    v: "2.9.32.1a", d: "2026-11-08",
+    title: "激光拖尾收敛与手机猛扑",
+    items: [
+      "删除手机右摇杆的黄色虚线预览与圆圈。",
+      "激光命中拖尾直径改为只与被命中单位直径相关；粒子数量仍随光束粗细增加。",
+      "越靠近光束末端的命中，拖尾与粒子透明度越低；末端近乎透明。",
+      "激光十字、撞墙光晕与电火花改为亚线性缩放，粗光束下不再过大晃眼。",
+      "手机新增可调悬浮「猛扑」键，对应电脑空格。",
+      "猛扑键纳入键位位置/大小/透明度/隐藏与编码导出。"
+    ]
+  },
+  {
+    v: "2.9.31.2a", d: "2026-11-08",
+    title: "操控退出修复",
+    items: [
+      "操控模式只要还开着，无论当前单位是否死亡/尸变/为空，再次点击「操控」都会退出。",
+      "单位阵亡自动交还 AI 时同步关闭操控标记与按钮高亮，不再锁死在死亡位置。",
+      "Esc 退出操控同样只看操控模式是否开启，不再要求存在存活单位。",
+      "新增死亡单位/空单位退出断言。"
+    ]
+  },
+  {
+    v: "2.9.31.1a", d: "2026-11-08",
+    title: "手机对局界面重排",
+    items: [
+      "菜单从顶栏移出并固定定位，手机顶栏横向滚动/磨砂不再裁掉菜单。",
+      "手机顶栏隐藏长状态文字；经济面板移到顶栏下方居中，不再压住波次预警。",
+      "兵力条在手机上缩短到 44% 宽、12px 高，并动态列出所有兵种（含新增/自定义）的颜色段。",
+      "兵力条位置贴到底栏上方，不再占据大块战场。",
+      "手机键位可调：位置、大小、透明度、隐藏；新增菜单/攻击悬浮键。",
+      "悬浮攻击键分两指/三指模式，三指才显示。"
+    ]
+  },
+  {
+    v: "2.9.30.2a", d: "2026-11-08",
+    title: "三指瞄准保持",
+    items: [
+      "三指模式按住攻击键时，右摇杆松开后不再让左手触摸点覆盖最后瞄准方向。",
+      "攻击方向保持到松开攻击键，避免松手瞬间攻击失效或打错方向。",
+      "本构建只修三指模式的瞄准保持。"
+    ]
+  },
+  {
+    v: "2.9.30.1a", d: "2026-11-08",
+    title: "手机瞄准距离与攻击键",
+    items: [
+      "右摇杆预览圈不再固定距离：圈的位置随摇杆推程变化，像拖动释放位置，而不是刚性连杆。",
+      "新增两指/三指攻击模式：两指右摇杆瞄准并开火；三指右摇杆只瞄准，攻击交给悬浮攻击键。",
+      "三指模式才显示可调攻击键；两指模式隐藏。",
+      "攻击键支持位置、大小、透明度、隐藏，并纳入键位编码。",
+      "右摇杆瞄准距离按单位射程与推程计算；松手时不再被左手触摸的方向覆盖。"
+    ]
+  },
+  {
+    v: "2.9.29.1a", d: "2026-11-08",
+    title: "手机键位可调系统",
+    items: [
+      "修正激光命中拖尾方向：改为与光束同向，不再指向激光兵。",
+      "手机悬浮键只在触屏为主设备显示，带触屏的电脑不再出现。",
+      "手机新增悬浮菜单键，解决顶栏横向滚动后菜单点不到的问题。",
+      "键位调整页支持每个悬浮键的位置、大小、透明度与隐藏开关。",
+      "新增「菜单」悬浮键，可调位置/大小/透明度/隐藏。",
+      "手机顶/底栏与悬浮键透明度统一降到 25%，保留磨砂。",
+      "键位配置编码包含位置、大小、透明度与隐藏状态。"
+    ]
+  },
+  {
+    v: "2.9.28.1a", d: "2026-11-08",
+    title: "狙击红外与激光光效",
+    items: [
+      "狙击兵新增红外瞄准线：电脑跟随鼠标方向，手机跟随右摇杆方向，松手开火。",
+      "红外线整条带柔光，撞墙处有圆形渐变光晕与更大的核心光点，不产生火花。",
+      "激光撞墙特效按光束直径等比例放大，光晕与电火花都比光束更粗。",
+      "激光出膛十字光带按激光直径/粗细等比例放大。",
+      "被激光笼罩的单位新增反向平行拖尾与粒子；光束结束后拖尾消失，粒子继续飘散到寿命结束。",
+      "手机瞄准优先使用右摇杆，不再被触摸点坐标覆盖。"
+    ]
+  },
+  {
+    v: "2.9.27.1a", d: "2026-11-08",
+    title: "移动端 HUD、经济面板与平衡调整",
+    items: [
+      "磁爆兵换弹从 6 秒缩短到 4.5 秒。",
+      "医疗兵价格 1000、液氮兵 800、喷火兵 750、磁爆兵 750、激光兵 1200。",
+      "新增战场经济常驻面板：资源、每秒收入、人类/丧尸数量，护送模式同样显示。",
+      "手机端顶/底栏改为半透明，文字增加描边、阴影与轻微光效。",
+      "手机新增半透明悬浮键：换弹、操控、全屏；支持拖动布局与编码导出/导入。",
+      "快捷键说明页顶部新增「键位调整」，可拖动三个悬浮键位置。",
+      "手机右摇杆拖动时显示落点预览与「松手施放/拖回取消」，覆盖液氮、磁爆、激光等落点攻击。",
+      "顶栏新增全屏按钮，手机悬浮全屏键更醒目。"
+    ]
+  },
+  {
+    v: "2.9.26.6a", d: "2026-11-08",
+    title: "演示关闭迷雾",
+    items: [
+      "角色编辑与市场演示期间强制关闭战争迷雾，僵尸不再被视野锥隐藏。",
+      "演示结束恢复原迷雾状态，不影响回到对局后的视野。",
+      "本构建修演示画面只剩迷雾、僵尸不显示的问题。"
+    ]
+  },
+  {
+    v: "2.9.26.5a", d: "2026-11-08",
+    title: "武器长度与图层收尾",
+    items: [
+      "磁爆针与激光炮可见长度压缩到角色半径以内（直径的一半）。",
+      "激光兵不攻击时武器跟随 faceAng 转身；只有蓄力/开火阶段跟随 laserAng。",
+      "喷火兵燃料罐到喷火器的管线改为绕身体右侧的 S 形曲线。",
+      "通用枪械改为画在身体之前：枪身与角色重叠，角色圆盖住枪根，不再离体。",
+      "本构建只调武器几何与图层。"
+    ]
+  },
+  {
+    v: "2.9.26.4a", d: "2026-11-08",
+    title: "调试控件回收",
+    items: [
+      "帮助/设置面板关闭时（含 Esc、点空白）先把 #debugBag 收回隐藏容器。",
+      "避免下一次重绘面板时连同调试按钮一起清掉，刷新前就少一排按钮。",
+      "调试控件回收不再依赖父节点位置，设置/帮助之间切换也能恢复。",
+      "本构建修排查与调试区消失的问题。"
+    ]
+  },
+  {
+    v: "2.9.26.3a", d: "2026-11-08",
+    title: "武器外移与喷火背包",
+    items: [
+      "磁爆针与激光炮缩短，并从身体边缘起笔，不再从双眼中间穿出。",
+      "激光棱镜/镜筒跟随 laserAng 横扫，不再始终朝正前方。",
+      "喷火兵燃料罐改为旋转的局部坐标，画在身体后方并随朝向转动。",
+      "喷火杆从身体边缘起笔，不再插进身体。",
+      "通用枪械同样外移到身体边缘并缩短，避免同类穿插。"
+    ]
+  },
+  {
+    v: "2.9.26.2a", d: "2026-11-08",
+    title: "磁爆线圈串环",
+    items: [
+      "磁爆兵的两层圆环改为串在避雷针针杆上，半径缩小到略大于针杆。",
+      "环心补一段针杆高光，明确圆环是穿在杆上的，不是围着人漂。",
+      "本构建只调磁爆武器外观。"
+    ]
+  },
+  {
+    v: "2.9.26.1a", d: "2026-11-08",
+    title: "特殊兵种武器与市场演示",
+    items: [
+      "装备市场演示改为真实兵种模拟与真实渲染，磁爆电弧、喷火、液氮不再退化成普通子弹。",
+      "磁爆兵改为灰色球体 + 细红线外圈；武器改为银色避雷针，针身漂浮两层圆环。",
+      "液氮兵手持液氮瓶；弹匣为 0 时瓶子消失，补弹后重新出现。",
+      "激光兵武器移到身体正前方：浅蓝反光镜片 + 两级递减浅灰柱体。",
+      "喷火兵背后增加两个灰色燃料罐，一根 1px 灰线连到右手喷火器。",
+      "失败后不再自动覆盖存档，读档可回到战败前的经济与战场；新增读档资源配置断言。"
+    ]
+  },
+  {
+    v: "2.9.25.6a", d: "2026-11-08",
+    title: "实际 DPS 读数",
+    items: [
+      "演示读数增加实际 DPS：按目标血量实际下降累计伤害，再除以演示运行时间。",
+      "同时显示累计伤害，理想 DPS 仍保留用于对照。",
+      "目标回满时重置基线，不把回血算成负伤害。",
+      "新增实际伤害累计断言。"
+    ]
+  },
+  {
+    v: "2.9.25.5a", d: "2026-11-08",
+    title: "机枪索敌与磁爆演示",
+    items: [
+      "修复机枪密度索敌网格列数写死 16：远于约 512px 的目标会被漏掉，现在按射程动态算列。",
+      "修复磁爆目标回退时把 {u,d} 包装对象当成单位，导致电弧打空、目标不掉血。",
+      "演示世界每帧重建空间网格，机枪与磁爆在演示里能正常锁定靶子。",
+      "新增机枪/磁爆演示命中断言。"
+    ]
+  },
+  {
+    v: "2.9.25.4a", d: "2026-11-08",
+    title: "调色盘与恢复地图",
+    items: [
+      "编辑器调色盘现在对墙体、矮墙、可破坏墙、房屋与自定义地块障碍生效。",
+      "自定义地块的实体墙使用所选颜色，不再被灰色墙盖住。",
+      "开战页「恢复默认」改为「恢复默认地图与设置」：清空编辑器改动并重建当前初始地图。",
+      "本构建修颜色与地图复位。"
+    ]
+  },
+  {
+    v: "2.9.25.3a", d: "2026-11-08",
+    title: "演示画幅",
+    items: [
+      "演示渲染关闭击杀播报、准星、波次倒计时等 HUD，只保留战场本身。",
+      "演示相机改为固定全景（0.70 倍），士兵与靶子落在画幅中部，不再缩在右下角。",
+      "本构建只改演示画幅。"
+    ]
+  },
+  {
+    v: "2.9.25.2a", d: "2026-11-08",
+    title: "更大点阵格",
+    items: [
+      "吸附档位新增 64 / 96 / 128px，不再最高只有 32px。",
+      "点阵模式下按当前吸附档位决定格子大小，最小 32px，手机可铺更大的墙块。",
+      "网格与棋盘格随档位同步放大，吸附点同步显示。",
+      "本构建只扩展点阵尺度。"
+    ]
+  },
+  {
+    v: "2.9.25.1a", d: "2026-11-08",
+    title: "编辑器网格、地图恢复与演示靶",
+    items: [
+      "编辑器内关闭战争迷雾，全图可见；显示半透明灰色虚线网格与吸附点。",
+      "吸附细分为 4 / 8 / 16 / 32px；点阵模式固定 32px 棋盘格。",
+      "编辑器「恢复默认」重建当前地图与单位；清空后开局若零丧尸，自动补回 12 只基础尸潮，避免直接判胜。",
+      "角色编辑演示固定士兵与丧尸位置，目标锁 1 点血量、持续攻击后回满，不再跑出画面或频繁重摆。",
+      "兵种目录补齐医疗/液氮/喷火/磁爆/激光名称，不再显示 undefined。",
+      "开战参数卡改为瀑布流，减少两栏空白；编辑器左栏改为双列工具格。"
+    ]
+  },
+  {
+    v: "2.9.24.7a", d: "2026-11-08",
+    title: "摘要离开复位",
+    items: [
+      "从战局摘要点「重开」或「返回主页」时先解除暂停，再离开。",
+      "避免返回主页或下一局设置后仍带着暂停状态。",
+      "本构建只修状态复位。"
+    ]
+  },
+  {
+    v: "2.9.24.6a", d: "2026-11-08",
+    title: "摘要暂停",
+    items: [
+      "菜单「重开这一局」先冻结战场，再显示上一局摘要，避免看摘要时后台继续推进。",
+      "点「继续」恢复战场；点「重开」进入下一局设置。",
+      "本构建只修摘要期间的暂停状态。"
+    ]
+  },
+  {
+    v: "2.9.24.5a", d: "2026-11-08",
+    title: "点阵擦除",
+    items: [
+      "点阵模式下橡皮也按 32px 格擦除，和填充保持同一套网格。",
+      "擦除会同时清掉该格内的墙体与自定义地块。",
+      "本构建只补点阵编辑的一致性。"
+    ]
+  },
+  {
+    v: "2.9.24.4a", d: "2026-11-08",
+    title: "演示镜头跟随",
+    items: [
+      "角色编辑演示镜头改为跟随当前士兵，单位不会再被固定镜头跑出画面。",
+      "演示缩放略放大，看得清射击与血条。",
+      "只有士兵跑出地图边界或演示超过二十二秒才重摆场景。",
+      "本构建只改演示镜头。"
+    ]
+  },
+  {
+    v: "2.9.24.3a", d: "2026-11-08",
+    title: "演示关闭与点阵棋盘",
+    items: [
+      "关闭演示面板改走统一 hideOverlay，Esc、点空白、返回主页都会真正停止演示循环与音效。",
+      "点阵模式增加棋盘格底，空格本身可见，不再只是空画布上的线。",
+      "本构建修演示残留与点阵可读性。"
+    ]
+  },
+  {
+    v: "2.9.24.2a", d: "2026-11-08",
+    title: "横屏开战双栏",
+    items: [
+      "开战参数卡在 641–900px 的横屏宽度也保持两栏，不再提前落成单列。",
+      "窄于 640px 的竖屏仍为单列。",
+      "本构建只调断点。"
+    ]
+  },
+  {
+    v: "2.9.24.1a", d: "2026-11-08",
+    title: "手机横屏单行 HUD",
+    items: [
+      "手机横屏下顶栏与底栏改为单行横向滚动，不再多行换行挤压战场。",
+      "状态文字超长省略，底栏选择框限宽，次要提示隐藏。",
+      "战场可视高度明显增加；控件仍可横向滑动访问。",
+      "本构建只调 HUD 布局。"
+    ]
+  },
+  {
+    v: "2.9.23.2a", d: "2026-11-08",
+    title: "编辑器工作台顶栏",
+    items: [
+      "宽屏编辑器左侧工作台增加固定顶栏：标题、当前地图名与「完成」。",
+      "完成按钮不再需要滚到工具栏最底部。",
+      "手机横屏隐藏该顶栏，继续用「工具」「完成」抽屉。",
+      "本构建只调布局。"
+    ]
+  },
+  {
+    v: "2.9.23.1a", d: "2026-11-08",
+    title: "开战参数卡片",
+    items: [
+      "开战设置按小节自动整理为卡片：地图、丧尸规模、支援、波次等各自成块。",
+      "宽屏两列卡片，窄屏单列；交互控件不再散落在长表单里。",
+      "本构建只改开战页排版，不改变参数与开战逻辑。"
+    ]
+  },
+  {
+    v: "2.9.22.4a", d: "2026-11-08",
+    title: "开战模式卡",
+    items: [
+      "开战设置顶部模式选择改为三张卡片：名称 + 一句差异 + 选中态。",
+      "窄屏自动单列，宽屏三列，不再是一排光秃秃按钮。",
+      "本构建只改开战页表现，不改变模式逻辑。"
+    ]
+  },
+  {
+    v: "2.9.22.3a", d: "2026-11-08",
+    title: "编辑器桌面工作台",
+    items: [
+      "宽屏进入编辑器改为左侧竖排工作台：标签、工具、操作全部在左侧滚动，画布不再被底栏压缩。",
+      "编辑器内隐藏游戏顶栏，避免资源/暂停条与编辑工具抢空间。",
+      "手机横屏仍用「工具」抽屉，不启用左侧栏。",
+      "本构建只调布局，不改变编辑逻辑。"
+    ]
+  },
+  {
+    v: "2.9.22.2a", d: "2026-11-08",
+    title: "开战两栏与编辑器抽屉",
+    items: [
+      "开战设置宽屏改为两栏排版，窄屏保持单栏，减少长表单滚动。",
+      "手机横屏进入编辑器默认收起工具，只留「工具」「完成」两个按钮；展开后恢复完整工具栏。",
+      "本构建只调布局，不改变编辑与开战逻辑。"
+    ]
+  },
+  {
+    v: "2.9.22.1a", d: "2026-11-08",
+    title: "暂停、点阵编辑与演示稳定性",
+    items: [
+      "空格暂停不再自动弹出面板，只冻结战场，不再遮挡画面。",
+      "菜单「重开这一局」先显示上一局战况摘要：继续回到战场，重开进入下一局设置。",
+      "首页与开战设置点击空白背景不再关闭页面、露出空背景。",
+      "地图编辑器新增「点阵」模式：显示 32px 网格，按格填充墙体/矮墙/可破坏墙，同一格不重复堆叠。",
+      "角色编辑演示改为单实例 RAF，修复多循环叠加导致的时间指数加速与音效串音。",
+      "演示期间静音 SFX；单位被赶出画面或运行过久自动重摆场景。",
+      "减少动态效果开关增加说明、选中态与可点反馈。"
+    ]
+  },
+  {
+    v: "2.9.21.7a", d: "2026-11-08",
+    title: "演示区前置",
+    items: [
+      "角色编辑与装备市场的演示画布在窄屏下自动排到内容最前，不再被长字段列表挤到页面底部。",
+      "演示画布高度在窄屏固定，避免被压缩成一条。",
+      "本构建只调布局，不改变演示数据与数值。"
+    ]
+  },
+  {
+    v: "2.9.21.6a", d: "2026-11-08",
+    title: "演示诊断",
+    items: [
+      "角色编辑演示记录渲染异常；发生回退时在读数后显示「渲染已回退」，便于反馈定位。",
+      "实机演示仍优先走真实 render，异常帧才退回简化画法。",
+      "本构建只加诊断，不改变演示逻辑。"
+    ]
+  },
+  {
+    v: "2.9.21.5a", d: "2026-11-08",
+    title: "对局内 Esc 标记修正",
+    items: [
+      "从首页或开战设置进入对局时清空首页/开战面板标记，Esc 在局内恢复为取消选中与关闭面板。",
+      "读档进入对局同样清空标记，不再继承入口页状态。",
+      "本构建只修状态残留，不改变玩法。"
+    ]
+  },
+  {
+    v: "2.9.21.4a", d: "2026-11-08",
+    title: "角色编辑演示与帮助返回",
+    items: [
+      "角色编辑的实机演示加入单帧异常边界：某帧渲染出错只回退该帧，不再让整个动画停止。",
+      "从角色编辑打开帮助或快捷键页时，关闭会回到角色编辑，而不是丢到底层。",
+      "本构建只修演示与返回路径，不改变数值。"
+    ]
+  },
+  {
+    v: "2.9.21.3a", d: "2026-11-08",
+    title: "交互防护补强",
+    items: [
+      "设置面板搬控件加入两百次上限，任何后续改动都不会再因循环条件写错冻住主线程。",
+      "进入战场的黑场过渡加入异常兜底：beginGame 抛错时自动清除遮罩并提示，不会永久黑屏。",
+      "本构建只加防护，不改变界面与玩法。"
+    ]
+  },
+  {
+    v: "2.9.21.2a", d: "2026-11-08",
+    title: "返回栈补强",
+    items: [
+      "快速开始关闭或按 Esc 返回首页，不再落到空背景。",
+      "从设置进入「兵种数据」后，关闭会回到设置面板，不再丢失上一层。",
+      "角色编辑从首页进入仍返回首页，从对局设置进入返回设置。",
+      "本构建只补返回路径，不改变数值与存档。"
+    ]
+  },
+  {
+    v: "2.9.21.1a", d: "2026-11-08",
+    title: "角色编辑入口与返回",
+    items: [
+      "首页工具区新增「角色编辑」，不必再进设置里的调试分区找兵种数据。",
+      "从首页打开角色编辑后，关闭会回到首页，不再停在一片空背景。",
+      "装备市场仍从对局内菜单进入；角色编辑的实机演示保留。",
+      "本版按反馈补入口与返回路径，其余候选缺陷继续处理。"
+    ]
+  },
+  {
+    v: "2.9.20.1a", d: "2026-11-08",
+    title: "开战设置与二级面板视觉收口",
+    items: [
+      "开战设置新增「01 模式 / 02 参数 / 03 开战」步骤条。",
+      "二级面板统一终端分区标题、选项按钮、下拉框与警示块样式，不再沿用旧蓝色控件。",
+      "首页/开战/对局三层视觉使用同一套琥珀、近黑与直角规则。",
+      "本版继续处理反馈中的界面断层，候选冻结状态暂停。"
+    ]
+  },
+  {
+    v: "2.9.19.1a", d: "2026-11-08",
+    title: "致命交互修复与市场演示",
+    items: [
+      "修复打开设置面板后整页按键与刷新无响应：音量源滑块在循环里被反复塞回容器，造成主线程死循环。",
+      "修复首页按 Esc 被关成空背景：首页 Esc 不再关闭，开战设置 Esc 返回首页，其余面板走返回栈。",
+      "对局顶栏与底栏统一为终端视觉，不再沿用旧蓝色工具栏。",
+      "装备市场新增实机演示：按当前配件实时开火、命中与换目标。",
+      "实机演示渲染异常时回退到简化画法，避免画布空白。",
+      "本构建优先修阻断问题，其余候选缺陷继续按反馈处理。"
+    ]
+  },
+  {
+    v: "2.9.18.1rc", d: "2026-11-08",
+    title: "2.x 候选重新冻结",
+    items: [
+      "地块合并血量补齐后，2.x 功能再次冻结，只修阻断发布的缺陷。",
+      "自动验收：语法与启动、兵种与特效、版本同步、部署哈希、压力测试全部通过。",
+      "剩余工作只有人工验收与 2.9 研究项；通过后发布正式版并建立回滚锚点。",
+      "本构建为候选版，不建立正式回滚锚点。"
+    ]
+  },
+  {
+    v: "2.9.17.1a", d: "2026-11-08",
+    title: "地块合并血量",
+    items: [
+      "相邻、同色、同纹理的可破坏地块自动合并为一组，共用一份结构血量。",
+      "命中组内任一地块时整组同步扣血；耐久归零后整组地块与碰撞体一并移除。",
+      "地块组随存档保存；旧存档没有组字段时按单块处理。",
+      "本版解除候选冻结，补完 2.4 的地块合并血量；之后重新冻结候选。"
+    ]
+  },
+  {
+    v: "2.9.16.5rc", d: "2026-11-08",
+    title: "候选修正：菜单与市场触控",
+    items: [
+      "手机菜单、剧情指令条、装备市场购买按钮、编辑器下拉在触屏设备上补齐四十四像素。",
+      "这些控件原先被更高优先级的选择器压在三十至三十四像素。",
+      "本构建只修候选缺陷，不加入新功能。"
+    ]
+  },
+  {
+    v: "2.9.16.4rc", d: "2026-11-08",
+    title: "候选修正：触控目标补齐",
+    items: [
+      "编辑器标签/工具/模式按钮在触屏设备上提高到四十四像素。",
+      "首页快捷按钮、帮助操作、快捷键页签、单位字段重置按钮统一补齐触控高度。",
+      "本构建只修候选缺陷，不加入新功能。"
+    ]
+  },
+  {
+    v: "2.9.16.3rc", d: "2026-11-08",
+    title: "候选修正：恢复默认不再跳转",
+    items: [
+      "从设置面板执行「恢复全部默认设置」时，不再自动打开开战设置面板。",
+      "重置仍在后台完成：键位、音量、兵种数值、开战参数与减少动态效果。",
+      "本构建只修候选缺陷，不加入新功能。"
+    ]
+  },
+  {
+    v: "2.9.16.2rc", d: "2026-11-08",
+    title: "候选修正：默认设置与触控尺寸",
+    items: [
+      "「恢复全部默认设置」现在同时关闭减少动态效果，并把生成难度恢复为标准。",
+      "地块取色器在触屏设备上提高到四十四像素高，避免难点。",
+      "本构建只修候选缺陷，不加入新功能。"
+    ]
+  },
+  {
+    v: "2.9.16.1rc", d: "2026-11-08",
+    title: "2.x 候选冻结",
+    items: [
+      "2.x 功能冻结：自本构建起不再加入新功能，只修阻断发布的缺陷。",
+      "自动验收：语法与启动、兵种与特效、版本四同步、deploy 哈希、270 单位压力测试全部通过。",
+      "已知缺口：地块合并血量、2.1.04 真人验收、2.4/2.6 部分表现项；均记录在验收矩阵。",
+      "本构建为候选版，不建立正式回滚锚点；正式版需人工验收后另发。"
+    ]
+  },
+  {
+    v: "2.9.15.1a", d: "2026-11-08",
+    title: "生成难度预算",
+    items: [
+      "编辑器新增生成难度：低、标准、高。",
+      "难度影响建筑/掩体数量、BSP 切分深度，以及刷怪点的间隔与上限。",
+      "低难度：更少建筑与掩体、刷怪更慢、上限更低；高难度反之。",
+      "本版为 2.9 深挖补强阶段第十五个方向，后续进入正式候选。"
+    ]
+  },
+  {
+    v: "2.9.14.1a", d: "2026-11-08",
+    title: "地块纹理与边缘",
+    items: [
+      "自定义地块新增纹理选项：纯色、斜纹、网格；绘制时按地块范围裁剪。",
+      "纹理写入存档；旧存档缺纹理字段时按纯色读取。",
+      "本版为 2.9 深挖补强阶段第十四个方向，后续进入正式候选。"
+    ]
+  },
+  {
+    v: "2.9.13.1a", d: "2026-11-08",
+    title: "旧存档兼容兜底",
+    items: [
+      "反序列化完成后统一补齐区域、地块、刷怪点、据点四个集合，旧存档缺少字段时按空数组读取。",
+      "后续逻辑不再逐处判空；读入旧档不会因缺字段报错。",
+      "本版为 2.9 深挖补强阶段第十三个方向，后续进入稳定化候选。"
+    ]
+  },
+  {
+    v: "2.9.12.1a", d: "2026-11-08",
+    title: "场景快捷键提示条",
+    items: [
+      "对局内新增场景提示条：默认显示暂停、市场与快速投放键。",
+      "接管单位后切换为换弹、开火模式、暂停提示；进入剧情模式后切换为导演指令提示。",
+      "触屏设备显示对应按钮与摇杆说明，不显示键位。",
+      "提示条在设置/帮助/暂停面板、教程与地形编辑器中自动隐藏。",
+      "本版为 2.9 深挖补强阶段第十二个方向，后续进入稳定化。"
+    ]
+  },
+  {
+    v: "2.9.11.1a", d: "2026-11-08",
+    title: "快捷键与操作面板",
+    items: [
+      "主菜单与帮助新增「快捷键与操作」，分键鼠、触屏两页。",
+      "键鼠页列常用键与进阶/剧情指令，键位实时读取当前绑定，改键后自动同步。",
+      "触屏页说明底栏投放、☰ 菜单、操控、左右摇杆与剧情模式入口。",
+      "面板内提供「键位设置」直达入口。",
+      "本版为 2.9 深挖补强阶段第十一个方向，后续进入稳定化。"
+    ]
+  },
+  {
+    v: "2.9.10.1a", d: "2026-11-08",
+    title: "减少动态效果",
+    items: [
+      "设置面板新增「减少动态效果」开关，开启后压缩界面过渡与动画时长。",
+      "开启时进入战场跳过黑场过渡，直接切换。",
+      "开关状态写入本地存储，下次启动继续生效。",
+      "本版为 2.9 深挖补强阶段第十个方向，后续进入稳定化。"
+    ]
+  },
+  {
+    v: "2.9.09.1a", d: "2026-11-08",
+    title: "进入战场黑场过渡",
+    items: [
+      "首页、开战设置与快速开始进入对局时，先黑场淡入再切到战场，避免界面硬切。",
+      "过渡期间阻止重复点击；进入后自动恢复透明，不拦截操作。",
+      "本版为 2.9 深挖补强阶段第九个方向，后续评估 Outbreak 剩余优点。"
+    ]
+  },
+  {
+    v: "2.9.08.1a", d: "2026-11-08",
+    title: "编辑器临时关闭吸附",
+    items: [
+      "编辑器内按住 Alt 临时关闭吸附，松开立即恢复；与 AutoCAD 的临时捕捉习惯一致。",
+      "快捷键只在地形编辑器激活时生效，不影响游戏内操作。",
+      "本版为 2.9 深挖补强阶段第八个方向，后续评估 Outbreak 剩余优点。"
+    ]
+  },
+  {
+    v: "2.9.07.1a", d: "2026-11-08",
+    title: "可破坏地块",
+    items: [
+      "自定义地块新增结构血量：不可破坏、耐久二百四十、耐久六百。",
+      "实心且带耐久的地块生成可破坏碰撞体；受击时地块与碰撞体同步扣血，耐久归零后一并移除。",
+      "受损地块在顶部显示耐久条；地块与耐久写入存档。",
+      "本版为 2.9 深挖补强阶段第七个方向，后续评估 Outbreak 剩余优点。"
+    ]
+  },
+  {
+    v: "2.9.06.1a", d: "2026-11-08",
+    title: "地块通行与子弹穿透",
+    items: [
+      "自定义地块新增通行与穿透选项：可走/阻挡、挡子弹/穿透。",
+      "阻挡地块同时生成一个不参与墙体绘制的碰撞体，寻路、移动与弹道按选项生效。",
+      "地块与碰撞体写入存档；编辑器撤销栈同时记录地块，撤回绘制时不会留下幽灵墙。",
+      "首页与快速开始按钮文案统一为「进入战场」「立即部署」；防线模式说明改为「推荐作为首次作战」。",
+      "引导与帮助中「想亲手打」改为「想亲自作战」，「点一个人」改为「选择一名单位」。",
+      "本版为 2.9 深挖补强阶段第六个方向，后续加入地块结构血量与可破坏。"
+    ]
+  },
+  {
+    v: "2.9.05.1a", d: "2026-11-08",
+    title: "自定义地块",
+    items: [
+      "地形工具新增「自定义地块」：按矩形绘制，颜色可选，踩踏效果可选无、减速、灼烧。",
+      "地块绘制在最底层，位于区域、血迹与单位之下；减速与灼烧复用区域结算逻辑。",
+      "地块写入存档；点选擦除、框选擦除、撤销与重做均支持。",
+      "本版完成外观与踩踏效果；通行、子弹穿透与结构血量列入后续构建。"
+    ]
+  },
+  {
+    v: "2.9.04.1a", d: "2026-11-08",
+    title: "开局 快速开始",
+    items: [
+      "首页新增「快速开始」入口，打开三步卡片：选模式、投放、观察。",
+      "面板底部说明胜负条件与操控入口，并提供「开始对局」。",
+      "三步卡片采用窄屏单列布局，不挤压首页模式卡。",
+      "本版为 2.9 深挖补强阶段第四个方向，后续补自定义地块。"
+    ]
+  },
+  {
+    v: "2.9.03.1a", d: "2026-11-08",
+    title: "性能读数",
+    items: [
+      "调试分区新增性能读数：帧率、模拟耗时、渲染耗时。",
+      "帧率每零点五秒刷新一次；模拟与渲染按帧计时，单位毫秒。",
+      "读数常驻调试面板，便于大地图与尸潮场景定位卡顿来源。",
+      "本版为 2.9 深挖补强阶段第三个方向，后续补 2.1.04 开局引导与 2.4 自定义地块。"
+    ]
+  },
+  {
+    v: "2.9.02.1a", d: "2026-11-08",
+    title: "实机演示接入真实渲染",
+    items: [
+      "单位演示画布改为直接调用主渲染 render()：临时切换画布、视口、像素比、战场与相机，绘制完成后立即还原。",
+      "删除演示专用的简化圆点/血条画法，演示与实战使用同一套地面、单位、特效与光照逻辑。",
+      "本版为 2.9 深挖补强阶段第二个方向，后续补 2.1.04 开局引导与 2.4 自定义地块。"
+    ]
+  },
+  {
+    v: "2.9.01.1a", d: "2026-11-08",
+    title: "不可变基线补强",
+    items: [
+      "内置兵种基线统一暴露为 BASE_UNIT，并在生成后立即冻结；重置逻辑只读该对象。",
+      "外部代码无法再改写基线字段；误写被忽略或抛出，不会污染恢复默认的结果。",
+      "本版为 2.9 深挖补强阶段首个构建，后续补 2.1.04 开局引导、2.3 真实渲染与 2.4 自定义地块。"
+    ]
+  },
+  {
+    v: "2.7.06.1a", d: "2026-11-08",
+    title: "航点提前切换",
+    items: [
+      "单位接近当前航点时，若下一个航点通视且满足通行宽度，直接切到下一个航点。",
+      "提前切换距离为航点判定半径的两倍，避免频繁抖动。",
+      "下一点被墙挡住或大单位宽度不足时仍走当前航点。",
+      "本版为 2.7 大版本内第六个方向，后续进入 UI 收尾与新内容阶段。"
+    ]
+  },
+  {
+    v: "2.7.05.1a", d: "2026-11-08",
+    title: "拐角折线化",
+    items: [
+      "路径拉直后增加拐角折线化：尖锐折点替换为两个切点，半径十二像素且不超过相邻线段的一半。",
+      "近乎直线的折点不切角，避免无意义地增加路径点。",
+      "本版为 2.7 大版本内第五个方向，后续加入路径与转向阻尼配合。"
+    ]
+  },
+  {
+    v: "2.7.04.1a", d: "2026-11-08",
+    title: "大体型通行宽度",
+    items: [
+      "新增区域通行检查：按单位半径向外扩格，任一格被墙占据即视为不可通行。",
+      "A 星扩展节点与路径拉直都会检查通行宽度；半径大于十一像素的单位自动启用。",
+      "普通体型单位仍走原路径，不增加额外开销。",
+      "本版为 2.7 大版本内第四个方向，后续加入拐点折线化与转向配合。"
+    ]
+  },
+  {
+    v: "2.7.03.1a", d: "2026-11-08",
+    title: "寻路预算复用",
+    items: [
+      "同一单位在一点五秒内重复请求同一目标，且原路径仍有效时，直接复用路径，不再消耗 A 星预算。",
+      "路径记录目标坐标与生成时刻；目标移动超过二十四像素或超时后重新寻路。",
+      "本版为 2.7 大版本内第三个方向，后续加入体型通行与拐点优化。"
+    ]
+  },
+  {
+    v: "2.7.02.1a", d: "2026-11-08",
+    title: "卡住脱困增强",
+    items: [
+      "卡住检测触发时，优先朝最近墙体的法线方向脱出，并沿该方向施加短暂速度脉冲。",
+      "远离墙体或找不到有效法线时，退回原有的扰动方向。",
+      "脱困仍受冷静期约束，避免贴墙单位每帧集体重算。",
+      "本版为 2.7 大版本内第二个方向，后续加入体型通行与预算优化。"
+    ]
+  },
+  {
+    v: "2.7.01.1a", d: "2026-11-08",
+    title: "寻路终点修正",
+    items: [
+      "目标格被墙体占据时，A 星路径终点改为最近可走格中心，不再把单位往墙里带。",
+      "路径结果增加 goalAdjusted 标记，便于排查目标被挡的情况。",
+      "起点与终点继续使用最近可走格作为兜底，目标不可达时仍能给出可行路径。",
+      "本版为 2.7 大版本首个构建，后续加入卡住脱困、体型通行与预算优化。"
+    ]
+  },
+  {
+    v: "2.6.05.1a", d: "2026-11-08",
+    title: "生成—校验—修复流水线",
+    items: [
+      "编辑器新增「生成+修复」，按上次使用的生成方式（房间、BSP、预制件）生成地形。",
+      "生成后立即校验：存在完全封闭房间时自动执行封闭区修复，并重新计算连通比例、密封数与评分。",
+      "修复会改动墙体，生成前仍压入撤销栈；关闭编辑器或撤销即可回退。",
+      "本版为 2.6 大版本内第五个方向，后续进入 2.7 寻路增强。"
+    ]
+  },
+  {
+    v: "2.6.04.1a", d: "2026-11-08",
+    title: "预制件地形生成",
+    items: [
+      "编辑器新增「预制件」，在每个 BSP 区块内按类型拼接：单栋建筑、双栋并排、带院落的建筑。",
+      "带院落类型在建筑右侧用矮墙围出院子；双栋类型留出中间巷道。",
+      "生成后补充刷怪点与中心据点，固定种子可复现。",
+      "生成报告包含建筑数、连通比例、密封房间数与评分。",
+      "本版为 2.6 大版本内第四个方向，后续加入房间—走廊真正连通与生成流水线。"
+    ]
+  },
+  {
+    v: "2.6.03.1a", d: "2026-11-08",
+    title: "BSP 分区地形生成",
+    items: [
+      "编辑器新增「BSP 地形」，按递归二分把地图切成若干区块，每个区块居中放置一座带门建筑。",
+      "每个区块最多切三层，过窄或过小的区块停止切分；生成后补充矮墙、刷怪点与中心据点。",
+      "生成使用固定种子，同一种子结果一致；生成前压入撤销栈。",
+      "生成报告包含建筑数、连通比例、密封房间数与评分。",
+      "本版为 2.6 大版本内第三个方向，后续加入预制件拼接与房间—走廊连通。"
+    ]
+  },
+  {
+    v: "2.6.02.1a", d: "2026-11-08",
+    title: "封闭区自动修复",
+    items: [
+      "分析面板新增「修复封闭区」：从房间中心向四个方向射线找墙，切出八十八像素开口并重建寻路。",
+      "最多执行三轮修复，直到没有完全封闭的房间；修复前自动压入撤销栈。",
+      "修正封闭区识别：只统计不属于主连通区的房间，避免把主区域误判为封闭区。",
+      "本版为 2.6 大版本内第二个方向，后续继续加入房间—走廊与 BSP 分区。"
+    ]
+  },
+  {
+    v: "2.6.01.3a", d: "2026-11-08",
+    title: "可玩地形生成",
+    items: [
+      "编辑器新增「生成地形」，清空现有地形并生成五座带门建筑、十二段矮墙掩体、一个刷怪点与一个中心据点。",
+      "生成使用固定种子，同一种子结果一致；生成前自动压入撤销栈，可一键撤回。",
+      "生成立即重建寻路与网格，生成后可直接在编辑器中修改。",
+      "生成后自动校验主连通比例、密封房间数与地图评分，结果写入提示。",
+      "生成最多尝试四个种子：优先选择密封房间为零且连通不低于七成的结果，否则取评分最高者。",
+      "最终保留的始终是最优种子生成的地形，提示中记录尝试次数。",
+      "本版为 2.6 大版本首个方向第三轮构建，后续加入房间—走廊连通、BSP 分区与预制件。"
+    ]
+  },
+  {
+    v: "2.5.04.1a", d: "2026-11-08",
+    title: "封闭区开口定位",
+    items: [
+      "地图分析为每个封闭区计算对外开口，记录开口坐标与数量。",
+      "分析面板显示「对外开口 X 处」或「完全封闭」，地图上以琥珀圆点标出开口。",
+      "地图评分对完全封闭的房间给出单独建议。",
+      "本版为 2.5 大版本内第四个方向，后续进入 2.6 可玩地形生成。"
+    ]
+  },
+  {
+    v: "2.5.03.1a", d: "2026-11-08",
+    title: "地图评分",
+    items: [
+      "分析面板新增地图评分，满分一百，由连通、掩体、封闭区与通道四项加权得出。",
+      "评分同时显示四项分条与修改建议，例如主连通区偏低、掩体偏少、封闭区偏多或通道不足。",
+      "评分只读，不修改地图；同一地形重复计算结果一致。",
+      "本版为 2.5 大版本内第三个方向，后续加入封闭区开口定位。"
+    ]
+  },
+  {
+    v: "2.5.02.1a", d: "2026-11-08",
+    title: "地图分析：自动岗位建议",
+    items: [
+      "分析面板新增「生成岗位建议」，按当前地形与人类质心重新计算可防守位置。",
+      "生成过程只在临时副本上运行，不覆盖现有岗位；确认后可用「应用建议」整体替换。",
+      "建议岗位在地图上以绿色圆圈与十字标出，与分析标出同时显示。",
+      "本版为 2.5 大版本内第二个方向，后续加入封闭区开口定位与地图评分。"
+    ]
+  },
+  {
+    v: "2.5.01.1a", d: "2026-11-08",
+    title: "地图分析面板",
+    items: [
+      "编辑器新增「地图分析」按钮，统计主连通区格数、占全图比例、封闭区、通道、出口与岗位数量。",
+      "分析结果可在地图上标出：封闭区画红色虚线框，通道画冷青节点，出口画琥珀圆圈。",
+      "分析为只读操作，不修改墙体、区域、刷怪点、据点与单位布置。",
+      "本版为 2.5 大版本首个构建，后续加入封闭区开口定位与自动岗位建议。"
+    ]
+  },
+  {
+    v: "2.4.05.1a", d: "2026-11-08",
+    title: "地图编辑器：据点",
+    items: [
+      "地形工具新增「据点」，按矩形划定范围，以矩形短边的一半作为占领半径。",
+      "人类独占三秒完成占领，丧尸独占三秒转为丧尸据点；双方同时在场时进度向零回落。",
+      "人类据点每秒产出两点资源，丧尸据点停止产出；场上以圆圈、虚线与归属文字标识。",
+      "据点写入存档，点选擦除、框选擦除、撤销与重做均支持。",
+      "本版为 2.4 大版本内第五个方向，后续继续加入自定义地块。"
+    ]
+  },
+  {
+    v: "2.4.04.1a", d: "2026-11-08",
+    title: "地图编辑器：刷怪点",
+    items: [
+      "地形工具新增「刷怪点」，按矩形划定生成范围，默认每三秒生成一只普通丧尸，上限二十只。",
+      "刷怪点在场上显示红色虚线与已生成数量，达成上限后停止生成。",
+      "刷怪点写入存档，点选擦除、框选擦除、撤销与重做均支持。",
+      "本版为 2.4 大版本内第四个方向，后续继续加入据点与自定义地块。"
+    ]
+  },
+  {
+    v: "2.4.03.1a", d: "2026-11-08",
+    title: "地图编辑器：缓速区与灼烧区",
+    items: [
+      "地形工具新增「缓速区」与「灼烧区」，按矩形绘制，地面显示虚线范围与类型标签。",
+      "缓速区对进入范围的单位持续减速；灼烧区每零点五秒对范围内丧尸结算一次伤害。",
+      "区域写入存档，旧存档没有区域字段时按空数组读取，不影响原有地图。",
+      "点选擦除、框选擦除、撤销与重做均支持区域。",
+      "本版为 2.4 大版本内第三个方向，后续继续加入刷怪点、据点与自定义地块。"
+    ]
+  },
+  {
+    v: "2.4.02.1a", d: "2026-11-08",
+    title: "地图编辑器：可破坏墙",
+    items: [
+      "地形工具新增「可破坏墙」，默认耐久二百四十点，按矩形绘制。",
+      "可破坏墙在受损后显示裂纹与耐久条；子弹命中按伤害扣血，耐久归零后从场景移除并重建寻路。",
+      "可破坏墙随存档保存耐久；旧存档没有该字段时按普通墙读取，不受影响。",
+      "本版为 2.4 大版本内第二个方向，后续继续加入减速区、伤害区与自定义地块。"
+    ]
+  },
+  {
+    v: "2.4.01.3a", d: "2026-11-08",
+    title: "地图编辑器：吸附、尺寸读数与撤销重做",
+    items: [
+      "地图编辑器新增吸附模式切换：八像素、三十二像素、十六像素、自由，按钮常驻工具栏。",
+      "吸附优先级为已有墙体与门的端点、边线，其次为所选网格；靠近边角时自动贴齐。",
+      "绘制矩形时显示像素尺寸与格子数，指针移动时显示世界坐标与格坐标；与墙体冲突时转红警示。",
+      "编辑器新增重做按钮与三十步重做栈；执行新的绘制操作时清空重做栈，撤销与重做按钮按栈内记录自动禁用。",
+      "撤销、重做均按完整快照恢复墙体、门与单位布置。",
+      "本版为 2.4 大版本首个方向，后续功能块与自定义地块在本大版本内继续推进。"
+    ]
+  },
+  {
+    v: "2.3.02.1a", d: "2026-11-08",
+    title: "单位编辑器分区及特殊机制重置",
+    items: [
+      "单位编辑器按基础、武器、特殊机制、全局四类分区显示字段，长列表不再混排。",
+      "特殊机制字段纳入独立分组，可按「特殊机制」范围单独恢复，不影响基础与武器数值。",
+      "调整字段标签列宽与滑条宽度，窄屏下仍可完整操作。",
+      "本版为 2.3 子批次第二个构建，演示渲染接入真实绘制列入后续构建。"
+    ]
+  },
+  {
+    v: "2.3.01.1a", d: "2026-11-08",
+    title: "兵种专属编辑字段及实机演示",
+    items: [
+      "单位编辑器按兵种显示专属字段：激光兵为光束直径、每跳伤害、射程、蓄力、横扫角度、过热上限、过热冷却、过热换弹与撞墙溅射；不再显示无意义的散布。",
+      "喷火兵显示喷火距离、扇形角度、结算间隔、每跳耗弹、直流伤害、火坑伤害、点燃时长与转向速度。",
+      "磁爆兵显示单发伤害、连锁上限、连锁半径、麻痹时长、连发次数与冷却；液氮兵显示弹匣瓶数、投掷间隔、寒冷圈半径、铺开时间、冻结时间与回暖时间。",
+      "实机演示改为独立沙盒：每次推进临时切换全局战场、随机数与镜头，推进完成后立即还原，主战场与存档不受影响。",
+      "演示按固定六十赫兹推进，画布读取真实单位位置、生命、弹匣、装填与子弹，不再使用手写假弹道。"
+    ]
+  },
+  {
+    v: "2.2.02.1a", d: "2026-11-08",
+    title: "字段上限表及逐字段重置",
+    items: [
+      "新增字段上限表，统一生命、体型、速度、伤害、射程、间隔、散布、弹匣、换弹、恐惧半径、后坐力及护盾字段的最小值、最大值与步进。",
+      "调兵种滑条的范围与写入夹值改为读取上限表，避免不同面板各写一套范围。",
+      "每个可调字段新增逐字段重置按钮，仅恢复该字段的预设值。",
+      "本版为 2.2 子批次第二个构建，单位编辑器完整接入与实机演示列入后续构建。"
+    ]
+  },
+  {
+    v: "2.2.01.1a", d: "2026-11-08",
+    title: "兵种预设基线及分区重置",
+    items: [
+      "建立兵种预设基线：每个内置兵种在加载时生成不可变数值快照，包含生命、移动、武器、恐惧半径、后坐力与特殊机制字段。",
+      "快照逐项校验为有效数字，缺失或非法值以零补位，避免恢复时写入未定义值。",
+      "恢复功能增加明确范围：本兵种、移动、武器、生存、特殊机制、全部兵种。",
+      "新增按兵种、按分组、按字段的重置接口，仅写回白名单字段，其余数值保持不变。",
+      "全部恢复不再删除或改写自定义兵种；全局子弹速度、后坐力、巡航比例等单独快照并随全部恢复还原。",
+      "本版为 2.2 子批次首个构建，单位编辑器的逐字段重置按钮与字段上限表列入后续构建。"
+    ]
+  },
+  {
+    v: "2.1.03.1a", d: "2026-11-08",
+    title: "编辑器工作台基础及首页入口",
+    items: [
+      "首页新增「工具」区及「地形编辑器」入口，无需先进入开战设置。",
+      "编辑器工具栏统一采用终端视觉样式，标签、工具、绘制模式按钮状态一致，「完成」使用主色按钮。",
+      "移动端面板改用实测视口高度计算上限，小屏下收窄内边距，避免超出屏幕。",
+      "编辑器工具按钮在窄屏下提高至四十像素，便于触控。",
+      "本版为 2.1.03 子批次首个构建，单位、波次、地砖编辑器将在后续构建统一接入工作台。"
+    ]
+  },
+  {
+    v: "2.1.02.4a", d: "2026-11-08",
+    title: "品牌更名及覆盖层交互修正",
+    items: [
+      "游戏名称调整为《归墟防线》，英文副标题定为 THE LAST LINE。应用标题、PWA 名称、首页、帮助、存档文件名及分享标题同步更新。",
+      "内部存储标识保持不变，既有存档与存档码继续有效。",
+      "修复自首页进入「设置与画面」「玩法说明」后关闭无法返回首页的问题。",
+      "更新公告、设置、帮助统一采用终端视觉规范，包括琥珀色分区线、直角面板、统一列表与滚动条。",
+      "设置面板音量滑条调整为琥珀色样式，并移除重复的音量控件。",
+      "新增首页专属战术地图背景板，首页与开战设置不再透出实时战场画面。",
+"新增暂停面板与结算面板：暂停时显示战况摘要及继续、设置、重开、返回主页；结算时显示战况统计及再来一局、读取存档、返回主页、观察战场。",
+"首页与开战设置期间收起顶栏、底栏，进入战斗或读档后恢复。",
+"设置面板重构为音效、画面、玩法与操作、调试与版本四个分区，开关与操作按钮按用途归位。",
+"配色主题改为直接切换并刷新选中态，不再重建整个面板，避免控件丢失。",
+"新手引导改为终端面板，增加步骤进度指示；触屏按钮高度保持四十四像素。",
+"帮助首屏增加三句话摘要及「重看新手引导」「开战设置」「关闭」入口，长说明继续折叠。",
+"小屏高度下帮助与引导可滚动，避免遮挡底栏。",
+"本版为 2.1.02 子批次第四个构建，移动端逐屏审计及画布命中区调整列入后续构建。"
+    ]
+  },
+  {
+    v: "2.1.01.2a", d: "2026-11-08",
+    title: "界面基础框架及版本号规则",
+    items: [
+      "自本版起启用四段式版本号，依次为主版本、主题、子批次、构建号，并以 a、b、rc 标识开发阶段。",
+      "本版为 2.1.01 子批次第二个构建，范围限于界面清单、设计语言与主界面框架，不涉及战斗数值。",
+      "建立终端视觉基础层：近黑背景、琥珀主色、冷青数据色、二像素直角及一像素细线；按钮、面板、分区标题统一规范。",
+      "首页重构为终端布局，列明三种作战模式、开始对局、读取存档、设置与版本信息。",
+      "主菜单按「战局」「存档」「行动」「系统」四组重排，顶部显示当前版本。",
+      "触屏设备按钮最小高度调整为四十四像素，菜单行同步加高。"
+    ]
+  },
+  {
+    v: "2.0.0", d: "2026-11-07",
+    title: "长线工程启动及存档码、装填逻辑更新",
+    items: [
+      "启动 2.0 长线工程，建立路线图、节点总表、工程日志、决策记录、研究笔记及风险与回滚文档。",
+      "新增存档码功能：完整存档经压缩编码为 SB2Z. 前缀文本，支持复制、系统分享及跨设备粘贴导入；原 JSON 存档导入方式保留。",
+      "存档码具备格式校验，异常内容将明确提示，且不影响现有存档。",
+      "武装单位新增强制装填判定：无敌情、最近敌情距离超过一百八十像素或弹匣低于四成时主动换弹。",
+      "新增同兵种装填互斥：二百五十像素范围内已有同兵种换弹时，其余单位暂缓换弹。",
+      "装填判定每零点三五秒执行一次并错峰，避免逐帧全场查询。",
+      "激光兵、液氮兵、喷火兵维持原有装填节奏，不适用上述规则。",
+      "本版不涉及平衡性调整。"
+    ]
+  },
+  {
+    v: "1.3.6", d: "2026-11-07",
+    title: "锁敌、火焰及激光表现修正",
+    items: [
+      "激光兵单次结算伤害由 0.9 调整为 1.5；光柱宽度调整为 16，撞墙截面闪光同步放大。",
+      "激光出膛十字改为四根锥形臂，自中心向末端透明度渐变，攻击期间高频闪烁，方向固定为横竖。",
+      "激光蓄力环整段仅出现三圈，分别位于 0、0.7、1.4 秒；半径缩至射程三分之一，透明度调整为三成，横扫周期延长至 2.8 秒。",
+      "玩家操控激光兵期间按住开火键持续照射，移速惩罚为五成；松开后消耗当前弹药、退下电池壳并进入三秒换弹；连续照射八秒后强制换弹。",
+      "磁爆兵单发伤害调整为 0.45，连锁半径调整为 174，索敌范围调整为 560；英雄连锁上限提升至五倍。",
+      "喷火兵未升格时火焰不穿透，仅命中首个目标；射程调整为 560；新增直流喷射伤害每零点二秒一点，火坑伤害每零点四秒两点且可叠加，点燃伤害不变。",
+      "液氮兵减速曲线调整为六秒达到九成五，离圈后按三秒基准恢复；雪花粒子改为固定位置浮动。",
+      "激光、磁爆、喷火及机枪统一视线规则：无视线时侧移寻找射界，不隔墙开火；目标进入墙后时停止照射。新增武器名称：液氮罐、喷火器、磁暴线圈、镭射核心。",
+      "修复导演模式触发「帝皇特使」时支援对象为空导致的异常；错误提示条调整为不拦截点击并自动收起。"
+    ]
+  },
+  {
+    v: "1.3.5", d: "2026-11-07",
+    title: "下拉菜单配色修正",
+    items: [
+      "修复底部放置下拉、地形编辑器兵种下拉及地图、规模、波次、存档槽等面板下拉框文字颜色异常问题，统一为浅色文字与深色背景。",
+      "剧情模式事件下拉保留原有紫色背景，选项文字同步调整为浅色。"
+    ]
+  },
+  {
+    v: "1.3.4", d: "2026-11-07",
+    title: "战斗表现与平衡性调整",
+    items: [
+      "激光兵每零点一秒伤害由 0.4 调整为 0.9；光柱改为出膛渐宽、末端按距离淡出，撞墙处以射线求交截断并显示截面光。",
+      "激光出膛十字固定为横竖方向，不随单位朝向旋转；蓄力环改为零点一八秒周期高速收拢。",
+      "磁爆兵单发伤害由 1 调整为 0.06，命中附加麻痹：速度归零、黄白高频闪烁，持续时间与闪电一致。",
+      "激光与磁爆调整为不穿墙：光柱按射线截断，闪电锁定及每段连锁均需视线。",
+      "喷火兵特效改为橙黄圆形火焰粒子与短渐变枪口，火焰落地形成圆形火片区，连续扫射可叠加成火墙。",
+      "液氮罐取消旋转，改为警示闪烁；寒冷圈落地零点一二秒铺满。",
+      "护送模式难度改为按开局派出武装单位数量乘数缩放：基准五人，每增加一人刷新量乘以一点一八，刷新间隔相应缩短并设上限。"
+    ]
+  },
+  {
+    v: "1.3.3", d: "2026-11-07",
+    title: "新增四类人类兵种",
+    items: [
+      "新增液氮兵，造价一百二十：弹匣一瓶、换弹三秒，投掷寒冷罐形成寒冷圈，圈内减速并冻结，离开后逐步恢复；扩容后最多三瓶，英雄寒冷圈半径扩大五倍。",
+      "新增喷火兵，造价一百五十：射程 560，弹匣一百，换弹五秒，持续扇形火焰并留下火墙与点燃；英雄火焰穿透单位。",
+      "新增磁爆兵，造价二百一十：弹匣二十五，五连电击后冷却，连锁最多十项指标，命中附加麻痹；减散布配件改为增加连锁上限，英雄上限三倍。",
+      "新增激光兵，造价二百五十：蓄力两秒后发射横扫光柱，每零点一秒造成零点四伤害，四轮后冷却；减散布配件改为增加光束宽度，英雄长度三倍、宽度五倍。",
+      "四类兵种接入投放列表、地形编辑器、护送编队、兵种面板及联机快照。",
+      "新增对应开火音效及换弹后的大号残骸，包括燃料罐、电池匣与聚能电池。",
+      "持续开火震动规则：激光每零点一秒、喷火每零点四秒触发一次。",
+      "调整狙击手配色，避免与液氮兵混淆。"
+    ]
+  },
+  {
+    v: "1.3.2", d: "2026-10-21",
+    title: "底部放置控件与单位行为修正",
+    items: [
+      "修复窄屏下底部放置单位下拉整体不可见问题，底栏改为自左排列并支持横向滚动。",
+      "放置单位下拉固定于底栏左侧，横向滚动时保持可见。",
+      "狙击手无射击机会时的主动出击等待由十秒缩短为四秒。",
+      "自爆丧尸爆炸减速效果由零点五秒、七成调整为一秒、八成。",
+      "医疗兵治疗弹及相关特效统一配色；英雄医疗兵改为弹匣与锁定数量均扩至三倍。",
+      "场上无武装单位时，平民与医疗兵向质心集结并按编号分配站位。",
+      "无其他武装单位时，医疗兵按武装单位逻辑行动，但不获得额外武器。"
+    ]
+  },
+  {
+    v: "1.3.1", d: "2026-10-21",
+    title: "各地图守军编制调整",
+    items: [
+      "各地图守军编制调整：城镇与 H 型通道维持十二名步枪兵、三名机枪兵；平原改为十名步枪兵、两名机枪兵、两名医疗兵、一名狙击手；室内改为十名步枪兵、两名机枪兵、一名盾兵。"
+    ]
+  },
+  {
+    v: "1.3.0", d: "2026-10-20",
+    title: "界面重构、地图扩充及联机功能",
+    items: [
+      "菜单重构为两级：顶层保留存档、导入导出、重开、装备市场、联机、设置与帮助；其余功能收入设置与帮助面板。",
+      "新增画面亮度调节，范围为五成至一点五倍；新增暮色、废墟褐、军事绿、夜战蓝四套配色主题，切换即时生效。",
+      "新增城镇、平原、室内、H 型通道四张地图。",
+      "新增联机对战，实验性功能：四位房号点对点连接，当前仅支持状态单向同步。",
+      "建立人类与丧尸兵种库，投放、编辑器及小队展开统一读取兵种库。",
+      "新增版本号体系及版本号详情页，公告保留最近三个版本。",
+      "新手引导扩展至五步，按键名称实时读取，并按设备类型分流。",
+      "修复医疗兵无法在地图编辑器放置、护送模式不撤离及无法编入小队；修复舔舐者死亡后束缚不解除；修复结算时无法退出操控；修复暂停同步重复触发及状态同步死锁；修复手机菜单超出屏幕、暂停提示不消失及窄屏按钮挤出屏幕。"
+    ]
+  },
+  {
+    v: "1.2.0", d: "2026-10-12",
+    title: "新增自爆丧尸、医疗兵及阵营投放",
+    items: [
+      "新增自爆丧尸：生命值耗尽后进入蓄爆，一秒后爆炸，蓄爆期间免疫伤害；爆炸产生冲击波、减速与血迹效果。",
+      "新增医疗兵，造价一百：锁定受感染友军并发射治疗弹，可解除感染；对丧尸造成三点伤害；可编入护送小队并解除封锁门。",
+      "开放丧尸阵营投放：普通丧尸十、舔舐者二十、母体一百。",
+      "舔舐者舌头改为蛛丝表现，舌头生命值三十，断舌冷却四秒，刷新比例提高至八十分之一。",
+      "被爆炸波及的人类新增腾空动画；淘汰播报新增感染条目。"
+    ]
+  },
+  {
+    v: "1.1.0", d: "2026-09-28",
+    title: "军需商城系统上线",
+    items: [
+      "新增军需商城，可通过 Z 键或菜单进入，为指定单位配置装备，无需接管该单位。",
+      "枪械改装设枪口、弹匣、瞄具三个槽位，槽位互斥，重复点击卸下。",
+      "新增角色升级：四级防护服、两档移速强化及帝皇赐福英雄化。",
+      "装备仅在当前页面会话有效，不写入存档。"
+    ]
+  },
+  {
+    v: "1.0.2", d: "2026-09-14",
+    title: "护送模式及营救流程",
+    items: [
+      "新增护送模式：小队自地图东侧出发，解除西侧牢房封锁，并护送平民至撤离点。",
+      "护送模式丧尸初始休眠，受靠近、枪声或同类带动而苏醒。",
+      "封锁门需武装单位或医疗兵接触解除；解封后每一点三秒释放一名平民。",
+      "撤离点每一点三秒撤离一人，平民优先；撤离阶段队伍持续向撤离点推进。",
+      "首名平民撤离后，尸潮自撤离点方向出现；全员撤离为胜，人类全灭为败。",
+      "新增营救人数、小队编制、出生点配置及撤离路径检查。"
+    ]
+  },
+  {
+    v: "1.0.1", d: "2026-08-30",
+    title: "波次、混沌模式及地形编辑器",
+    items: [
+      "新增波次模式：按波数、首波延迟及间隔分批刷怪，全部波次清空为胜。",
+      "新增混沌模式：丧尸三倍血量、击退翻倍、平民数量提升，开场设倒计时。",
+      "新增地形编辑器：支持拖拽、两角、单击三种画法，八像素吸附，可绘制墙体、门、牢房、出生点、撤离点、波次区、休眠尸群及单位。",
+      "编辑器支持撤销、清空、恢复默认及连通性检查。",
+      "新增手动存档、读档、每十五秒自动存档及存档导入导出。"
+    ]
+  },
+  {
+    v: "1.0.0", d: "2026-08-12",
+    title: "首个正式版本",
+    items: [
+      "首个正式版本，包含防线模式、四类人类单位及四类丧尸单位。",
+      "实现八方向 A 星寻路、集群同步、护卫编组、掩体利用、恐惧半径与后坐力。",
+      "实现资源经济、批量投放、暂停及四档倍速。",
+      "战争迷雾作为实验性功能默认关闭。"
+    ]
+  },
+];
+
+function patchNoteHtml() {
+  var h = "", i, j, V;
+  var n = Math.min(3, PATCH_VERSIONS.length);   /* 公告只放最近三次 */
+  for (i = 0; i < n; i++) {
+    V = PATCH_VERSIONS[i];
+    h += "<h3 class='verHead'>" + V.v + " · " + V.d + "</h3>";
+    if (V.title) h += "<p class='verSub'>" + V.title + "</p>";
+    h += "<ul>";
+    for (j = 0; j < V.items.length; j++) h += "<li>" + V.items[j] + "</li>";
+    h += "</ul>";
+  }
+  return h;
+}
+/* 打开公告：每次刷新都弹，菜单里也能再点开 */
+function showPatchNote() {
+  if (document.getElementById("moreHost")) morePark();
+  var el = $("patchNote");
+  if (!el) return;
+  var body = $("patchBody");
+  if (body) body.innerHTML = patchNoteHtml();
+  var sub = $("patchSub");
+  if (sub) sub.textContent = "当前版本 " + GAME_VERSION + "　·　这里保留最近三次更新，可上下滑动查阅";
+  el.className = "show";
+  if (body) body.scrollTop = 0;
+}
+/* 历代版本记录：公告里只留最近三次，更早的都收在这里，一条都不删 */
+function patchHistoryHtml() {
+  var h = "", i, j, V;
+  for (i = 0; i < PATCH_VERSIONS.length; i++) {
+    V = PATCH_VERSIONS[i];
+    h += "<h3 class='verHead'>" + V.v + " · " + V.d + "</h3>";
+    if (V.title) h += "<p class='verSub'>" + V.title + "</p>";
+    h += "<ul>";
+    for (j = 0; j < V.items.length; j++) h += "<li>" + V.items[j] + "</li>";
+    h += "</ul>";
+  }
+  return h;
+}
+function showPatchHistory() {
+  if (document.getElementById("moreHost")) morePark();
+  panelEl.className = "";
+  panelEl.innerHTML =
+    "<h2>版本号详情</h2>" +
+    "<p style='margin:-4px 0 10px;color:#9fb4dd;font-size:12.5px'>从新到旧，一共 " +
+    PATCH_VERSIONS.length + " 个版本。更新公告里只显示最近三次，这里是完整记录。<br>" +
+    "版本号怎么定：第一位变是整块重写，第二位变是成批的新功能，第三位变是一处小修小补。" +
+    "每一处改动都单独占一个版本号，不回填到已经发布的版本里；" +
+    "当天之内的小型单位数值调整直接并入当天那个版本，不再另开版本号。</p>" +
+    "<div style='max-height:56vh;overflow-y:auto;padding-right:8px' id='phBody'></div>" +
+    "<p style='text-align:right'><button id='phClose'>关闭</button></p>";
+  HOME_PANEL = false; START_PANEL = false;
+  overlayEl.className = "show";
+  var body = $("phBody");
+  if (body) body.innerHTML = patchHistoryHtml();
+  var cl = $("phClose");
+  if (cl) cl.addEventListener("click", hideOverlay);
+}
+function maybeShowPatch() { showPatchNote(); }
+function hidePatchNote() {
+  var el = $("patchNote");
+  if (el) el.className = "";
+}
+/* 手机浏览器的 100vh 包含地址栏和底栏的高度，按它算出来的菜单永远超出屏幕。
+   这里实测可视高度写进 CSS 变量，所有需要"贴着屏幕边缘"的布局都用它 */
+function syncViewportVars() {
+  var vv = window.visualViewport;
+  var de = document.documentElement || {};
+  var h = (vv && vv.height) || de.clientHeight || window.innerHeight || 0;
+  var w = (vv && vv.width) || de.clientWidth || window.innerWidth || 0;
+  if (!de || !de.style || !de.style.setProperty) return;   /* 测试环境没有 documentElement */
+  if (h > 0) de.style.setProperty("--vh", h + "px");
+  if (w > 0) de.style.setProperty("--vw", w + "px");
+}
+function watchViewport() {
+  syncViewportVars();
+  window.addEventListener("resize", syncViewportVars);
+  window.addEventListener("orientationchange", function () { setTimeout(syncViewportVars, 120); });
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", syncViewportVars);
+    window.visualViewport.addEventListener("scroll", syncViewportVars);
+  }
+}
+function boot() {
+  loadBinds();
+  rebuildFactionKinds();
+  watchViewport();
+  loadBrightness();
+  loadShake();
+  loadQuality();
+  loadGlowLayer();
+  loadVisualFx();
+  loadReplay();
+  loadPalette();
+  loadReduceMotion();
+  try {
+    var mp = localStorage.getItem("zombieSandbox.map");
+    if (mp && MAP_PRESETS[mp]) CFG.mapPreset = mp;
+  } catch (e) {}
+  loadManualSlots();
+  CANVAS = $("cv");
+  CTX = CANVAS.getContext("2d", { alpha: false });
+  resize();
+  /* 打开游戏不直接开局：先摆好场景，再由开战设置面板决定尸潮规模 */
+  LAST_ZOMBIE_COUNT = CFG.start.baseZombies;
+  buildScenario(undefined, LAST_ZOMBIE_COUNT);
+  centerCamera();
+  bindUI();
+  isTouchPrimary();
+  statEl.textContent = "准备就绪";
+  showHome();
+  /* 公告盖在开局选项上面，先看公告再看怎么开局 */
+  var px = $("patchX"); if (px) px.addEventListener("click", hidePatchNote);
+  var po = $("patchOk"); if (po) po.addEventListener("click", hidePatchNote);
+  var bp = $("bPatch"); if (bp) bp.addEventListener("click", showPatchNote);
+  var bn = $("bNet"); if (bn) bn.addEventListener("click", showNetPanel);
+  /* 手机没有键盘：这两个功能原本只有快捷键，等于手机上根本进不去 */
+  var bfm = $("bFireMode");
+  if (bfm) bfm.addEventListener("click", function () {
+    if (!(PLAYER.on && PLAYER.unit && !PLAYER.unit.dead)) {
+      toast("先点「操控」接管一名士兵，才能切换开火模式");
+      return;
+    }
+    PLAYER.fireMode = PLAYER.fireMode === 0 ? 1 : 0;
+    PLAYER.semiShot = 0;
+    toast("开火模式：" + CFG.playerFire.modeName[PLAYER.fireMode]);
+  });
+  var bdr = $("bDirector");
+  if (bdr) bdr.addEventListener("click", function () { setDirector(!DIRECTOR.on); });
+  var bset = $("bSettings");
+  if (bset) bset.addEventListener("click", function () { $("menuPop").className = ""; showSettingsPanel(); });
+  var bmore = $("bHelp");
+  if (bmore) bmore.addEventListener("click", function () { $("menuPop").className = ""; showMorePanel(); });
+  maybeShowPatch();
+  requestAnimationFrame(function (t) { lastFrameT = t; requestAnimationFrame(frame); });
+}
+boot();
+
+
+
+
+
+

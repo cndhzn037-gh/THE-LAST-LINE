@@ -1,0 +1,42 @@
+﻿# === 大体积媒体（与代码无关） ===
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.zip
+*.7z
+*.rar
+
+# === 密钥与凭据（绝不外传） ===
+.cred
+*.cred
+.preview*
+.tok_ok
+账户密钥.md
+CLoudflare API密钥.md
+*密钥*.md
+*api密钥*
+.env
+.env.*
+*.pem
+*.key
+secrets.*
+credentials.*
+
+# === 历史归档与实验目录 ===
+实验性测试/
+丧尸沙盒/回滚锚点/
+
+# === 临时文件 ===
+**/_*
+_*
+*.bak
+*.log
+*.tmp
+
+# === 系统与编辑器 ===
+Thumbs.db
+desktop.ini
+.DS_Store
+

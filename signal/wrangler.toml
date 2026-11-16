@@ -1,0 +1,14 @@
+# 信令服务器：一个不关心内容的房间转发口
+# 部署：npm i -D wrangler && npx wrangler login && npx wrangler deploy
+name = "zangbishahe-signal"
+main = "src/index.js"
+compatibility_date = "2024-11-01"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+# 注意：必须是 new_sqlite_classes，写成 new_classes 会要求付费计划
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]

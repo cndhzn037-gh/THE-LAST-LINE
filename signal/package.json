@@ -1,0 +1,9 @@
+{
+  "name": "zangbishahe-signal",
+  "private": true,
+  "version": "1.0.0",
+  "description": "丧尸沙盘的联机信令：一个只做房间转发的 Cloudflare Worker",
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

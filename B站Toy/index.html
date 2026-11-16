@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<title>归墟防线 · 人类最后的沙盘</title>
+<meta name="theme-color" content="#0a0c13">
+<meta property="og:title" content="归墟防线 · THE LAST LINE">
+<meta property="og:description" content="文明燃尽之处，人类仍在结阵。2D 俯视角丧尸攻防沙盘。">
+<meta property="og:type" content="website">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="归墟防线">
+<link rel="apple-touch-icon" href="icon-192.png">
+<link rel="icon" type="image/png" href="icon-192.png">
+<link rel="stylesheet" href="game.css">
+</head>
+<body>
+<canvas id="cv"></canvas>
+<div id="sceneFade" aria-hidden="true"></div>
+<div id="homeBg" aria-hidden="true">
+  <div class="hb-grid"></div>
+  <svg class="hb-map" viewBox="0 0 1280 800" preserveAspectRatio="xMidYMid slice" aria-hidden="true">
+    <g fill="none" stroke="rgba(217,164,65,.24)" fill="rgba(217,164,65,.035)" stroke-width="1">
+      <rect x="54" y="82" width="188" height="118"/><rect x="282" y="60" width="120" height="86"/>
+      <rect x="52" y="246" width="120" height="150"/><rect x="206" y="238" width="150" height="92"/>
+      <rect x="930" y="88" width="180" height="96"/><rect x="1140" y="110" width="110" height="150"/>
+      <rect x="960" y="238" width="150" height="120"/><rect x="1130" y="300" width="120" height="90"/>
+      <rect x="80" y="590" width="150" height="110"/><rect x="270" y="630" width="110" height="90"/>
+      <rect x="940" y="560" width="170" height="120"/><rect x="1150" y="610" width="100" height="110"/>
+    </g>
+    <g fill="none" stroke="rgba(217,164,65,.15)" stroke-width="1">
+      <path d="M54 200 H900"/><path d="M54 560 H1230"/><path d="M360 60 V740"/><path d="M930 60 V740"/>
+      <path d="M0 660 C 220 600, 320 540, 520 530 S 840 430, 1120 320"/>
+      <path d="M0 700 C 240 640, 360 590, 560 575 S 880 480, 1180 360"/>
+      <path d="M0 740 C 260 690, 400 640, 600 620 S 920 530, 1240 410"/>
+    </g>
+    <g fill="none" stroke="rgba(111,199,192,.5)" stroke-width="1.4" stroke-dasharray="9 7" stroke-width="1.8">
+      <path d="M30 690 C 300 640, 430 575, 660 520 S 1000 360, 1250 170"/>
+    </g>
+    <g fill="rgba(217,164,65,.85)">
+      <circle cx="30" cy="690" r="3.5"/><circle cx="330" cy="610" r="3.5"/>
+      <circle cx="660" cy="520" r="4"/><circle cx="980" cy="350" r="3.5"/><circle cx="1250" cy="170" r="3.5"/>
+    </g>
+    <g fill="none" stroke="rgba(217,164,65,.24)" stroke-width="1">
+      <circle cx="640" cy="400" r="128"/><circle cx="640" cy="400" r="196"/><circle cx="640" cy="400" r="264"/>
+      <path d="M640 120 V180 M640 620 V680 M360 400 H420 M860 400 H920"/>
+    </g>
+  </svg>
+  <div class="hb-topo"></div>
+  <div class="hb-noise"></div>
+  <div class="hb-vig"></div>
+  <div class="hb-corner tl"></div><div class="hb-corner tr"></div>
+  <div class="hb-corner bl"></div><div class="hb-corner br"></div>
+  <div class="hb-mark">SECTOR 07 // LAST LINE</div>
+  <div class="hb-coord">E 117° 14′ · N 34° 06′</div>
+</div>
+<div id="ctxHint" aria-hidden="true"></div>
+<div id="econHud" aria-live="polite" style="display:none">
+  <div class="econTop"><span>资源</span><b id="econRes">0</b></div>
+  <div class="econRate" id="econRate">+0 / 秒</div>
+  <div class="econRows"><span>人类 <b id="econHumans">0</b></span><span>丧尸 <b id="econZombies">0</b></span></div>
+</div>
+<div class="bar" id="top">
+  <span id="stat">初始化…</span>
+  <button id="bPause">暂停</button>
+  <button id="bSpeed">1×</button>
+  <button id="bFull" title="全屏">⛶ 全屏</button>
+  <button id="bMenu" title="菜单：存档、音量、调试、玩法说明">☰ 菜单</button>
+  <div id="menuPop">
+    <div class="menuHead"><b>作战终端</b><span id="menuVer">v2.0.0</span></div>
+
+    <div class="menuSec">战局</div>
+    <div class="row"><button id="bRestart">重开这一局</button></div>
+
+    <div class="menuSec">存档</div>
+    <div class="row"><button id="bSave">存档</button><button id="bLoad">读档</button></div>
+    <div class="row"><button id="bExport">导出</button><button id="bImport">导入</button></div>
+    <div class="row"><button id="bCode" title="用一段文本在手机/电脑之间转移存档">存档码</button></div>
+
+    <div class="menuSec">行动</div>
+    <button id="bMarket" title="给当前操控的士兵买枪械配件和角色升级">装备市场</button>
+    <button id="bNet" title="和另一台设备联机：一方建房，另一方用同一个房间号加入">联机对战</button>
+    <div class="row"><button id="bFireMode" title="操控单位时切换全自动/半自动">开火模式</button><button id="bDirector" title="进入剧情模式：暂停游戏，给任意单位下指令">剧情导演</button></div>
+
+    <div class="menuSec">系统</div>
+    <button id="bSettings" style="text-align:left">设置与画面 ▸</button>
+    <button id="bHelp" style="text-align:left">帮助与术语 ▸</button>
+    <button id="bKeysHelp" style="text-align:left">快捷键与操作 ▸</button>
+
+    <!-- 下面这些被收纳进设置/帮助面板，仍留在 DOM 里，事件绑定和 id 都保持不变 -->
+    <div id="settingBag" style="display:none">
+      <input type="range" id="volRange" min="0" max="150" value="95">
+      <b id="volVal">95%</b>
+      <button id="fogBtn" data-label="战争迷雾（实验性功能）">✗ 战争迷雾（实验性功能）</button>
+      <button id="fbFeed" data-label="淘汰播报">✓ 淘汰播报</button>
+      <button id="fbHit" data-label="命中标记">✓ 命中标记</button>
+      <button id="fbSfx" data-label="击杀音效">✓ 击杀音效</button>
+      <button id="bKeys">键位设置</button>
+      <button id="bReduce" title="关闭界面过渡与入场动画；进入战场直接切换">减少动态效果：关</button>
+      <button id="bResetAll">恢复全部默认设置</button>
+      <div id="debugBag" style="display:none">
+        <button id="bDebug">调试视图开关</button>
+        <select id="debugSel">
+          <option value="">显示全部线索</option>
+          <option value="target">只看锁敌</option>
+          <option value="range">只看感知</option>
+          <option value="post">只看岗位</option>
+          <option value="path">只看路径</option>
+          <option value="guard">只看护卫</option>
+        </select>
+        <button id="bTune">调兵种数值（试用）</button>
+        <button id="bPatch">更新公告</button>
+        <div id="perfLine" class="perfLine">性能：—</div>
+      </div>
+    </div>
+  </div>
+</div>
+<div class="bar" id="editbar">
+  <div class="eworkHead"><b>地形编辑器</b><span id="eWorkInfo">自定义地图</span><button id="eDoneTop">完成</button></div>
+  <button id="eDrawer" class="drawerBtn" title="展开/收起工具">工具 ▾</button>
+  <button id="eDoneMobile" class="drawerBtn primary" title="完成编辑">完成</button>
+
+  <div class="ebar" id="editTabs">
+    <button class="etool" data-tool="pan" title="切到这个工具后，单指拖动屏幕就是平移地图（手机上编辑地形必备）">✥ 移动镜头</button>
+    <button id="eUndo">撤销</button>
+    <button id="eRedo">重做</button>
+    <button id="eClear">清空</button>
+    <button id="eReset">恢复默认</button>
+    <button id="eWallArt" title="在墙体、建筑上绘制矢量图层">墙面绘制</button>
+    <button id="eDone">完成</button>
+  </div>
+
+  <div class="ebar esection" id="editModes">
+    <button class="esecHead" data-sec="mode">绘制方式 ▾</button>
+    <div class="esecBody" id="modeBody">
+      <button class="emode on" data-mode="drag">拖拽</button>
+      <button class="emode" data-mode="corner">两角</button>
+      <button class="emode" data-mode="point">单击</button>
+      <button class="emode" data-mode="cell" title="按 32px 网格逐格填充墙体">点阵</button>
+      <button id="eSnapMode" title="切换吸附：4 / 8 / 16 / 32 / 64 / 96 / 128px / 自由">吸附：32px</button>
+    </div>
+  </div>
+
+  <div id="editTools">
+    <div class="ebar esection" id="secEdit">
+      <button class="esecHead" data-sec="edit">编辑块 ▾</button>
+      <div class="esecBody" id="bodyEdit">
+        <button class="etool on" data-tool="house">房屋</button>
+        <button class="etool" data-tool="wall">实心墙</button>
+        <button class="etool" data-tool="destWall">可破坏墙</button>
+        <button class="etool" data-tool="low">矮墙</button>
+        <button class="etool" data-tool="door">门</button>
+        <button class="etool" data-tool="erase">橡皮擦</button>
+      </div>
+    </div>
+
+    <div class="ebar esection" id="secUnit">
+      <button class="esecHead" data-sec="unit">单位块 ▾</button>
+      <div class="esecBody collapsed" id="bodyUnit">
+        <select id="editUnitSel" title="选择要放置的单位">
+          <option value="">放置单位…</option>
+          <optgroup label="人类阵营">
+            <option value="rifle">步枪兵</option>
+            <option value="mg">机枪兵</option>
+            <option value="sniper">狙击手</option>
+            <option value="shield">盾兵</option>
+            <option value="medic">医疗兵</option>
+            <option value="cryo">液氮兵</option>
+            <option value="flame">喷火兵</option>
+            <option value="tesla">磁爆兵</option>
+            <option value="laser">激光兵</option>
+            <option value="civilian">平民</option>
+          </optgroup>
+          <optgroup label="丧尸阵营">
+            <option value="zombie">普通丧尸</option>
+            <option value="runner">奔跑者</option>
+            <option value="licker">舔舐者</option>
+            <option value="bomber">自爆丧尸</option>
+            <option value="mother">母体</option>
+          </optgroup>
+        </select>
+        <button id="eBatchMinus" title="批量数量 −">−</button>
+        <span id="eBatchVal" style="font-size:12px;min-width:30px;display:inline-block;text-align:center">×1</span>
+        <button id="eBatchPlus" title="批量数量 +">+</button>
+        <button class="etool" data-tool="defend">坚守点位</button>
+        <button class="etool" data-tool="move">移动</button>
+        <button class="etool" data-tool="route">画路线</button>
+        <button id="eNewRoute">新路线</button>
+        <button id="eClearRoute">清空路线</button>
+        <button class="etool" data-tool="safezone">无敌区</button>
+      </div>
+    </div>
+
+    <div class="ebar esection" id="secLevel">
+      <button class="esecHead" data-sec="level">关卡要素块 ▾</button>
+      <div class="esecBody collapsed" id="bodyLevel">
+        <button class="etool" data-tool="spawner">刷怪点</button>
+        <button class="etool" data-tool="hold">据点</button>
+        <button class="etool" data-tool="mound">休眠尸群</button>
+        <button class="etool" data-tool="wavezone">波次区</button>
+        <button class="etool" data-tool="prison">牢房</button>
+        <button class="etool" data-tool="prisondoor">解锁门</button>
+        <button class="etool" data-tool="squadpt">出生点</button>
+        <button class="etool" data-tool="evacpt">撤离点</button>
+        <button class="etool" data-tool="spawn">出生区</button>
+      </div>
+    </div>
+
+    <div class="ebar esection" id="secOther">
+      <button class="esecHead" data-sec="other">其他块 ▾</button>
+      <div class="esecBody collapsed" id="bodyOther">
+        <button class="etool" data-tool="slowZone">寒冷区域（缓速区）</button>
+        <button class="etool" data-tool="burnZone">灼烧区域</button>
+        <div class="esecTitle">自定义地块</div>
+        <button class="etool" data-tool="tile">自定义地块</button>
+        <input type="color" id="tileColor" value="#3a4a56" title="地块颜色" style="width:44px;height:34px;padding:0;border:1px solid #2b3944;background:#0c1217">
+        <select id="tileEffect" title="地块踩踏效果">
+          <option value="none">无效果</option><option value="slow">减速</option><option value="burn">灼烧</option>
+        </select>
+        <select id="tileSolid" title="地块通行">
+          <option value="0">可走</option><option value="1">阻挡</option>
+        </select>
+        <select id="tilePierce" title="子弹穿透">
+          <option value="0">挡子弹</option><option value="1">穿透</option>
+        </select>
+        <select id="tileHp" title="地块结构血量">
+          <option value="0">不可破坏</option><option value="240">耐久 240</option><option value="600">耐久 600</option>
+        </select>
+        <select id="tilePattern" title="地块纹理">
+          <option value="solid">纯色</option><option value="stripe">斜纹</option><option value="grid">网格</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="ebar esection" id="secGen">
+      <button class="esecHead" data-sec="gen">地形分析与生成 ▾</button>
+      <div class="esecBody collapsed" id="genBody">
+        <button id="eAnalyze" title="统计主连通区、封闭区、通道与出口">地图分析</button>
+        <button id="eGen" title="清空并生成一张可玩的房间—走廊地形">生成地形</button>
+        <button id="eGenBsp" title="按 BSP 分区生成地形">BSP 地形</button>
+        <button id="eGenPrefab" title="按区块拼接预制件">预制件</button>
+        <button id="eGenFix" title="按上次使用的方式生成，并自动修复封闭区">生成+修复</button>
+        <select id="genDifficulty" title="生成难度预算">
+          <option value="easy">生成：低</option><option value="normal" selected>生成：标准</option><option value="hard">生成：高</option>
+        </select>
+      </div>
+    </div>
+  </div>
+</div>
+<div id="wallArtOverlay">
+  <div id="waBar">
+    <b>墙面绘制</b>
+    <button class="waTool on" data-watool="pen">钢笔</button>
+    <button class="waTool" data-watool="brush">笔刷</button>
+    <button class="waTool" data-watool="line">直线</button>
+    <button class="waTool" data-watool="curve">曲线</button>
+    <button class="waTool" data-watool="bucket">油漆桶</button>
+    <button class="waTool" data-watool="text">多行文字</button>
+    <span class="waSep"></span>
+    <input type="color" id="waColor" value="#e8d8b8" title="颜色">
+    <input type="range" id="waWidth" min="1" max="18" value="3" title="笔宽">
+    <button id="waUndo">撤销</button>
+    <button id="waClear">清空绘画</button>
+    <button id="waClose">完成</button>
+  </div>
+  <div id="waStage"><canvas id="waCanvas"></canvas></div>
+  <div id="waTextPanel">
+    <textarea id="waTextInput" placeholder="输入多行文字"></textarea>
+    <button id="waTextOK">放到墙上</button>
+    <button id="waTextCancel">取消</button>
+  </div>
+</div>
+<div class="bar" id="bottom">
+  <select id="placeSel" title="选择要放置的单位或障碍">
+    <option value="">— 不放任何东西 —</option>
+    <optgroup label="人类阵营">
+      <option value="rifle">步枪兵</option>
+      <option value="militia">民兵</option>
+      <option value="mg">机枪兵</option>
+      <option value="sniper">狙击手</option>
+      <option value="shield">盾兵</option>
+      <option value="medic">医疗兵</option>
+      <option value="cryo">液氮兵</option>
+      <option value="flame">喷火兵</option>
+      <option value="tesla">磁爆兵</option>
+      <option value="laser">激光兵</option>
+      <option value="civilian">平民</option>
+      <option value="supportSquad">支援小队</option>
+      <option value="supportSpecial">特化部队增援</option>
+      <option value="supportLegion">军团主力</option>
+      <option value="supportEmperor">帝皇特使降临</option>
+    </optgroup>
+    <optgroup label="丧尸阵营">
+      <option value="zombie">普通丧尸</option>
+      <option value="runner">奔跑者</option>
+      <option value="licker">舔舐者</option>
+      <option value="bomber">自爆丧尸</option>
+      <option value="mother">母体</option>
+    </optgroup>
+    <optgroup label="工事">
+      <option value="sandbag">沙袋</option>
+    </optgroup>
+  </select>
+  <span class="sep"></span>
+  <button id="bControl" title="开启后点击一名人类单位即可接管（键盘 WASD + 鼠标瞄准）">操控</button>
+  <span class="sep"></span>
+  <span class="lab">批量</span>
+  <button id="batchMinus">−</button>
+  <span id="batchVal" style="font-size:12px;min-width:30px;display:inline-block;text-align:center">×1</span>
+  <button id="batchPlus">+</button>
+  <span class="sep"></span>
+  <span class="lab">尸潮</span>
+  <input type="range" id="waveRange" min="10" max="300" step="10" value="40" style="width:120px">
+  <span id="waveVal" style="font-size:12px;min-width:34px;display:inline-block;text-align:center">40</span>
+  <button id="bWave" title="按左边的数量一次性投放一群丧尸">投放尸潮</button>
+  <button id="bPromote" title="赐福一名存活的人类单位，令他当场升格为英雄">赐福</button>
+</div>
+<div id="tips">
+  <div class="tt"><span id="tipsT">第 1 步</span><span class="tdots" id="tipsDots"></span></div>
+  <div class="tb" id="tipsB"></div>
+  <div class="tr"><button id="tipsSkip">跳过</button><button id="tipsNext" class="primary">下一步</button></div>
+</div>
+<div id="directorBar">
+  <span id="dirSel">未选中单位</span>
+  <span class="sep"></span>
+  <button data-cue="moveTo" title="再点一下画布指定目标点">移动</button>
+  <button data-cue="follow" title="跟随当前选中的另一个单位">跟随</button>
+  <button data-cue="hold" title="原地待命，不主动移动">待命</button>
+<button data-cue="garrison" title="坚守：钉在一小片区域里，恐惧半径缩到很小（只躲接触感染），压力一减就用火力顶回去。点完再点画布选中心">坚守</button>
+  <button data-cue="face" title="再点一下画布指定朝向">朝向</button>
+  <button data-cue="fireAt" title="再点一下画布指定射击方向">射击</button>
+  <button data-cue="safe" title="保险打开：不开火，但照常走位">保险</button>
+  <button data-cue="say">对话</button>
+  <button data-cue="die" title="立刻阵亡">阵亡</button>
+  <button data-cue="release" title="清空剧本，交还 AI">解除</button>
+  <span class="sep"></span>
+  <button data-cue="camTo" title="再点一下画布，镜头平滑推到这里">镜头到此</button>
+  <button data-cue="camFollow" title="镜头平滑跟拍选中的单位">跟拍</button>
+  <button data-cue="camFree" title="解除镜头锁定">解除运镜</button>
+  <span class="sep"></span>
+  <select id="dirEvent" style="font-size:12.5px;min-height:32px;background:#2a2140;color:#dfe6f5;border:1px solid #5a4a86;border-radius:8px;padding:3px 6px">
+    <option value="">— 触发事件 —</option>
+    <option value="supportSquad">支援小队</option>
+    <option value="supportSpecial">特化部队增援</option>
+    <option value="supportLegion">军团主力</option>
+    <option value="supportEmperor">帝皇特使降临</option>
+    <option value="wave">波次来袭</option>
+    <option value="spawnZombies">此处刷丧尸 20 只</option>
+    <option value="spawnHumans">此处刷人类 5 人</option>
+    <option value="heroSel">选中单位升格英雄</option>
+    <option value="infectSel">选中单位强制感染</option>
+    <option value="win">强制胜利</option>
+    <option value="lose">强制失败</option>
+  </select>
+  <button id="dirFire" title="立刻触发选中的事件">触发</button>
+  <span class="sep"></span>
+  <button id="dirExport" title="把本次下达的指令与事件导出成 JSON">导出剧本</button>
+  <button id="dirImport" title="导入之前导出的剧本（仅作参考记录）">导入</button>
+  <span class="sep"></span>
+  <button id="dirBinds" title="自定义每个指令的快捷键">键位</button>
+  <button id="dirSave" title="手动存档：不会被自动存档覆盖，可随时读回来重演">存档</button>
+</div>
+<!-- 版本更新公告：盖在开局选项之上，第一次打开这个版本时弹出一次 -->
+<div id="patchNote">
+  <div id="patchCard">
+    <button id="patchX" title="关闭公告">×</button>
+    <h2>版本更新公告</h2>
+    <p class="patchSub" id="patchSub"></p>
+    <div id="patchBody"></div>
+    <div class="patchFoot"><button id="patchOk">关闭</button></div>
+  </div>
+</div>
+<div id="mobileFloat">
+  <button id="mReload" title="手动换弹">换弹</button>
+  <button id="mCtrl" title="操控单位">操控</button>
+  <button id="mFull" title="全屏">⛶</button>
+  <button id="mMenu" title="菜单">☰</button>
+  <button id="mAttack" title="攻击">攻击</button>
+  <button id="mPounce" title="猛扑">猛扑</button>
+</div>
+<div id="overlay"><div id="panel"></div></div>
+<input type="file" id="fileIn" accept=".json,application/json" style="display:none">
+<script src="game.js"></script>
+</body>
+</html>

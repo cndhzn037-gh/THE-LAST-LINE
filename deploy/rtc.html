@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WebRTC 直连自检</title>
+<style>
+  body{margin:0;padding:18px;background:#0b0f1a;color:#dfe6f5;
+    font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+  h1{font-size:17px;margin:0 0 4px}
+  p.sub{margin:0 0 14px;color:#8fa4cc;font-size:12.5px}
+  label{display:block;margin:10px 0 4px;color:#9fb4dd;font-size:12.5px}
+  input{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;
+    background:#141c2e;border:1px solid #2c3757;color:#dfe6f5;font-size:14px}
+  .row{display:flex;gap:8px;margin-top:10px}
+  button{flex:0 0 auto;padding:9px 18px;border-radius:8px;background:#1d2b48;
+    border:1px solid #35507f;color:#dfe6f5;font-size:14px;cursor:pointer}
+  button:hover{background:#25375c}
+  button:disabled{opacity:.45;cursor:default}
+  .cards{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+  .card{flex:1;min-width:130px;background:#111726;border:1px solid #223055;
+    border-radius:9px;padding:8px 11px}
+  .card b{display:block;font-size:11.5px;color:#7f92b8;font-weight:400}
+  .card span{font-size:14px}
+  .g{color:#7fe0a0}.y{color:#ffd479}.r{color:#ff9a9a}.d{color:#7f92b8}
+  #log{margin-top:14px;height:340px;overflow:auto;background:#070b14;
+    border:1px solid #1e2740;border-radius:9px;padding:10px 12px;
+    font:12.5px/1.7 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>WebRTC 直连自检</h1>
+<p class="sub">两台设备填<b>同一个房间号</b>，各自点「开始」。连上后会显示 ICE 状态和候选类型，然后可以互发文字。<br>
+这一步验证的是「两台设备能不能绕过服务器直连」，跟游戏还无关。</p>
+
+<label>信令地址（已填好，不用改）</label>
+<input id="host" value="wss://zangbishahe.pages.dev/api/signal/">
+
+<label>房间号（两台设备必须一样）</label>
+<div class="row">
+  <input id="room" value="">
+  <button id="btnRand">随机</button>
+</div>
+
+<div class="row">
+  <button id="btnStart" style="flex:1;background:#22406b">开始连接</button>
+</div>
+
+<div class="cards">
+  <div class="card"><b>信令</b><span id="stSig" class="d">未连接</span></div>
+  <div class="card"><b>ICE 状态</b><span id="stIce" class="d">—</span></div>
+  <div class="card"><b>本端候选</b><span id="stCand" class="d">0</span></div>
+  <div class="card"><b>数据通道</b><span id="stDc" class="d">未建立</span></div>
+</div>
+
+<label>通道打通后可以互发文字</label>
+<div class="row">
+  <input id="msg" value="hello" style="flex:1">
+  <button id="btnSend" disabled>发送</button>
+</div>
+
+<div id="log"></div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var logEl = $("log");
+  function log(s, cls) {
+    var d = document.createElement("div");
+    var t = new Date().toLocaleTimeString();
+    if (cls) d.className = cls;
+    d.textContent = t + " " + s;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setSt(id, text, cls) { var e = $(id); e.textContent = text; e.className = cls || "d"; }
+
+  $("room").value = Math.random().toString(36).slice(2, 8);
+  $("btnRand").onclick = function () { $("room").value = Math.random().toString(36).slice(2, 8); };
+
+  var ws = null, pc = null, dc = null;
+  var myId = Math.random().toString(36).slice(2, 10);
+  var remoteId = null;
+  var isHost = false;
+  var pendingIce = [];
+  var remoteSet = false;
+  var helloReplied = false;   /* 收到对方的 hello 后，回应过没有 */
+  var roleDecided = false;    /* 主持/应答的角色只决定一次 */
+
+  var ICE = {
+    iceServers: [
+      { urls: "stun:stun.cloudflare.com:3478" },
+      { urls: "stun:stun.l.google.com:19302" }
+    ],
+    iceCandidatePoolSize: 2
+  };
+
+  function sendSig(obj) {
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify(obj));
+      return true;
+    }
+    return false;
+  }
+
+  function newPeer() {
+    pc = new RTCPeerConnection(ICE);
+
+    pc.onicecandidate = function (e) {
+      if (e.candidate) {
+        sendSig({ type: "ice", c: e.candidate });
+        var n = (window.__candCount = (window.__candCount || 0) + 1);
+        setSt("stCand", String(n), "y");
+        /* 候选类型决定能不能打通：host 是同网段直连，srflx 是过了 NAT 的公网地址 */
+        var t = e.candidate.type || "?";
+        log("候选 #" + n + " 类型=" + t + " " + (e.candidate.candidate || "").slice(0, 70), "d");
+      } else {
+        log("本端候选收集结束（共 " + (window.__candCount || 0) + " 个）", "y");
+      }
+    };
+
+    /* 收集状态：new → gathering → complete，卡在 new 说明根本没启动 */
+    pc.onicegatheringstatechange = function () {
+      log("候选收集状态: " + pc.iceGatheringState, pc.iceGatheringState === "complete" ? "g" : "y");
+    };
+
+    /* 最关键的一条：STUN 服务器到底报了什么错 */
+    pc.onicecandidateerror = function (e) {
+      log("STUN 出错 [" + (e.url || "?") + "] code=" + (e.errorCode || "?") +
+        " " + (e.errorText || "") + " host=" + (e.address || "?"), "r");
+    };
+
+    pc.oniceconnectionstatechange = function () {
+      var s = pc.iceConnectionState;
+      setSt("stIce", s, s === "connected" || s === "completed" ? "g" : (s === "failed" ? "r" : "y"));
+      log("ICE: " + s);
+    };
+
+    pc.onconnectionstatechange = function () {
+      var s = pc.connectionState;
+      log("连接状态: " + s, s === "connected" ? "g" : (s === "failed" ? "r" : ""));
+    };
+
+    pc.ondatachannel = function (e) {
+      dc = e.channel;
+      bindChannel();
+    };
+  }
+
+  function bindChannel() {
+    dc.onopen = function () {
+      setSt("stDc", "已打通", "g");
+      log("数据通道打开 ✓", "g");
+      $("btnSend").disabled = false;
+    };
+    dc.onclose = function () {
+      setSt("stDc", "已断开", "r");
+      $("btnSend").disabled = true;
+    };
+    dc.onmessage = function (e) {
+      log("收到 ← " + e.data, "g");
+    };
+  }
+
+  async function makeOffer() {
+    log("我是主持方，创建数据通道并发 offer", "y");
+    if (!pc) newPeer();          /* 没有这句 pc 还是 null，下一行就炸 */
+    dc = pc.createDataChannel("game", { ordered: true });
+    bindChannel();
+    var offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSig({ type: "offer", sdp: pc.localDescription });
+    log("offer 已发出");
+  }
+
+  async function onSignal(msg) {
+    if (msg.type === "hello") {
+      remoteId = msg.id;
+      log("对方上线 id=" + remoteId, "y");
+      /* 先连上的一方发的 hello，后进来的人收不到 —— 所以收到 hello 时要回应一次，
+         否则 id 较大的那一方永远不知道对面在，双方会一起干等 */
+      if (!helloReplied) {
+        helloReplied = true;
+        sendSig({ type: "hello", id: myId });
+        log("已回应上线消息");
+      }
+      /* id 小的当主持方，避免双方同时发 offer */
+      if (!roleDecided) {
+        roleDecided = true;
+        if (myId < remoteId) {
+          isHost = true;
+          await makeOffer();
+        } else {
+          log("我是应答方，等待 offer");
+        }
+      }
+      return;
+    }
+    if (msg.type === "offer") {
+      log("收到 offer");
+      if (!pc) newPeer();
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      remoteSet = true;
+      await flushIce();
+      var ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      sendSig({ type: "answer", sdp: pc.localDescription });
+      log("answer 已回发");
+      return;
+    }
+    if (msg.type === "answer") {
+      log("收到 answer");
+      await pc.setRemoteDescription(new RTCSessionDescription(msg.sdp));
+      remoteSet = true;
+      await flushIce();
+      return;
+    }
+    if (msg.type === "ice") {
+      if (!pc) { pendingIce.push(msg.c); return; }
+      if (!remoteSet) { pendingIce.push(msg.c); return; }
+      try { await pc.addIceCandidate(new RTCIceCandidate(msg.c)); }
+      catch (e) { log("加候选失败: " + e.message, "r"); }
+      return;
+    }
+  }
+
+  async function flushIce() {
+    while (pendingIce.length) {
+      var c = pendingIce.shift();
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
+      catch (e) { log("补加候选失败: " + e.message, "r"); }
+    }
+  }
+
+  $("btnStart").onclick = function () {
+    var host = ($("host").value || "").trim();
+    while (host.slice(-1) === "/") host = host.slice(0, -1);
+    var room = ($("room").value || "").trim();
+    if (!room) { log("房间号不能为空", "r"); return; }
+    $("btnStart").disabled = true;
+    setSt("stSig", "连接中…", "y");
+    log("我的 id = " + myId);
+
+    var url = host + "/?room=" + encodeURIComponent(room);
+    ws = new WebSocket(url);
+    ws.onopen = function () {
+      setSt("stSig", "已连接", "g");
+      log("信令已连接", "g");
+      sendSig({ type: "hello", id: myId });
+      log("已广播上线消息，等待对方…");
+    };
+    ws.onmessage = function (ev) {
+      var m;
+      try { m = JSON.parse(ev.data); } catch (e) { return; }
+      onSignal(m).catch(function (err) { log("处理信令出错: " + err.message, "r"); });
+    };
+    ws.onerror = function () { log("信令连接出错", "r"); setSt("stSig", "出错", "r"); };
+    ws.onclose = function (ev) {
+      setSt("stSig", "已断开", "r");
+      log("信令关闭 code=" + ev.code + " " + (ev.reason || ""));
+    };
+  };
+
+  $("btnSend").onclick = function () {
+    if (!dc || dc.readyState !== "open") { log("通道还没通", "r"); return; }
+    var m = $("msg").value;
+    dc.send(m);
+    log("发出 → " + m);
+  };
+
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>信令联机 · 链路自检</title>
+<style>
+  body{margin:0;padding:20px;background:#0b0f1a;color:#dfe6f5;
+    font:14px/1.7 system-ui,-apple-system,"Microsoft YaHei",sans-serif}
+  h1{font-size:18px;margin:0 0 4px}
+  p.sub{margin:0 0 16px;color:#8fa4cc;font-size:12.5px}
+  label{display:block;margin:12px 0 4px;color:#9fb4dd;font-size:12.5px}
+  input{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:8px;
+    background:#141c2e;border:1px solid #2c3757;color:#dfe6f5;font-size:14px}
+  .row{display:flex;gap:8px;margin-top:10px}
+  button{flex:0 0 auto;padding:9px 18px;border-radius:8px;background:#1d2b48;
+    border:1px solid #35507f;color:#dfe6f5;font-size:14px;cursor:pointer}
+  button:hover{background:#25375c}
+  button:disabled{opacity:.45;cursor:default}
+  #log{margin-top:16px;height:300px;overflow:auto;background:#070b14;
+    border:1px solid #1e2740;border-radius:9px;padding:10px 12px;
+    font:12.5px/1.7 ui-monospace,Menlo,Consolas,monospace;white-space:pre-wrap}
+  .ok{color:#7fe0a0}.err{color:#ff9a9a}.dim{color:#7f92b8}.me{color:#8fc4ff}
+  #state{font-weight:700}
+</style>
+</head>
+<body>
+<h1>信令联机 · 链路自检</h1>
+<p class="sub">两台设备输入<b>同一个房间号</b>，点连接，然后互发文字。这一步只验证"传话口通不通"，跟 WebRTC 和游戏都无关。</p>
+
+<label>信令服务器地址</label>
+<input id="host" value="wss://zangbishahe.pages.dev/api/signal/">
+
+<label>房间号（两边必须一样）</label>
+<input id="room" value="test1">
+
+<div class="row">
+  <button id="btnConn">连接</button>
+  <button id="btnDisc" disabled>断开</button>
+  <button id="btnRand">随机房间号</button>
+</div>
+
+<label>要发的内容</label>
+<div class="row">
+  <input id="msg" value="hello from 对面？" style="flex:1">
+  <button id="btnSend" disabled>发送</button>
+</div>
+
+<p style="margin-top:14px">状态：<span id="state" class="dim">未连接</span></p>
+<div id="log"></div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var logEl = $("log"), stateEl = $("state"), ws = null;
+
+  function log(s, cls) {
+    var t = new Date().toLocaleTimeString();
+    var d = document.createElement("div");
+    if (cls) d.className = cls;
+    d.textContent = "[" + t + "] " + s;
+    logEl.appendChild(d);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+  function setState(s, cls) { stateEl.textContent = s; stateEl.className = cls || ""; }
+
+  $("btnRand").onclick = function () {
+    $("room").value = Math.random().toString(36).slice(2, 8);
+  };
+
+  $("btnConn").onclick = function () {
+    var host = ($("host").value || "").trim();
+    var room = ($("room").value || "").trim();
+    if (!host) { log("先填信令服务器地址（wss:// 开头）", "err"); return; }
+    if (!room) { log("房间号不能为空", "err"); return; }
+    var url = host.replace(/\/+$/, "") + "/?room=" + encodeURIComponent(room);
+    log("正在连接 " + url, "dim");
+    setState("连接中…", "dim");
+    try { ws = new WebSocket(url); } catch (e) {
+      log("建连失败：" + e.message, "err"); setState("失败", "err"); return;
+    }
+
+    ws.onopen = function () {
+      log("已连上信令服务器", "ok");
+      setState("已连接", "ok");
+      $("btnConn").disabled = true; $("btnDisc").disabled = false; $("btnSend").disabled = false;
+    };
+    ws.onmessage = function (ev) {
+      log("收到 ← " + ev.data, "me");
+    };
+    ws.onerror = function () {
+      log("连接出错（可能是地址不对、或跨域被拒）", "err");
+    };
+    ws.onclose = function (ev) {
+      log("连接已关闭 code=" + ev.code + " reason=" + (ev.reason || "无"), ev.code === 1000 ? "dim" : "err");
+      setState(ev.code === 1013 ? "房间已满（对方已经在了）" : "已断开", ev.code === 1013 ? "err" : "dim");
+      $("btnConn").disabled = false; $("btnDisc").disabled = true; $("btnSend").disabled = true;
+      ws = null;
+    };
+  };
+
+  $("btnDisc").onclick = function () { if (ws) ws.close(1000, "手动断开"); };
+
+  $("btnSend").onclick = function () {
+    if (!ws || ws.readyState !== 1) { log("还没连上", "err"); return; }
+    var m = $("msg").value;
+    ws.send(m);
+    log("发出 → " + m, "ok");
+  };
+})();
+</script>
+</body>
+</html>

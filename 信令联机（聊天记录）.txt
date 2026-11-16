@@ -1,0 +1,134 @@
+结论：链路成立，但你列的那三步缺了最关键的一步，而且公共信令这层在你所在网络环境下大概率不通。
+
+那三步里，只有第一步是既成事实
+部署到 Pages：已经是事实。deploy/ 那五个文件就在 zangbishahe.pages.dev 上跑着，这层没问题。
+引入 Trystero 用公共信令：这是最大的坑。它本质上是个「帮你找到对方」的中间人，靠的是第三方公共基础设施——BitTorrent tracker、Nostr 中继、MQTT broker、Firebase 之类，具体用哪个按策略选。这些东西在国内的连通性很不稳定，Firebase 基本不可用，Nostr 中继多数被墙，公开 tracker 也不稳。
+更麻烦的是下一环：信令接通只是知道了对方 IP，真正传输要靠 WebRTC 打洞，而打洞默认依赖 STUN（公开的那些在国内同样经常不可达）。打洞失败就得有 TURN 中继，那就回到「你得有服务器」——绕了一圈把省下的东西又花出去了。
+「访问同一个链接就自动联机」：这第三步在技术上从来没成立过。Trystero 的模型是「同一个房间号 → 互相发现」，双方仍然要输入/共享一个房间标识。而且它解决到「建立了一条 data channel」为止，之后游戏状态怎么同步，它一个字都不管。
+你这个项目特有的两个好消息
+模拟层已经是种子驱动的。RNG 是 mulberry32，resetWorld(seed) 可以完整复现一局。我查了 18 处 Math.random()，全部在表现层——枪声音高、屏幕抖动、音效噪声、兵种预览。也就是说模拟本身是确定性的，这是确定性锁步（lockstep）的前提，大多数项目做不到这么干净。
+单文件、零依赖、离线可玩这套结构，仍然可以保住——把联机做成「点开才动态加载」的可选层就行。
+但真正的成本不在信令，在同步
+两条路，成本差很多：
+
+确定性锁步	主机权威
+传什么	只传输入（拖拽、投放、操控、指令）	主机广播单位状态快照
+带宽	极小	3000 单位量化后约 120–180 KB/s，4G 吃力、WiFi 可以
+主要风险	浮点发散	增量编码 + 插值的工作量
+手感	网络一抖，整个模拟等着	主机端顺滑，客户端有插值延迟
+锁步那条路，你的代码底子已经站在门口了，但有个绕不过去的物理限制：Math.sin/cos/atan2/sqrt 在不同 JS 引擎上可能有 ulp 级差异，两小时的战局跑下来会分叉。必须加周期性校验（比对单位坐标哈希），不一致就回滚重算——这是 lockstep 里最难啃的部分。
+
+我的建议
+先做一个决定性实验，再决定路线。 别急着接 Trystero：
+
+给游戏加一个「同种子 + 共享输入流」的调试模式——两端用同样的 seed 开局，各自把玩家的输入按帧号记录并互换，跑 5 分钟 3000 只丧尸，然后比对两边的世界哈希。这个实验一两百行就能写完，但它的结果直接决定你是走锁步（剩 80% 工作量）还是走主机权威（推倒重来）。
+
+信令别用公共中继。 你已经在 Cloudflare 生态里了，用 Workers + Durable Objects 做一个房间转发就行——信令是几十字节一次的 JSON 交换，免费额度绰绰有余，比赌公共 tracker 稳得多。TURN 也可以考虑 Cloudflare 的，但先确认它当前的计费方式。
+
+如果你只是想和朋友一起玩，还有个便宜得多的选项：做「共享种子 + 回放」而不是实时联机。一局打完后导出种子和输入记录，对方导入就能看到完全一样的战况，还能随时接管继续打。零网络代码、零带宽、手机上完全流畅，实现量大概是实时联机的 5%。
+
+我的判断是：这个游戏值得做的是最后这个，而不是硬啃实时 P2P。
+
+
+
+
+
+12:59 · 用时 53秒 · 首 token 1.2秒 · 138 tok/s
+Workers + Durable Objects 的房间转发是什么意思？怎么用的？
+13:18
+
+Think
+用户问：Workers + Durable Objects 的房间转发是什么意思？怎么用？
+「房间转发」就是把信令服务器做到最小：一个不关心内容的传话口。
+
+它在整个流程里的位置
+WebRTC 双方要先交换三样东西才能直连：A 的 offer（我要连你，我的编解码能力是这样）、B 的 answer、以及双方各自不断冒出来的 ICE candidate（我这条 NAT 后面的地址）。这三样加起来通常几 KB，交换完就没用了。
+
+所以信令服务器做的事就是：让 A 说的话能被 B 听到，反之亦然。它不需要理解内容，也不需要存任何东西。
+
+复制
+A ──ws──┐                  ┌──ws── B
+        ├─ 房间「abc123」 ─┤
+        └─ 收到就转发给 ────┘   （SDP / ICE 原样捎过去）
+Durable Object 正好就是「房间」
+Cloudflare 里普通 Worker 是无状态的，你没法让两个请求落在同一份内存上。Durable Object 解决了这个：它是有状态、单线程、全局唯一的对象，每个对象由名字寻址。所以 idFromName("abc123") 天然就是「abc123 号房间」。
+
+一个房间里所有 WebSocket 连的是同一个 DO 实例，它在内存里存着连接列表，收到谁的消息就转发给同房间其他人。就这么点逻辑。
+
+最小可用实现
+wrangler.toml：
+
+toml
+复制
+name = "zangbishahe-signal"
+main = "src/index.js"
+compatibility_date = "2024-09-01"
+
+[[durable_objects.bindings]]
+name = "ROOM"
+class_name = "Room"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Room"]
+src/index.js：
+
+js
+复制
+export class Room {
+  constructor(state) {
+    this.state = state;
+    this.socks = new Set();       // 这个房间当前的所有连接
+  }
+
+  async fetch(req) {
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+    server.accept();
+    this.socks.add(server);
+
+    server.addEventListener("message", (e) => {
+      // 纯转发，不看内容
+      for (const s of this.socks) {
+        if (s === server) continue;
+        try { s.send(e.data); } catch { this.socks.delete(s); }
+      }
+    });
+
+    const bye = () => this.socks.delete(server);
+    server.addEventListener("close", bye);
+    server.addEventListener("error", bye);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+}
+
+export default {
+  async fetch(req, env) {
+    const room = new URL(req.url).searchParams.get("room");
+    if (!room) return new Response("缺房间号", { status: 400 });
+    // 同一个房间号永远映射到同一个 DO 实例
+    return env.ROOM.get(env.ROOM.idFromName(room)).fetch(req);
+  }
+};
+客户端这边（接在你的游戏里）：
+
+js
+复制
+const ws = new WebSocket(`wss://zangbishahe-signal.你的账号.workers.dev/?room=${code}`);
+ws.onmessage = (e) => {
+  const msg = JSON.parse(e.data);        // { type: "sdp" | "ice", payload }
+  /* 把它塞给 RTCPeerConnection 就行 */
+};
+部署只要三步：npm i -D wrangler → npx wrangler login → npx wrangler deploy。它会给你一个 xxx.workers.dev 的地址，游戏里连这个地址即可。
+
+几个实操要点
+new_sqlite_classes 不能写成 new_classes。前者是 SQLite 存储后端，只有它能在免费计划上跑；写成旧的那个会要求你升级到付费计划。
+信令的流量可以忽略。一局游戏只在开局几秒交换几条几 KB 的消息，之后数据全走 P2P 直连，信令连接可以直接关掉。Workers 免费额度每天十万请求，够开几百局。
+DO 休眠时别存重要状态。你不活跃时实例会被驱逐，内存里的东西没了。不过只要还有 WebSocket 挂着它就是活跃的，所以这个房间里什么都不用持久化——正是我们要的效果。
+房间码生成放客户端：Math.random().toString(36).slice(2, 8)，六位就够，撞车概率可以忽略。想更稳就加个人数上限（this.socks.size > 2 直接拒绝）。
+STUN 还得单独配。信令通了只代表双方知道对方想连，实际打洞要靠 STUN 服务器告诉公网地址。RTCPeerConnection 的 iceServers 里得填一个能用的，公网那些在国内经常不通——这层绕不过去，要么找个可达的 STUN，要么上 TURN 中继（要流量费）。
+一句话回到你的问题
+这层不难，是三十行代码加十分钟部署的事，它甚至不值得你纠结。真正决定你这个游戏能不能联机的，是上次说的那件事：两个客户端跑同一份 3000 单位模拟，五分钟后还一不一致。
+
+如果你要，我可以把这个 Worker 直接建在 deploy/ 旁边，再把客户端的房间建立、offer/answer、断线重连那一套写成一个独立的小模块——但同步层我建议还是先做那个验证实验。

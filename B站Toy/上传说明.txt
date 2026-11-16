@@ -1,0 +1,31 @@
+B 站 Toy 上传说明
+
+版本：3.0.0
+
+一、上传文件
+1. 网页包：归墟防线-Toy.zip
+2. 封面：封面-归墟防线.jpg（1200 × 900，4:3）
+
+二、为什么需要这个版本
+单文件版 index.html 解压后约 1.03 MB，超过 Toy 平台 index.html 的 1 MB 限制。
+本目录把内联样式拆成 game.css，把内联脚本拆成 game.js，index.html 只保留页面结构，约 20 KB。
+
+三、目录内容
+index.html        页面入口
+game.css          样式
+game.js           游戏脚本
+icon-192.png      图标
+icon-512.png      图标
+
+四、上传方式
+把 归墟防线-Toy.zip 上传到网页包，封面单独上传 封面-归墟防线.jpg。
+不要把整个 B站Toy 文件夹压缩成带外层目录的包；zip 根目录必须直接看到 index.html。
+
+五、已针对 Toy 做的调整
+- 去掉 manifest.json 引用。
+- 去掉 Service Worker 注册。
+- 避免 iframe / 沙盒环境发起额外的 PWA 网络请求。
+- 如果仍出现 NetworkError，优先检查 B 站上传接口、网络或浏览器扩展，而不是游戏脚本。
+
+六、注意
+本目录由当前主程序拆分生成；主程序和 deploy 目录未改动。
